@@ -24,13 +24,17 @@ Run `basalt-colab doctor` at any time to verify Python, OpenSSH, Colab CLI, OAut
 
 ## Control Console & Clients
 
-- **Unified Control Console**: `basalt-colab console` starts the local proxy (without waking G4) and opens `http://127.0.0.1:18080/_console#key=...`. From there you can start/stop G4, inspect live Basalt telemetry, view your 14-day CU cost curve (`usage.jsonl`), edit & hot-reload `config.toml`, and tail local/VM logs.
+- **Unified Visual Control Console**: `basalt-colab console` starts the local proxy (without waking G4) and opens `http://127.0.0.1:18080/_console#key=...`. From there you can start/restart/stop G4, adjust settings visually (with **Save & Apply** or **Save & Restart G4**), copy live-synced configs for all supported agents, inspect Basalt telemetry & 14-day CU cost curve, and tail local/VM logs.
 - **Basalt Web UI**: `http://127.0.0.1:18080/` proxies natively to Basalt's web console once G4 is ready.
-- **Claude Code**: `basalt-colab claude` pre-wires `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`. Background `claude-haiku-*` / `claude-sonnet-*` subagent calls automatically route to `DeepSeek-V4.1-Flash-1017-UD-IQ1_M` unless `proxy.strict_model = true`.
-- **Codex CLI**: `basalt-colab codex` pre-wires `OPENAI_BASE_URL`, `OPENAI_API_KEY`, `OPENAI_MODEL`. `/v1/models` returns both `data` and `models` keys for newer Codex builds.
-- **opencode**: `basalt-colab opencode [dir]` regenerates `opencode.json` and launches opencode.
-- **Multimodal & Piped CLI**:
+- **Pure Config Generation (`basalt-colab connect`)**: All agents use clean config generation synced to the live running model (no fragile subprocess wrappers):
+  - **DeepSeek Harness (`dsh`)**: `basalt-colab connect dsh` (or `basalt-colab dsh --raw`) outputs a ready-to-paste `llm-pi-ai` block for `~/.dsh/profiles/web/cordis.patch.yml` with `reasoningEfforts` (`off: none` -> disables thinking), `compat` switches, and Dynamic Vision (`input: [text, image]`).
+  - **Claude Code**: `basalt-colab connect claude` (or `basalt-colab claude`) prints `~/.claude/settings.json` and `ANTHROPIC_*` shell exports. Background `claude-haiku-*` / `claude-sonnet-*` subagent calls route to the active model automatically unless `proxy.strict_model = true`.
+  - **Codex CLI**: `basalt-colab connect codex` (or `basalt-colab codex`) prints `~/.codex/config.toml` (`wire_api = "responses"`) and `OPENAI_*` exports.
+  - **OpenCode**: `basalt-colab connect opencode` prints `opencode.json` (pass `--write` to update the managed file directly).
+  - **Shell env**: `eval "$(basalt-colab env)"` exports `OPENAI_*`, `ANTHROPIC_*`, and `BASALT_API_KEY` synced to the running proxy.
+- **Interactive Chat, Multimodal & Piped CLI**:
   ```bash
+  basalt-colab chat
   basalt-colab ask --image screenshot.png "Explain this stack trace"
   git diff | basalt-colab ask --max "Review this diff for subtle bugs"
   ```

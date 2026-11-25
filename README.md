@@ -2,9 +2,9 @@
 
 <h1>basalt-colab</h1>
 
-<p><b>Uncensored DeepSeek-V4.1-Flash (UD-IQ1_M) on Google Colab G4 (RTX PRO 6000 96 GB), built from first principles around Basalt v0.5.7.</b><br>
+<p><b>Uncensored DeepSeek-V4.1-Flash on Google Colab G4 (RTX PRO 6000 96 GB), built from first principles around Basalt v0.5.7.</b><br>
 150–190+ tok/s solo · 159 tok/s 2-stream concurrent · up to 1M elastic FP8 KV · 32 GiB Disk Conversation Cache · Dynamic Vision.<br>
-Modular zero-dependency Python 3.11+ CLI · Unified Web Control Console · OpenAI / Anthropic Gateway · Claude Code, Codex &amp; opencode ready.</p>
+Zero-dependency Python 3.11+ CLI · Visual Web Control Console · OpenAI / Anthropic Gateway · DeepSeek Harness, Claude Code, Codex, OpenCode &amp; Cursor config generator.</p>
 
 </div>
 
@@ -24,49 +24,49 @@ pip install --no-deps --no-build-isolation -e .
 Start your Colab G4 endpoint (or open the Unified Control Console first without waking a GPU):
 
 ```bash
-basalt-colab up            # sets up Colab CLI + OAuth on first run, boots G4 (~2-3 min)
+basalt-colab up            # sets up Colab CLI + OAuth on first run, boots G4 (~1.5-2 min)
+basalt-colab up -d         # start and return immediately without blocking in watch view
 basalt-colab console       # opens http://127.0.0.1:18080/_console (auto-authenticated)
+basalt-colab connect dsh   # prints ready-to-paste DeepSeek Harness cordis.patch.yml snippet
 ```
 
 ```text
-basalt-colab 0.1.0 · DeepSeek-V4.1-Flash (Basalt v0.5.7)
+basalt-colab 0.3.0 · DeepSeek-V4.1-Flash-1017-UD-IQ1_M (Basalt v0.5.7)
 
-Starting a Colab G4 GPU · ~2-3 minutes (faster with prebuilt binary)
+Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
 
    0:11  ✓  G4 GPU allocated
    0:15  ✓  abliteration edit downloaded (43 KB)
-   0:56  ✓  model downloaded (Basalt UD-IQ1_M)
-   1:40  ✓  Basalt built / ready
-   1:43  ✓  abliteration baked into weights (62/62)
-   2:00  ✓  model loaded onto GPU + RAM
-   2:00  ✓  tmpfs RAM punched & reclaimed
-   2:32  ✓  Engram table loaded (110.6 GB)
-   2:33  ✓  warmup answer done
+   0:56  ✓  model backbone downloaded
+   1:02  ✓  Basalt built / ready
+   1:05  ✓  abliteration baked into weights (62/62)
+   1:20  ✓  model loaded onto GPU + RAM
+   1:20  ✓  backbone storage punched & reclaimed
+   1:45  ✓  Engram table loaded
+   1:47  ✓  warmup answer done
 
-✓ Ready after 2:39
+✓ Ready after 1:48
 
   Console    http://127.0.0.1:18080/_console
   Web UI     http://127.0.0.1:18080/
   Base URL   http://127.0.0.1:18080/v1
   API key    sk-ds41-...
-  Model      DeepSeek-V4.1-Flash-1017-UD-IQ1_M (effort 50)
-  Engine     262K×2 FP8 KV · vision dynamic · ~160.4 tok/s
+  Model      DeepSeek-V4.1-Flash-1017-UD-IQ1_M (effort 50, uncensored)
+  Engine     UD-IQ1_M · 262K×2 FP8 KV · vision dynamic · route balanced · ~160 tok/s
 
-  Try it     basalt-colab ask "Hello!"
+  Try it     basalt-colab ask "Hello!"   /   basalt-colab chat
   Console    basalt-colab console
-  Claude     basalt-colab claude
-  Codex      basalt-colab codex
-  opencode   basalt-colab opencode [project folder]
+  Agents     basalt-colab connect [dsh|claude|codex|opencode|openai]
   Shell env  eval "$(basalt-colab env)"
   Stop       basalt-colab down
 ```
 
 ## Measured Performance (Colab G4 — RTX PRO 6000 Blackwell 96 GB)
 
-| Metric | Measured (Basalt v0.5.7 + `UD-IQ1_M`) |
+| Metric | Measured (Basalt v0.5.7 + `UD-IQ1_M` / `UD-IQ2_XXS`) |
 | --- | --- |
-| VM cold start (source build / prebuilt) | **139s** (`~95s` with GitHub Release prebuilt `sm_120` binary) |
-| Solo decode (`/v1/chat/completions`) | **148–160+ tok/s** (97.0% VRAM expert hit rate, 0.9% PCIe) |
+| VM cold start (prebuilt `sm_120` binary) | **~95–108s** (`build.sh` in **6s**, zero-GIL 128 MiB parallel download at **3.47 GB/s**) |
+| Solo decode (`/v1/chat/completions`) | **148–160+ tok/s** (`UD-IQ1_M`) · **94–125 tok/s** (`UD-IQ2_XXS`, 98.3% VRAM hit, 0.3% PCIe) |
 | OpenAI Responses (`/v1/responses`) | **193.8 tok/s** (DSpark speculative draft + 32 draft experts) |
 | Anthropic Messages (`/v1/messages`) | **152.5 tok/s** (native Claude Code compatible) |
 | 2-stream concurrent decode | **159.0 tok/s aggregate** (`78.7 + 80.3 tok/s`, 94.1% hit, 0.8% PCIe) |
@@ -74,12 +74,14 @@ Starting a Colab G4 GPU · ~2-3 minutes (faster with prebuilt binary)
 | Disk Conversation Cache | **32 GiB** `/content/conv_cache` (99.8% KV restored in **0.5 ms** across rotated sessions) |
 | Vision (`dynamic` mode) | **0 MiB idle VRAM / 0 MiB idle RAM**, ~1.0–1.6s on-demand image encode |
 | Client-disconnect cancel (`MSG_PEEK`) | **0.48s** measured GPU decode abort after client hangup |
-| Steady-state host RAM free | **10 GiB available** after loading 110.6 GB Engram table |
 | Cost | **~8.9 CU/hr** while GPU runs · **0 CU** when stopped |
 
-## Unified Control Console (`/_console`) & Basalt Web UI (`/`)
+## Unified Visual Control Console (`/_console`) & Basalt Web UI (`/`)
 
-- **Control Console (`/_console`)**: Self-contained dark UI (zero CDN deps) for starting/stopping G4 (with `--wait-gpu` toggle), live boot timeline, real-time Basalt `tok/s` + VRAM hit % telemetry, **14-day CU billing curve & session ledger** (`usage.jsonl`), **online `config.toml` editor with live hot-reload**, and local/VM log viewer. When G4 is off or booting, visiting `/` serves `/_console` directly.
+- **Visual Control Console (`/_console`)**: Self-contained dark UI (zero CDN deps) featuring:
+  - **One-Click Client Integration Tabs**: live-synced, copy-ready config snippets & shell env exports for **DeepSeek Harness (`dsh`)**, **Claude Code**, **Codex CLI**, **OpenCode**, and **Cursor / Cherry Studio / OpenAI** (`GET /_control/clients`).
+  - **Visual Configuration Controls**: Performance profile pills (`Balanced` / `Solo-Fast` / `Exact`), live hot-reload controls (`Effort`, `Idle stop`, `Hard cap`, `Wait-GPU`), engine controls (`Quant`, `Context`, `Parallel`, `Routing`, `KV`, `Vision`, `Answer Room`, `Abliteration` scale slider), **Save & Apply** + **Save & Restart G4** buttons, plus a collapsible raw `config.toml` editor.
+  - **Live Telemetry & Billing**: real-time Basalt `tok/s` + VRAM hit % + PCIe %, boot timeline, 14-day CU cost curve & session ledger (`usage.jsonl`), and local/VM log viewer.
 - **Basalt Native Web UI (`/`)**: Once G4 is ready, `/` proxies 100% natively to Basalt's built-in chat & diagnostics console without rewriting any asset paths.
 - Run `basalt-colab console` to open `/_console#key=...` auto-authenticated (the URL fragment is stored in `localStorage` and immediately stripped from the URL; never sent over HTTP).
 
@@ -87,20 +89,19 @@ Starting a Colab G4 GPU · ~2-3 minutes (faster with prebuilt binary)
 
 | Command | Description |
 | --- | --- |
-| `basalt-colab up [--quant Q] [--profile P] [--routing-mode M] [--parallel N] [--pack-url URL] [--uncensor-scale S] [--wait-gpu] [--basalt-ref REF]` | Start G4 (`--quant ud-iq1_m\|ud-iq2_xxs\|ud-q2_k_xl\|custom`; `--profile balanced\|solo-fast\|exact`; `--routing-mode balanced\|exact\|fast`; `--parallel 1..4`; `--uncensor-scale` adjusts mrfakename strength; `--wait-gpu` retries up to 30 min; `--basalt-ref` builds an upstream Basalt tag/branch/SHA) |
-| `basalt-colab down [--all]` | Stop G4, wipe VM secrets, record session in `usage.jsonl`, stop detached proxy |
+| `basalt-colab up \| start [opts]` | Start G4 (`-d`/`--no-watch`, `--quant`, `--profile balanced\|solo-fast\|exact`, `--routing-mode`, `--parallel`, `--uncensor-scale`, `--wait-gpu [MIN]` for unlimited or bounded queue wait, `--no-notify`, `--basalt-ref`) |
+| `basalt-colab restart [opts]` | Stop current G4, reload saved `config.toml`, and boot fresh (keeps local proxy running) |
+| `basalt-colab down \| stop [--all]` | Stop G4, wipe VM secrets, record session in `usage.jsonl`, stop detached proxy |
 | `basalt-colab console [--no-open]` | Ensure local proxy is up (without waking G4) and open `/_console` |
-| `basalt-colab status` | Snapshot of Console/Web UI URLs, live Basalt telemetry, CU billing ledger, and Colab balance |
-| `basalt-colab watch` | Live terminal status bar with `tok/s`, VRAM hit %, PCIe %, idle countdown, and CU cost |
-| `basalt-colab config [show\|path\|wizard]` | Inspect or edit `config.toml` interactively (hot-reloads live fields without restart!) |
-| `basalt-colab ask [opts] TEXT` | Stream an answer with `--max`, `--effort VAL`, `--image PATH` (repeatable), or piped `stdin` |
-| `basalt-colab claude [...]` | Launch **Claude Code** pointed at Anthropic `/v1/messages` |
-| `basalt-colab codex [...]` | Launch **Codex CLI** pointed at OpenAI `/v1/responses` |
-| `basalt-colab opencode [...]` | Launch **opencode** with auto-generated `opencode.json` |
-| `basalt-colab env [--powershell\|--sh]` | Print shell `export` or PowerShell `$env:` lines for OpenAI & Anthropic clients |
-| `basalt-colab logs` | Local proxy log + VM boot timeline + Basalt server & engine logs |
-| `basalt-colab doctor` | One-command check of Python 3.11+, OpenSSH, Colab CLI, OAuth balance, `config.toml`, VM payload & local port |
-| `basalt-colab setup` | First-run setup + automatic one-time migration of legacy `./state/{api_key,id_ed25519}` |
+| `basalt-colab connect [CLIENT] [opts]` | Pure config generator for **`dsh`** (DeepSeek Harness), **`claude`**, **`codex`**, **`opencode`**, **`openai`** (`--raw`, `--json`, `--sh`, `--powershell`, `--write`) — synced to the live running model! |
+| `basalt-colab dsh \| claude \| codex \| opencode` | Direct shortcuts for `basalt-colab connect <client>` |
+| `basalt-colab env [--sh\|--powershell\|--json]` | Print live-synced `OPENAI_*`, `ANTHROPIC_*`, and `BASALT_API_KEY` exports |
+| `basalt-colab ask [opts] TEXT` | Stream an answer (auto-starts proxy on demand; `--effort`, `--max`, `--no-think`, `--hide-think`, `--max-tokens`, `--system`, `--image`, or piped `stdin`) |
+| `basalt-colab chat [opts]` | Interactive multi-turn terminal chat REPL with `/effort`, `/think`, `/clear`, `/image`, `/system`, `/exit` |
+| `basalt-colab config [show\|path\|wizard\|get\|set\|profile]` | Inspect or update `config.toml` (`config set effort high`, `config profile solo-fast` — hot-reloads live!) |
+| `basalt-colab status` / `watch` | Snapshot or live terminal bar (`tok/s`, VRAM hit %, PCIe %, idle countdown, CU cost) |
+| `basalt-colab logs [-f\|--follow] [--local\|--vm]` | Local proxy log (`-f` live tail) + VM boot timeline + Basalt server & engine logs |
+| `basalt-colab doctor` / `setup` | Environment diagnostics and one-time Colab OAuth + key setup |
 
 ## Quantization Tiers & Zero-SSD-Expert Staging
 
@@ -124,6 +125,7 @@ idle_min = 10            # hot-reloadable live
 max_hours = 6            # hot-reloadable live
 min_balance = 5
 wait_gpu = false         # hot-reloadable live
+wait_gpu_min = 0         # hot-reloadable live (0 = unlimited when wait_gpu = true)
 orphan_boot_s = 30
 
 [proxy]
@@ -142,6 +144,8 @@ kv = "fp8"               # "fp8" or "fp16"
 vision = "dynamic"       # 0 MiB idle VRAM/RAM
 spec = 6                 # DSpark speculative window (0..8)
 draft_experts = 32       # 32, 64, 96, 128, or 0
+routing_mode = "balanced" # "balanced" (+20-37% speed), "fast", or "exact" (lossless)
+answer_room = "auto"     # "auto" reserves room for final answer so thinking never truncates it
 conv_cache_mib = 32768   # 32 GiB disk conversation cache
 resident_budget_gib = 0  # 0 = auto-planned per storage mode (55 / ~87 / ~130 GiB)
 uncensor = true          # 43 KB mrfakename rank-2 stochastic-rounding abliteration (0% decode slowdown)

@@ -20,6 +20,15 @@ import webbrowser
 from typing import Any, Callable
 
 from basalt_colab import __version__
+from basalt_colab.clients import (
+    VALID_CLIENTS,
+    ClientEndpoint,
+    all_client_bundles,
+    client_bundle,
+    env_vars,
+    format_env_lines,
+    resolve_client,
+)
 from basalt_colab.colab import (
     Logger,
     alive,
@@ -44,21 +53,26 @@ from basalt_colab.colab import (
     vmx,
 )
 from basalt_colab.config import (
+    HOT_FIELDS,
     Config,
     ConfigError,
+    answer_room_value,
     context_value,
     dump_toml,
     effort_value,
+    get_config_value,
     load_config,
     profile_value,
     quant_value,
     routing_mode_value,
     save_config,
+    set_config_value,
     short_context,
     validate_config,
 )
 from basalt_colab.lifecycle import UPSTREAM_TIMEOUT, mmss, run_watchdog, stop_cloud
 from basalt_colab.manifest import Manifest, load_manifest
+from basalt_colab.notify import notify
 from basalt_colab.paths import IS_WIN, Paths, get_paths, migrate_legacy_state
 from basalt_colab.proxy import serve, write_opencode_config
 from basalt_colab.usage import UsageLedger
@@ -66,34 +80,43 @@ from basalt_colab.usage import UsageLedger
 USAGE = f"""basalt-colab {__version__} — DeepSeek-V4.1-Flash on Google Colab G4 via Basalt v0.5.7
 
 usage: basalt-colab COMMAND [options]
-  up [opts]                            start G4 (~1.5-2 min), print endpoints & live status
+  up | start [opts]                    start G4 (~1.5-2 min), print endpoints & live status
+     -d, --detach, --no-watch          return immediately after G4 is ready (skip live watch view)
      --quant Q                         ud-iq1_m (default, 100% RAM) | ud-iq2_xxs (-13% KLD) | ud-q2_k_xl | custom
      --pack-url URL                    override .basalt URL (required for ud-q2_k_xl / custom)
      --profile P                       balanced (default: 2 slots, route balanced) | solo-fast (1 slot, route fast) | exact
      --routing-mode M                  balanced (default, KLD +0.0005, +20-37% speed) | exact (lossless) | fast
      --parallel N                      concurrent slots (1-4; default 2, use 1 for lowest solo latency)
      --uncensor-scale S                refusal-removal strength multiplier (0.0=off, 1.0=default, 1.15-1.25=stronger)
-     --wait-gpu                        retry G4 allocation up to 30 min with backoff
+     --wait-gpu [MIN]                  retry G4 allocation until ready (0/omitted = unlimited, or cap at MIN minutes)
+     --no-notify                       disable terminal bell and OS desktop notification on ready/failure
      --basalt-ref REF                  build an upstream Basalt tag/branch/SHA from source
-  down [--all]                         stop G4, wipe VM secrets, record CU ledger, stop detached proxy
+  restart [up opts]                    stop current G4, reload saved config.toml, and boot fresh (keeps proxy)
+  down | stop [--all]                  stop G4, wipe VM secrets, record CU ledger, stop detached proxy
   status                               Control Console & Web UI URLs, Basalt telemetry, billing ledger, Colab balance
   watch                                live terminal status bar (tok/s, VRAM hit %, idle countdown, CU cost)
   console [--no-open]                  ensure local proxy is running and open the Unified Control Console (/_console)
-  config [show|path|wizard]            inspect or edit config.toml interactively (hot-reloads live!)
-  ask [opts] TEXT                      stream an answer (--max, --effort VAL, --image PATH, or piped stdin)
-  claude ...                           launch Claude Code pointed at /v1/messages
-  codex ...                            launch Codex CLI pointed at /v1/responses
-  opencode ...                         launch opencode with auto-generated opencode.json
-  env [--powershell|--sh]              print export / PowerShell $env: lines for OpenAI & Anthropic clients
-  logs                                 local proxy log plus VM boot timeline, Basalt server & engine logs
+  config [subcmd]                      inspect or edit config.toml (hot-reloads live!)
+     show | path | wizard              show TOML, print path, or run interactive wizard
+     get <key>                         print value (e.g. quant, effort, idle_min, basalt.answer_room)
+     set <key> <value>                 update key, save config.toml, and hot-reload running proxy
+     profile <name>                    apply balanced | solo-fast | exact and save
+  connect [CLIENT] [opts]              generate ready-to-paste config for dsh | claude | codex | opencode | openai
+     --raw | --json | --sh | --powershell | --write (for opencode)
+  dsh | claude | codex | opencode      shortcuts for `basalt-colab connect <client>` (pure config generation)
+  env [--sh|--powershell|--json]       print live env exports (OPENAI_*, ANTHROPIC_*, BASALT_API_KEY)
+  ask [opts] TEXT                      stream an answer (--effort VAL, --max, --no-think, --hide-think, --max-tokens N, --system S, --image PATH)
+  chat [opts]                          interactive multi-turn terminal chat REPL (/effort, /clear, /image, /system, /exit)
+  logs [-f|--follow] [--local|--vm]    local proxy log plus VM boot timeline, Basalt server & engine logs
   doctor                               diagnose Python, OpenSSH, Colab CLI, OAuth balance, config.toml, VM payload & port
   setup                                install Colab CLI, complete Google OAuth, create keys & migrate legacy state/
   serve [--detached]                   run the local proxy in the foreground (Ctrl+C stops the GPU too)
 
 env: BASALT_COLAB_HOME, BASALT_COLAB_PORT, BASALT_COLAB_BIND, BASALT_COLAB_QUANT, BASALT_COLAB_PACK_URL,
      BASALT_COLAB_PROFILE (balanced|solo-fast|exact), BASALT_COLAB_ROUTING_MODE (balanced|exact|fast),
-     BASALT_COLAB_UNCENSOR, BASALT_COLAB_UNCENSOR_SCALE, BASALT_COLAB_IDLE_MIN, BASALT_COLAB_MAX_HOURS,
-     BASALT_COLAB_WAIT_GPU, BASALT_COLAB_REF, BASALT_COLAB_MAX_CONTEXT (32K..1M), BASALT_COLAB_PARALLEL (1-4),
+     BASALT_COLAB_ANSWER_ROOM (auto|0..65536), BASALT_COLAB_UNCENSOR, BASALT_COLAB_UNCENSOR_SCALE,
+     BASALT_COLAB_IDLE_MIN, BASALT_COLAB_MAX_HOURS, BASALT_COLAB_WAIT_GPU, BASALT_COLAB_WAIT_GPU_MIN,
+     BASALT_COLAB_NO_NOTIFY, BASALT_COLAB_REF, BASALT_COLAB_MAX_CONTEXT (32K..1M), BASALT_COLAB_PARALLEL (1-4),
      BASALT_COLAB_KV (fp8|fp16), BASALT_COLAB_EFFORT, BASALT_COLAB_STRICT_MODEL, HF_TOKEN, BASALT_COLAB_YES=1"""
 
 TTY, COLOR = [False], [False]
@@ -167,7 +190,9 @@ class Live:
         print(text, flush=True)
 
 
-def control_call(paths: Paths, cfg: Config, port: int, path: str, body: dict[str, Any] | None, timeout: float) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
+def control_call(
+    paths: Paths, cfg: Config, port: int, path: str, body: dict[str, Any] | None, timeout: float
+) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse]:
     data = None if body is None else json.dumps(body).encode()
     return http_call(
         port,
@@ -178,6 +203,27 @@ def control_call(paths: Paths, cfg: Config, port: int, path: str, body: dict[str
         timeout,
         cfg.proxy.host,
     )
+
+
+def fetch_live_status(paths: Paths, cfg: Config, port: int, timeout: float = 2.5) -> dict[str, Any] | None:
+    try:
+        conn, r = control_call(paths, cfg, port, "/_control/status", None, timeout)
+        data = json.loads(r.read()) if r.status == 200 else None
+        conn.close()
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError, http.client.HTTPException):
+        return None
+
+
+def fetch_live_endpoint(paths: Paths, cfg: Config) -> tuple[ClientEndpoint, bool]:
+    """Builds ClientEndpoint synced with the running proxy when active, else falls back to config.toml."""
+    if not paths.key_file.exists():
+        sys.exit(f"missing {paths.key_file}; run: {cli_name()} setup")
+    held = serve_running(paths)
+    port = int(held["port"]) if held else cfg.proxy.port
+    live = fetch_live_status(paths, cfg, port) if held else None
+    ep = ClientEndpoint.from_config(cfg, read_api_key(paths), port=port, live_status=live, paths=paths)
+    return ep, bool(held)
 
 
 def follow(resp: http.client.HTTPResponse, header: str | None = None) -> tuple[str, str]:
@@ -342,11 +388,9 @@ def endpoint_info(paths: Paths, cfg: Config, manifest: Manifest, port: int, bal:
         print(f"  {name:<10} {paint(value, 'bold')}")
     print()
     for name, value in (
-        ("Try it", f'{me_cmd} ask "Hello!"'),
+        ("Try it", f'{me_cmd} ask "Hello!"   /   {me_cmd} chat'),
         ("Console", f"{me_cmd} console"),
-        ("Claude", f"{me_cmd} claude"),
-        ("Codex", f"{me_cmd} codex"),
-        ("opencode", f"{me_cmd} opencode [project folder]"),
+        ("Agents", f"{me_cmd} connect [dsh|claude|codex|opencode|openai]"),
         ("Shell env", f'eval "$({me_cmd} env)"'),
         ("Stop", f"{me_cmd} down"),
     ):
@@ -477,7 +521,9 @@ def interactive_config_wizard(paths: Paths, cfg: Config) -> Config | None:
         new.basalt.pack_url = ""
     new.basalt.max_context = pick("Context/slot", "32K..1M (slot-full-context)", short_context(cfg.basalt.max_context), context_value)
     new.basalt.parallel = int(pick("Parallel", "1-4 concurrent slots", cfg.basalt.parallel, lambda t: int(t) if t.isdigit() and 1 <= int(t) <= 4 else None))
+    new.basalt.routing_mode = pick("Routing", "balanced | fast | exact", cfg.basalt.routing_mode, routing_mode_value)
     new.basalt.kv = pick("KV precision", "fp8 (0.97G@1M) or fp16", cfg.basalt.kv, lambda t: t.lower() if t.lower() in ("fp8", "fp16") else None)
+    new.basalt.answer_room = pick("Answer room", "auto (anti-trunc) or 0..65536", cfg.basalt.answer_room, answer_room_value)
     new.basalt.effort = pick("Effort", "1-100, low, high, max (live)", cfg.basalt.effort, effort_value)
     new.colab.idle_min = float(pick("Idle stop", "minutes 1-120 (live)", f"{cfg.colab.idle_min:g}", lambda t: _parse_num(t, 1, 120)))
     new.colab.max_hours = float(pick("Hard stop", "hours 1-24 (live)", f"{cfg.colab.max_hours:g}", lambda t: _parse_num(t, 1, 24)))
@@ -497,19 +543,45 @@ def cmd_setup(paths: Paths, cfg: Config, manifest: Manifest) -> None:
     print(f"Next: {cli_name()} up   (or {cli_name()} console)")
 
 
-def cmd_up(
-    paths: Paths,
+def _parse_wait_gpu_args(args: list[str]) -> tuple[bool, float | None]:
+    wait_gpu = False
+    wait_gpu_min: float | None = None
+    for i, a in enumerate(args):
+        if a == "--wait-gpu":
+            wait_gpu = True
+            if i + 1 < len(args) and not args[i + 1].startswith("-"):
+                try:
+                    wait_gpu_min = float(args[i + 1])
+                except ValueError:
+                    sys.exit(f"invalid --wait-gpu minutes {args[i + 1]!r} (expected number >= 0)")
+                if wait_gpu_min < 0 or wait_gpu_min > 1440:
+                    sys.exit("--wait-gpu minutes must be 0 (unlimited) or 0.1..1440")
+        elif a.startswith("--wait-gpu="):
+            wait_gpu = True
+            raw = a.split("=", 1)[1]
+            try:
+                wait_gpu_min = float(raw)
+            except ValueError:
+                sys.exit(f"invalid --wait-gpu minutes {raw!r} (expected number >= 0)")
+            if wait_gpu_min < 0 or wait_gpu_min > 1440:
+                sys.exit("--wait-gpu minutes must be 0 (unlimited) or 0.1..1440")
+    return wait_gpu, wait_gpu_min
+
+
+def _build_up_opts(
     cfg: Config,
     manifest: Manifest,
+    *,
     wait_gpu: bool,
+    wait_gpu_min: float | None,
     basalt_ref: str | None,
-    quant: str | None = None,
-    pack_url: str | None = None,
-    uncensor_scale: float | None = None,
-    profile: str | None = None,
-    routing_mode: str | None = None,
-    parallel: int | None = None,
-) -> None:
+    quant: str | None,
+    pack_url: str | None,
+    uncensor_scale: float | None,
+    profile: str | None,
+    routing_mode: str | None,
+    parallel: int | None,
+) -> tuple[Config, dict[str, Any]]:
     want_cfg = cfg.clone()
     if profile is not None:
         p = profile_value(profile)
@@ -542,19 +614,11 @@ def cmd_up(
     except ConfigError as e:
         sys.exit(f"config error: {e}")
 
-    print(paint(f"basalt-colab {__version__} · {want_cfg.basalt.effective_model_alias} (Basalt {want_cfg.basalt.ref or manifest.basalt_tag})", "bold") + "\n")
-    bal = ensure_setup(paths, want_cfg, manifest)
-    held = serve_running(paths)
-    if held and held.get("cold_signature") and held["cold_signature"] != want_cfg.cold_signature():
-        have = held.get("engine_summary") or "different engine settings"
-        sys.exit(f"The endpoint runs with {have}. To change engine settings, stop it first: {cli_name()} down")
-    if bal < want_cfg.colab.min_balance and not (held and load_session(paths)):
-        sys.exit(f"Colab balance {bal:.2f} compute units is below min_balance {want_cfg.colab.min_balance:.0f}")
-    if not held:
-        held = ensure_detached_proxy(paths)
     up_opts: dict[str, Any] = {}
     if wait_gpu:
         up_opts["wait_gpu"] = True
+    if wait_gpu_min is not None:
+        up_opts["wait_gpu_min"] = wait_gpu_min
     if basalt_ref is not None:
         up_opts["basalt_ref"] = basalt_ref
     if profile is not None:
@@ -569,17 +633,71 @@ def cmd_up(
         up_opts["routing_mode"] = want_cfg.basalt.routing_mode
     if parallel is not None:
         up_opts["parallel"] = want_cfg.basalt.parallel
-    conn, r = control_call(paths, want_cfg, held["port"], "/_control/up", up_opts, 120)
-    kind, rest = follow(r, paint("Starting a Colab G4 GPU", "bold") + paint(" · ~2-3 minutes (faster with prebuilt binary)", "dim"))
+    return want_cfg, up_opts
+
+
+def cmd_up(
+    paths: Paths,
+    cfg: Config,
+    manifest: Manifest,
+    wait_gpu: bool,
+    basalt_ref: str | None,
+    quant: str | None = None,
+    pack_url: str | None = None,
+    uncensor_scale: float | None = None,
+    profile: str | None = None,
+    routing_mode: str | None = None,
+    parallel: int | None = None,
+    wait_gpu_min: float | None = None,
+    detach: bool = False,
+    do_notify: bool = True,
+    restart: bool = False,
+) -> None:
+    want_cfg, up_opts = _build_up_opts(
+        cfg,
+        manifest,
+        wait_gpu=wait_gpu,
+        wait_gpu_min=wait_gpu_min,
+        basalt_ref=basalt_ref,
+        quant=quant,
+        pack_url=pack_url,
+        uncensor_scale=uncensor_scale,
+        profile=profile,
+        routing_mode=routing_mode,
+        parallel=parallel,
+    )
+    print(paint(f"basalt-colab {__version__} · {want_cfg.basalt.effective_model_alias} (Basalt {want_cfg.basalt.ref or manifest.basalt_tag})", "bold") + "\n")
+    bal = ensure_setup(paths, want_cfg, manifest)
+    held = serve_running(paths)
+    if not restart and held and held.get("cold_signature") and held["cold_signature"] != want_cfg.cold_signature():
+        have = held.get("engine_summary") or "different engine settings"
+        sys.exit(f"The endpoint runs with {have}. To apply new engine settings, run: {cli_name()} restart")
+    if bal < want_cfg.colab.min_balance and not (held and load_session(paths)):
+        sys.exit(f"Colab balance {bal:.2f} compute units is below min_balance {want_cfg.colab.min_balance:.0f}")
+    if not held:
+        held = ensure_detached_proxy(paths)
+    endpoint_path = "/_control/restart" if restart else "/_control/up"
+    header = (
+        paint("Restarting Colab G4 GPU", "bold")
+        if restart
+        else paint("Starting a Colab G4 GPU", "bold")
+    ) + paint(" · ~1.5-2 minutes (prebuilt binary)", "dim")
+    conn, r = control_call(paths, want_cfg, held["port"], endpoint_path, up_opts, 120)
+    kind, rest = follow(r, header)
     conn.close()
     if kind != "READY":
-        print(paint("Start failed: " + (rest or "the local endpoint closed the connection"), "red"))
+        err_msg = rest or "the local endpoint closed the connection"
+        notify("basalt-colab: G4 Start Failed", err_msg[:140], enabled=do_notify)
+        print(paint("Start failed: " + err_msg, "red"))
         sys.exit(f"Details: {cli_name()} logs")
     secs = int(rest or 0)
     ready_line = f"{glyph('●', '*')} The GPU is already running" if secs < 2 else f"\n{glyph('✓', '+')} Ready after {mmss(secs)}"
     print(paint(ready_line, "bold", "green"))
+    if secs >= 2:
+        notify("basalt-colab: G4 Ready", f"{want_cfg.basalt.effective_model_alias} ready after {mmss(secs)}", enabled=do_notify)
     endpoint_info(paths, want_cfg, manifest, held["port"], bal)
-    watch_loop(paths, want_cfg, held["port"])
+    if not detach:
+        watch_loop(paths, want_cfg, held["port"])
 
 
 def cmd_down(paths: Paths, cfg: Config, manifest: Manifest, everything: bool = False) -> None:
@@ -672,6 +790,22 @@ def cmd_console(paths: Paths, cfg: Config, manifest: Manifest, no_open: bool = F
             pass
 
 
+def _reload_proxy_if_running(paths: Paths, cfg: Config) -> None:
+    held = serve_running(paths)
+    if not held:
+        return
+    try:
+        conn, r = control_call(paths, cfg, held["port"], "/_control/reload", {}, 10)
+        res = json.loads(r.read())
+        conn.close()
+        ap = res.get("applied") or {}
+        print(f"  {paint(glyph('✓', '+'), 'green')} Applied live (effort {ap.get('effort')} · idle {ap.get('idle_min')} min · cap {ap.get('max_hours')} h)")
+        if res.get("restart_required"):
+            print(paint(f"  Cold engine changes ({', '.join(res.get('cold_changed', []))}) apply on restart: {cli_name()} restart", "dim"))
+    except (OSError, ValueError, http.client.HTTPException) as e:
+        print(paint(f"  Saved to disk, but live reload failed ({e}).", "red"))
+
+
 def cmd_config(paths: Paths, cfg: Config, args: list[str]) -> None:
     sub = args[0] if args else ("wizard" if (sys.stdin and sys.stdin.isatty()) else "show")
     if sub == "path":
@@ -680,30 +814,60 @@ def cmd_config(paths: Paths, cfg: Config, args: list[str]) -> None:
     if sub == "show":
         print(dump_toml(cfg), end="")
         return
+    if sub == "get":
+        if len(args) < 2:
+            sys.exit(f"usage: {cli_name()} config get <key>")
+        try:
+            canonical, val = get_config_value(cfg, args[1])
+        except ConfigError as e:
+            sys.exit(f"config error: {e}")
+        print(f"{canonical} = {val}")
+        return
+    if sub == "set":
+        if len(args) < 3:
+            sys.exit(f"usage: {cli_name()} config set <key> <value>")
+        disk_cfg = load_config(paths, apply_env=False)
+        try:
+            updated, canonical, val = set_config_value(disk_cfg, args[1], " ".join(args[2:]))
+            save_config(updated, paths)
+        except ConfigError as e:
+            sys.exit(f"config error: {e}")
+        tag = "live" if canonical in HOT_FIELDS else "restart required if G4 running"
+        print(f"  {paint(glyph('✓', '+'), 'green')} {canonical} = {val}  {paint(f'({tag})', 'dim')}")
+        _reload_proxy_if_running(paths, updated)
+        return
+    if sub == "profile":
+        if len(args) < 2:
+            sys.exit(f"usage: {cli_name()} config profile <balanced|solo-fast|exact>")
+        disk_cfg = load_config(paths, apply_env=False)
+        try:
+            disk_cfg.apply_profile(args[1])
+            save_config(disk_cfg, paths)
+        except ConfigError as e:
+            sys.exit(f"config error: {e}")
+        print(f"  {paint(glyph('✓', '+'), 'green')} Applied profile {args[1]} -> {disk_cfg.describe_engine()}")
+        _reload_proxy_if_running(paths, disk_cfg)
+        return
     if sub != "wizard":
-        sys.exit(f"unknown config subcommand {sub!r} (use: show, path, wizard)")
+        sys.exit(f"unknown config subcommand {sub!r} (use: show, path, wizard, get, set, profile)")
     if not (sys.stdin and sys.stdin.isatty()):
         sys.exit(f"Config: {cfg.summary()}\nEdit {paths.config_file} or run '{cli_name()} config' in a terminal.")
     updated = interactive_config_wizard(paths, cfg)
-    held = serve_running(paths)
-    if updated and held:
-        try:
-            conn, r = control_call(paths, cfg, held["port"], "/_control/reload", {}, 10)
-            res = json.loads(r.read())
-            conn.close()
-            ap = res.get("applied") or {}
-            print(f"  {paint(glyph('✓', '+'), 'green')} Applied live (effort {ap.get('effort')} · idle {ap.get('idle_min')} min · cap {ap.get('max_hours')} h)")
-            if res.get("restart_required"):
-                print(paint(f"  Cold engine changes ({', '.join(res.get('cold_changed', []))}) apply on next GPU start ({cli_name()} down && {cli_name()} up).", "dim"))
-        except (OSError, ValueError, http.client.HTTPException) as e:
-            print(paint(f"  Saved to disk, but live reload failed ({e}).", "red"))
+    if updated:
+        _reload_proxy_if_running(paths, updated)
 
 
-def cmd_logs(paths: Paths, cfg: Config) -> None:
-    raw = read_bytes(paths.log_file)
+def cmd_logs(paths: Paths, cfg: Config, args: list[str] | None = None) -> None:
+    opts = args or []
+    follow_mode = "-f" in opts or "--follow" in opts
+    only_local = "--local" in opts
+    only_vm = "--vm" in opts
     key = read_api_key(paths) if paths.key_file.exists() else ""
-    print(redact(raw.decode("utf-8", "replace")[-4000:], key) if raw is not None else "(no local log)")
-    if session_alive(cfg.colab.session):
+
+    if not only_vm:
+        raw = read_bytes(paths.log_file)
+        print(redact(raw.decode("utf-8", "replace")[-4000:], key) if raw is not None else "(no local log)")
+    if not only_local and not follow_mode and session_alive(cfg.colab.session):
         _, out = vmx(
             cfg.colab.session,
             "cat /content/res/timeline.txt 2>/dev/null; tail -n 25 /content/res/server.log 2>/dev/null; "
@@ -711,6 +875,25 @@ def cmd_logs(paths: Paths, cfg: Config) -> None:
             40,
         )
         print(redact(out, key))
+    if follow_mode:
+        print(paint("--- following local log (Ctrl+C to stop) ---", "dim"), flush=True)
+        pos = paths.log_file.stat().st_size if paths.log_file.exists() else 0
+        try:
+            while True:
+                if paths.log_file.exists():
+                    size = paths.log_file.stat().st_size
+                    if size < pos:
+                        pos = 0
+                    if size > pos:
+                        with paths.log_file.open("rb") as f:
+                            f.seek(pos)
+                            chunk = f.read(size - pos)
+                            pos = size
+                        sys.stdout.write(redact(chunk.decode("utf-8", "replace"), key))
+                        sys.stdout.flush()
+                time.sleep(0.4)
+        except KeyboardInterrupt:
+            print()
 
 
 def cmd_watch(paths: Paths, cfg: Config) -> None:
@@ -722,23 +905,60 @@ def cmd_watch(paths: Paths, cfg: Config) -> None:
     watch_loop(paths, cfg, held["port"])
 
 
-def parse_ask_args(words: list[str]) -> tuple[str | None, list[str], str]:
-    effort, images, rest = None, [], []
+def parse_ask_options(words: list[str]) -> dict[str, Any]:
+    effort: str | None = None
+    images: list[str] = []
+    rest: list[str] = []
+    max_tokens: int | None = None
+    system_prompt: str | None = None
+    no_think = False
+    hide_think = False
     i = 0
     while i < len(words):
         w = words[i]
         if w == "--max":
             effort = "max"
+        elif w == "--no-think":
+            no_think = True
+            effort = "none"
+        elif w == "--hide-think":
+            hide_think = True
         elif w == "--effort" and i + 1 < len(words):
             i += 1
-            effort = effort_value(words[i]) or sys.exit(f"invalid --effort {words[i]!r} (use 1-100, low, high, max)")
+            raw_e = words[i].strip().lower()
+            if raw_e in ("none", "off"):
+                no_think = True
+                effort = "none"
+            else:
+                effort = effort_value(raw_e) or sys.exit(f"invalid --effort {words[i]!r} (use 1-100, low, high, max, none)")
+        elif w == "--max-tokens" and i + 1 < len(words):
+            i += 1
+            if not words[i].isdigit() or int(words[i]) <= 0:
+                sys.exit(f"invalid --max-tokens {words[i]!r} (expected positive integer)")
+            max_tokens = int(words[i])
+        elif w == "--system" and i + 1 < len(words):
+            i += 1
+            system_prompt = words[i]
         elif w == "--image" and i + 1 < len(words):
             i += 1
             images.append(words[i])
         else:
             rest.append(w)
         i += 1
-    return effort, images, " ".join(rest).strip()
+    return {
+        "effort": effort,
+        "images": images,
+        "prompt": " ".join(rest).strip(),
+        "max_tokens": max_tokens,
+        "system": system_prompt,
+        "no_think": no_think,
+        "hide_think": hide_think,
+    }
+
+
+def parse_ask_args(words: list[str]) -> tuple[str | None, list[str], str]:
+    opts = parse_ask_options(words)
+    return opts["effort"], opts["images"], opts["prompt"]
 
 
 def encode_image_url(path: str) -> str:
@@ -764,11 +984,121 @@ def read_piped_stdin(has_prompt: bool) -> str:
     return sys.stdin.read().strip()
 
 
+def stream_chat_turn(
+    paths: Paths,
+    cfg: Config,
+    port: int,
+    model: str,
+    messages: list[dict[str, Any]],
+    *,
+    effort: str | None = None,
+    max_tokens: int | None = None,
+    hide_think: bool = False,
+) -> tuple[str, str]:
+    """Streams one chat completion turn, returning (assistant_content, reasoning_content)."""
+    body: dict[str, Any] = {
+        "model": model,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "messages": messages,
+    }
+    if effort:
+        body["reasoning_effort"] = effort
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
+
+    t_req = time.time()
+    conn, r = http_call(
+        port,
+        "POST",
+        "/v1/chat/completions",
+        json.dumps(body).encode(),
+        {"Authorization": "Bearer " + read_api_key(paths), "Content-Type": "application/json"},
+        UPSTREAM_TIMEOUT,
+        cfg.proxy.host,
+    )
+    if r.status != 200:
+        err_body = r.read()[:500].decode("utf-8", "replace")
+        conn.close()
+        sys.exit(f"HTTP {r.status}: {err_body}")
+
+    live, part, timings, usage_obj, t_first = Live(), None, None, None, None
+    out_text: list[str] = []
+    think_text: list[str] = []
+    show_think = TTY[0] and not hide_think
+
+    for raw in r:
+        line = raw.decode("utf-8", "replace").strip()
+        wait = re.match(r": starting gpu vm \((\d+) s\)(?: - (.*))?", line)
+        if wait:
+            live.show(mmss(float(wait.group(1))), wait.group(2) or "starting the GPU (~1.5-2 min)")
+        if not line.startswith("data: {"):
+            continue
+        event = json.loads(line[6:])
+        if event.get("error"):
+            live.clear()
+            conn.close()
+            sys.exit(f"\nerror: {event['error'].get('message', event['error'])}")
+        timings = event.get("timings") or timings
+        if event.get("usage"):
+            usage_obj = event["usage"]
+        for ch in event.get("choices", []):
+            delta = ch.get("delta") or {}
+            for kind, text in (("think", delta.get("reasoning_content")), ("say", delta.get("content"))):
+                if not text:
+                    continue
+                if t_first is None:
+                    t_first = time.time()
+                if kind == "think":
+                    think_text.append(text)
+                    if not show_think:
+                        continue
+                else:
+                    out_text.append(text)
+                live.clear()
+                if kind == "think" and part is None:
+                    sys.stdout.write(paint(f"{glyph('╭─', '---')} thinking\n", "dim"))
+                elif kind == "say" and part == "think":
+                    sys.stdout.write(paint(f"\n{glyph('╰─', '---')}\n\n", "dim"))
+                part = kind
+                sys.stdout.write(paint(text, "dim") if kind == "think" else text)
+                sys.stdout.flush()
+    t_end = time.time()
+    conn.close()
+    live.clear()
+    if part == "think" and show_think:
+        sys.stdout.write(paint(f"\n{glyph('╰─', '---')}", "dim"))
+    print()
+    answer = "".join(out_text)
+    reasoning = "".join(think_text)
+    if not answer and reasoning and TTY[0]:
+        print(paint("  (thinking finished without final answer — try a larger --max-tokens or --no-think)", "yellow"))
+    if TTY[0]:
+        if timings and timings.get("predicted_n"):
+            print(paint(f"  {model}: {timings['predicted_n']} tokens at {timings.get('predicted_per_second', 0):.1f} tok/s", "dim"))
+        elif usage_obj and usage_obj.get("completion_tokens") and t_first is not None:
+            n = int(usage_obj["completion_tokens"])
+            dec_s = max(0.001, t_end - t_first)
+            ttft = max(0.0, t_first - t_req)
+            print(paint(f"  {model}: {n} tokens · TTFT {ttft:.2f}s · {n / dec_s:.1f} tok/s", "dim"))
+    return answer, reasoning
+
+
+def _ensure_proxy_for_chat(paths: Paths, cfg: Config) -> tuple[int, str]:
+    if not paths.key_file.exists():
+        sys.exit(f"missing {paths.key_file}; run: {cli_name()} setup")
+    held = ensure_detached_proxy(paths)
+    port = int(held["port"])
+    live = fetch_live_status(paths, cfg, port)
+    model = str((live or {}).get("model") or cfg.basalt.effective_model_alias)
+    return port, model
+
+
 def cmd_ask(paths: Paths, cfg: Config, words: list[str]) -> None:
-    held = serve_running(paths)
-    if not held:
-        sys.exit(f"The endpoint is not running. Start it first: {cli_name()} up")
-    effort, images, prompt = parse_ask_args(words)
+    opts = parse_ask_options(words)
+    port, model = _ensure_proxy_for_chat(paths, cfg)
+    prompt = opts["prompt"]
+    images = opts["images"]
     piped = read_piped_stdin(bool(prompt or images))
     if piped and prompt:
         prompt = piped + "\n\n" + prompt
@@ -781,136 +1111,202 @@ def cmd_ask(paths: Paths, cfg: Config, words: list[str]) -> None:
         if images
         else prompt
     )
-    body: dict[str, Any] = {
-        "model": cfg.basalt.effective_model_alias,
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "messages": [{"role": "user", "content": content}],
-    }
-    if effort:
-        body["reasoning_effort"] = effort
-    t_req = time.time()
-    conn, r = http_call(
-        held["port"],
-        "POST",
-        "/v1/chat/completions",
-        json.dumps(body).encode(),
-        {"Authorization": "Bearer " + read_api_key(paths), "Content-Type": "application/json"},
-        UPSTREAM_TIMEOUT,
-        cfg.proxy.host,
+    messages: list[dict[str, Any]] = []
+    if opts["system"]:
+        messages.append({"role": "system", "content": opts["system"]})
+    messages.append({"role": "user", "content": content})
+    stream_chat_turn(
+        paths,
+        cfg,
+        port,
+        model,
+        messages,
+        effort=opts["effort"],
+        max_tokens=opts["max_tokens"],
+        hide_think=opts["hide_think"],
     )
-    if r.status != 200:
-        sys.exit(f"HTTP {r.status}: {r.read()[:500].decode('utf-8', 'replace')}")
-    live, part, timings, usage_obj, t_first = Live(), None, None, None, None
-    for raw in r:
-        line = raw.decode("utf-8", "replace").strip()
-        wait = re.match(r": starting gpu vm \((\d+) s\)(?: - (.*))?", line)
-        if wait:
-            live.show(mmss(float(wait.group(1))), wait.group(2) or "starting the GPU (~2-3 min)")
-        if not line.startswith("data: {"):
+
+
+def cmd_chat(paths: Paths, cfg: Config, words: list[str]) -> None:
+    opts = parse_ask_options(words)
+    port, model = _ensure_proxy_for_chat(paths, cfg)
+    effort: str | None = opts["effort"]
+    max_tokens: int | None = opts["max_tokens"]
+    hide_think: bool = opts["hide_think"]
+    system_prompt: str | None = opts["system"]
+    pending_images: list[str] = list(opts["images"])
+    history: list[dict[str, Any]] = []
+
+    print(paint(f"basalt-colab chat · {model}", "bold") + paint("  (/help for commands, Ctrl+D or /exit to quit)", "dim"))
+    while True:
+        try:
+            user_text = input(f"\n{paint('you ›', 'cyan', 'bold')} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not user_text:
             continue
-        event = json.loads(line[6:])
-        if event.get("error"):
-            live.clear()
-            sys.exit(f"\nerror: {event['error'].get('message', event['error'])}")
-        timings = event.get("timings") or timings
-        if event.get("usage"):
-            usage_obj = event["usage"]
-        for ch in event.get("choices", []):
-            delta = ch.get("delta") or {}
-            for kind, text in (("think", delta.get("reasoning_content")), ("say", delta.get("content"))):
-                if not text:
-                    continue
-                if t_first is None:
-                    t_first = time.time()
-                if kind == "think" and not TTY[0]:
-                    continue
-                live.clear()
-                if part not in (None, kind):
-                    sys.stdout.write("\n\n")
-                part = kind
-                sys.stdout.write(paint(text, "dim") if kind == "think" else text)
-                sys.stdout.flush()
-    t_end = time.time()
-    conn.close()
-    print()
-    if TTY[0]:
-        if timings and timings.get("predicted_n"):
-            print(paint(f"{cfg.basalt.effective_model_alias}: {timings['predicted_n']} tokens at {timings.get('predicted_per_second', 0):.1f} tok/s", "dim"))
-        elif usage_obj and usage_obj.get("completion_tokens") and t_first is not None:
-            n = int(usage_obj["completion_tokens"])
-            dec_s = max(0.001, t_end - t_first)
-            ttft = max(0.0, t_first - t_req)
-            print(paint(f"{cfg.basalt.effective_model_alias}: {n} tokens · TTFT {ttft:.2f}s · {n / dec_s:.1f} tok/s", "dim"))
+        if user_text.startswith("/"):
+            parts = user_text.split(None, 1)
+            cmd = parts[0].lower()
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            if cmd in ("/exit", "/quit", "/q"):
+                return
+            if cmd == "/help":
+                print("  /clear            reset conversation history")
+                print("  /effort <val>     set effort (low | 50 | high | max | none | default)")
+                print("  /think            toggle hiding thinking tokens")
+                print("  /system <text>    set or clear system prompt")
+                print("  /image <path>     attach image to the next message")
+                print("  /history          show turn count")
+                print("  /exit             quit chat")
+                continue
+            if cmd == "/clear":
+                history.clear()
+                pending_images.clear()
+                print(paint("  Conversation cleared.", "dim"))
+                continue
+            if cmd == "/think":
+                hide_think = not hide_think
+                print(paint(f"  Thinking display: {'hidden' if hide_think else 'visible'}", "dim"))
+                continue
+            if cmd == "/effort":
+                if not arg or arg in ("default", "reset"):
+                    effort = None
+                    print(paint("  Effort reset to server default.", "dim"))
+                elif arg.lower() in ("none", "off"):
+                    effort = "none"
+                    print(paint("  Thinking disabled (effort=none).", "dim"))
+                else:
+                    parsed = effort_value(arg)
+                    if not parsed:
+                        print(paint("  Invalid effort (use 1-100, low, high, max, none).", "red"))
+                    else:
+                        effort = parsed
+                        print(paint(f"  Effort set to {effort}.", "dim"))
+                continue
+            if cmd == "/system":
+                system_prompt = arg or None
+                print(paint("  System prompt updated." if system_prompt else "  System prompt cleared.", "dim"))
+                continue
+            if cmd == "/image":
+                if not arg or not os.path.isfile(arg):
+                    print(paint(f"  Image not found: {arg or '(empty)'}", "red"))
+                else:
+                    pending_images.append(arg)
+                    print(paint(f"  Attached {arg} (will send with next message).", "dim"))
+                continue
+            if cmd == "/history":
+                print(paint(f"  {len(history) // 2} turns in context.", "dim"))
+                continue
+            print(paint(f"  Unknown command {cmd!r}. Type /help.", "red"))
+            continue
+
+        content: Any = (
+            [{"type": "text", "text": user_text}] + [{"type": "image_url", "image_url": {"url": encode_image_url(p)}} for p in pending_images]
+            if pending_images
+            else user_text
+        )
+        pending_images.clear()
+        msgs: list[dict[str, Any]] = []
+        if system_prompt:
+            msgs.append({"role": "system", "content": system_prompt})
+        msgs.extend(history)
+        msgs.append({"role": "user", "content": content})
+        print()
+        answer, _ = stream_chat_turn(
+            paths,
+            cfg,
+            port,
+            model,
+            msgs,
+            effort=effort,
+            max_tokens=max_tokens,
+            hide_think=hide_think,
+        )
+        history.append({"role": "user", "content": content})
+        if answer:
+            history.append({"role": "assistant", "content": answer})
 
 
 def client_env_vars(paths: Paths, cfg: Config, port: int) -> tuple[tuple[str, str], ...]:
-    base = f"http://{cfg.proxy.host}:{port}"
-    key = read_api_key(paths)
-    model = cfg.basalt.effective_model_alias
-    return (
-        ("OPENAI_BASE_URL", base + "/v1"),
-        ("OPENAI_API_KEY", key),
-        ("OPENAI_MODEL", model),
-        ("ANTHROPIC_BASE_URL", base),
-        ("ANTHROPIC_API_KEY", key),
-        ("ANTHROPIC_AUTH_TOKEN", key),
-        ("ANTHROPIC_MODEL", model),
-        ("ANTHROPIC_SMALL_FAST_MODEL", model),
-    )
+    """Compatibility helper returning env var tuples for a given port."""
+    ep = ClientEndpoint.from_config(cfg, read_api_key(paths), port=port, paths=paths)
+    return env_vars(ep)
 
 
-def find_opencode() -> str | None:
-    for p in (shutil.which("opencode"), os.path.join(os.path.expanduser("~"), ".opencode", "bin", "opencode.exe" if IS_WIN else "opencode")):
-        if p and os.path.exists(p):
-            return p
-    return None
+def cmd_connect(paths: Paths, cfg: Config, target: str | None, args: list[str]) -> None:
+    ep, running = fetch_live_endpoint(paths, cfg)
+    me_cmd = cli_name()
+    as_json = "--json" in args
+    raw_only = "--raw" in args
+    want_ps = "--powershell" in args or (IS_WIN and "--sh" not in args)
+    only_env = "--sh" in args or "--powershell" in args
+    do_write = "--write" in args
 
+    if not target:
+        if as_json:
+            print(json.dumps(all_client_bundles(ep), indent=2))
+            return
+        state_note = "live proxy" if running else "from config.toml (proxy not running)"
+        print(paint(f"basalt-colab Client Integration ({state_note})", "bold"))
+        print(f"  Base URL   {paint(ep.openai_base_url, 'cyan')}")
+        print(f"  Model      {paint(ep.model, 'bold')}")
+        print(f"  Effort     {ep.effort}  ·  Vision: {'dynamic' if ep.vision_enabled else 'off'}\n")
+        for cid in VALID_CLIENTS:
+            b = client_bundle(ep, cid)
+            print(f"  {paint(f'{me_cmd} connect {cid:<9}', 'cyan')}  {b['label']:<17} {paint(b['file_hint'], 'dim')}")
+        print(f"\n  {paint('Tip:', 'dim')} add {paint('--raw', 'cyan')} to print only the snippet for piping, or open {paint(f'{me_cmd} console', 'cyan')} for 1-click Copy.")
+        return
 
-def cmd_opencode(paths: Paths, cfg: Config, args: list[str]) -> None:
-    held = serve_running(paths)
-    if not held:
-        sys.exit(f"The endpoint is not running. Start it first: {cli_name()} up")
-    exe = find_opencode()
-    if not exe:
-        sys.exit("opencode is not installed. Get it from https://opencode.ai, then run this again.")
-    write_opencode_config(paths, cfg, held["port"])
-    sys.exit(subprocess.call([exe] + args, env=dict(os.environ, OPENCODE_CONFIG=str(paths.opencode_file))))
+    cid = resolve_client(target)
+    if cid is None:
+        sys.exit(f"unknown client {target!r} (supported: {', '.join(VALID_CLIENTS)})")
+    bundle = client_bundle(ep, cid)
 
+    if do_write:
+        if cid == "opencode":
+            write_opencode_config(paths, cfg, ep.port)
+            print(f"  {paint(glyph('✓', '+'), 'green')} Wrote {paths.opencode_file}")
+            print(f"  Run: {paint(f'OPENCODE_CONFIG={shlex.quote(str(paths.opencode_file))} opencode', 'cyan')}")
+            return
+        sys.exit(f"--write is currently supported for opencode; for {cid}, copy or pipe `{me_cmd} connect {cid} --raw` into {bundle['file_hint']}")
 
-def cmd_claude(paths: Paths, cfg: Config, args: list[str]) -> None:
-    held = serve_running(paths)
-    if not held:
-        sys.exit(f"The endpoint is not running. Start it first: {cli_name()} up")
-    exe = shutil.which("claude")
-    if not exe:
-        sys.exit("claude is not installed. Install Claude Code, then run this again.")
-    env = dict(os.environ, **dict(client_env_vars(paths, cfg, held["port"])), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
-    sys.exit(subprocess.call([exe] + args, env=env))
+    if as_json:
+        print(json.dumps(bundle, indent=2))
+        return
+    if raw_only:
+        sys.stdout.write(bundle["snippet"])
+        return
+    if only_env:
+        print(bundle["env_ps"] if want_ps else bundle["env_sh"])
+        return
 
-
-def cmd_codex(paths: Paths, cfg: Config, args: list[str]) -> None:
-    held = serve_running(paths)
-    if not held:
-        sys.exit(f"The endpoint is not running. Start it first: {cli_name()} up")
-    exe = shutil.which("codex")
-    if not exe:
-        sys.exit("codex is not installed. Install Codex CLI (npm i -g @openai/codex), then run this again.")
-    env = dict(os.environ, **dict(client_env_vars(paths, cfg, held["port"])))
-    sys.exit(subprocess.call([exe] + args, env=env))
+    print(paint(f"{bundle['label']} — {bundle['subtitle']}", "bold"))
+    print(f"  Target: {paint(bundle['file_hint'], 'cyan')}")
+    print(f"  Model:  {ep.model}  ({ep.openai_base_url})\n")
+    print(bundle["snippet"].rstrip("\n"))
+    print(paint("\n# Environment:", "dim"))
+    print(bundle["env_ps"] if want_ps else bundle["env_sh"])
+    if bundle.get("run_hint"):
+        print(paint("\n# Quick start:", "dim"))
+        print("  " + paint(bundle["run_hint"], "cyan"))
+    if bundle.get("notes"):
+        print("\n" + paint(bundle["notes"], "dim"))
 
 
 def cmd_env(paths: Paths, cfg: Config, args: list[str]) -> None:
-    if not paths.key_file.exists():
-        sys.exit(f"missing {paths.key_file}; run: {cli_name()} setup")
-    held = serve_running(paths)
-    port = held["port"] if held else cfg.proxy.port
+    ep, _ = fetch_live_endpoint(paths, cfg)
+    if "--json" in args:
+        print(json.dumps(dict(env_vars(ep)), indent=2))
+        return
     ps = "--powershell" in args or (IS_WIN and "--sh" not in args)
-    for k, v in client_env_vars(paths, cfg, port):
-        if ps:
-            print(f"$env:{k} = '{v.replace(chr(39), chr(39) * 2)}'")
-        else:
-            print(f"export {k}={shlex.quote(v)}")
+    for flag, cid in (("--dsh", "dsh"), ("--claude", "claude"), ("--codex", "codex"), ("--opencode", "opencode")):
+        if flag in args:
+            b = client_bundle(ep, cid)
+            print(b["env_ps"] if ps else b["env_sh"])
+            return
+    print(format_env_lines(env_vars(ep), powershell=ps))
 
 
 def cmd_doctor(paths: Paths, cfg: Config, manifest: Manifest) -> None:
@@ -976,7 +1372,7 @@ def main(argv: list[str] | None = None) -> None:
         run_watchdog(paths, args[1], float(args[2]), float(args[3]), float(args[4]), float(args[5]))
         return
     if cmd in ("help", "-h", "--help") or (
-        cmd not in ("claude", "codex", "opencode", "ask")
+        cmd not in ("ask", "chat")
         and any(a in ("-h", "--help") for a in args[1:])
     ):
         print(USAGE)
@@ -996,31 +1392,39 @@ def main(argv: list[str] | None = None) -> None:
             serve(paths, cfg, manifest, detached="--detached" in args[1:])
         elif cmd == "setup":
             cmd_setup(paths, cfg, manifest)
-        elif cmd == "up":
-            raw_scale = _extract_flag_val(args[1:], "--uncensor-scale")
+        elif cmd in ("up", "start", "restart"):
+            sub_args = args[1:]
+            raw_scale = _extract_flag_val(sub_args, "--uncensor-scale")
             try:
                 parsed_scale = float(raw_scale) if raw_scale is not None else None
             except ValueError:
                 sys.exit(f"invalid --uncensor-scale {raw_scale!r} (expected float 0.0-2.0)")
-            raw_par = _extract_flag_val(args[1:], "--parallel")
+            raw_par = _extract_flag_val(sub_args, "--parallel")
             try:
                 parsed_par = int(raw_par) if raw_par is not None else None
             except ValueError:
                 sys.exit(f"invalid --parallel {raw_par!r} (expected integer 1-4)")
+            wait_gpu, wait_gpu_min = _parse_wait_gpu_args(sub_args)
+            detach = any(f in sub_args for f in ("-d", "--detach", "--no-watch"))
+            do_notify = "--no-notify" not in sub_args
             cmd_up(
                 paths,
                 cfg,
                 manifest,
-                wait_gpu="--wait-gpu" in args[1:],
-                basalt_ref=_extract_flag_val(args[1:], "--basalt-ref"),
-                quant=_extract_flag_val(args[1:], "--quant"),
-                pack_url=_extract_flag_val(args[1:], "--pack-url"),
+                wait_gpu=wait_gpu,
+                wait_gpu_min=wait_gpu_min,
+                basalt_ref=_extract_flag_val(sub_args, "--basalt-ref"),
+                quant=_extract_flag_val(sub_args, "--quant"),
+                pack_url=_extract_flag_val(sub_args, "--pack-url"),
                 uncensor_scale=parsed_scale,
-                profile=_extract_flag_val(args[1:], "--profile"),
-                routing_mode=_extract_flag_val(args[1:], "--routing-mode"),
+                profile=_extract_flag_val(sub_args, "--profile"),
+                routing_mode=_extract_flag_val(sub_args, "--routing-mode"),
                 parallel=parsed_par,
+                detach=detach,
+                do_notify=do_notify,
+                restart=(cmd == "restart"),
             )
-        elif cmd == "down":
+        elif cmd in ("down", "stop"):
             cmd_down(paths, cfg, manifest, everything="--all" in args[1:])
         elif cmd == "status":
             cmd_status(paths, cfg)
@@ -1031,15 +1435,17 @@ def main(argv: list[str] | None = None) -> None:
         elif cmd == "config":
             cmd_config(paths, cfg, args[1:])
         elif cmd == "logs":
-            cmd_logs(paths, cfg)
+            cmd_logs(paths, cfg, args[1:])
         elif cmd == "ask":
             cmd_ask(paths, cfg, args[1:])
-        elif cmd == "claude":
-            cmd_claude(paths, cfg, args[1:])
-        elif cmd == "codex":
-            cmd_codex(paths, cfg, args[1:])
-        elif cmd == "opencode":
-            cmd_opencode(paths, cfg, args[1:])
+        elif cmd == "chat":
+            cmd_chat(paths, cfg, args[1:])
+        elif cmd == "connect":
+            rest = [a for a in args[1:] if not a.startswith("-")]
+            flags = [a for a in args[1:] if a.startswith("-")]
+            cmd_connect(paths, cfg, rest[0] if rest else None, flags)
+        elif cmd in ("dsh", "harness", "claude", "codex", "opencode"):
+            cmd_connect(paths, cfg, cmd, args[1:])
         elif cmd == "env":
             cmd_env(paths, cfg, args[1:])
         elif cmd == "doctor":
@@ -1048,6 +1454,6 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(USAGE)
     except KeyboardInterrupt:
         print()
-        if cmd == "up" and serve_running(paths):
+        if cmd in ("up", "start", "restart") and serve_running(paths):
             print(f"Interrupted. The GPU may keep starting in the background. Stop it with: {cli_name()} down")
         sys.exit(130)

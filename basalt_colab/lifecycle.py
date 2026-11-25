@@ -234,6 +234,7 @@ class Manager:
         self._stats_at = 0.0
         self._stats_cache: dict[str, Any] | None = None
         self._override_wait_gpu: bool | None = None
+        self._override_wait_gpu_min: float | None = None
         self._override_ref: str | None = None
         self._override_quant: str | None = None
         self._override_pack_url: str | None = None
@@ -264,6 +265,7 @@ class Manager:
             self.cfg.colab.idle_min = new_cfg.colab.idle_min
             self.cfg.colab.max_hours = new_cfg.colab.max_hours
             self.cfg.colab.wait_gpu = new_cfg.colab.wait_gpu
+            self.cfg.colab.wait_gpu_min = new_cfg.colab.wait_gpu_min
             self.cfg.colab.orphan_boot_s = new_cfg.colab.orphan_boot_s
             self.cfg.proxy.strict_model = new_cfg.proxy.strict_model
             self.cfg.basalt.effort = new_cfg.basalt.effort
@@ -280,6 +282,7 @@ class Manager:
         explicit: bool = False,
         is_gone: Callable[[], bool] | None = None,
         wait_gpu: bool | None = None,
+        wait_gpu_min: float | None = None,
         basalt_ref: str | None = None,
         quant: str | None = None,
         pack_url: str | None = None,
@@ -311,6 +314,7 @@ class Manager:
                         if self.closing:
                             return "proxy is shutting down"
                         self._override_wait_gpu = wait_gpu
+                        self._override_wait_gpu_min = wait_gpu_min
                         self._override_ref = basalt_ref
                         self._override_quant = quant
                         self._override_pack_url = pack_url
@@ -558,22 +562,36 @@ class Manager:
             f"hard stop {cfg.colab.max_hours:.1f} h, idle stop {cfg.colab.idle_min:.1f} min"
         )
         wait_gpu = cfg.colab.wait_gpu if self._override_wait_gpu is None else self._override_wait_gpu
-        deadline = time.time() + (1800 if wait_gpu else 300)
-        max_attempts = 40 if wait_gpu else 3
+        wait_limit_min = cfg.colab.wait_gpu_min if self._override_wait_gpu_min is None else self._override_wait_gpu_min
+        alloc_start = time.time()
+        if wait_gpu:
+            deadline = None if wait_limit_min <= 0 else alloc_start + wait_limit_min * 60.0
+            max_attempts = None
+        else:
+            deadline = alloc_start + 300.0
+            max_attempts = 3
         delay_scale = min(1.0, poll_interval() / 15.0)
         out = ""
-        for attempt in range(max_attempts):
+        attempt = 0
+        while True:
             rc, out = colab_run(["new", "-s", session, "--gpu", "G4"], 300)
             if rc == 0 and "READY" in out:
                 self.alloc_note = ""
                 break
-            self.logger.log(f"allocation attempt {attempt + 1} failed: {out.strip()[-300:]}")
+            attempt += 1
+            self.logger.log(f"allocation attempt {attempt} failed: {out.strip()[-300:]}")
             self._check_stop()
-            if attempt + 1 >= max_attempts or time.time() >= deadline:
+            hit_attempts = max_attempts is not None and attempt >= max_attempts
+            hit_deadline = deadline is not None and time.time() >= deadline
+            if hit_attempts or hit_deadline:
                 brief = " ".join(re.sub(r"[╭╮╰╯─│]+", " ", out).split())[-200:]
                 raise StartError("no G4 GPU from Colab (none free, or plan has no compute units): " + brief)
-            wait_s = min(60.0, 10.0 * (2 ** min(attempt, 3))) * max(0.02, delay_scale)
-            self.alloc_note = f"waiting for G4 GPU (retry {attempt + 2} in {max(1, int(wait_s))}s)"
+            wait_s = min(60.0, 10.0 * (2 ** min(attempt - 1, 3))) * max(0.02, delay_scale)
+            elapsed_s = time.time() - alloc_start
+            cap_note = f" / {wait_limit_min:g}m" if (wait_gpu and wait_limit_min > 0) else ""
+            self.alloc_note = (
+                f"waiting for G4 GPU (attempt {attempt + 1}, elapsed {mmss(elapsed_s)}{cap_note}, retry in {max(1, int(wait_s))}s)"
+            )
             self._sleep_cancelable(wait_s)
         s["allocated_ts"] = time.time()
         self._stage(s, "allocated", t0)
@@ -848,6 +866,13 @@ class Manager:
                 "session": self.cfg.colab.session,
                 "model": self.cfg.basalt.effective_model_alias,
                 "quant": self.cfg.basalt.quant,
+                "max_context": self.cfg.basalt.max_context,
+                "vision": self.cfg.basalt.vision,
+                "parallel": self.cfg.basalt.parallel,
+                "routing_mode": self.cfg.basalt.routing_mode,
+                "answer_room": self.cfg.basalt.answer_room,
+                "vram_reserve_mib": self.cfg.basalt.vram_reserve_mib,
+                "uncensor_scale": self.cfg.basalt.uncensor_scale,
                 "uncensor": self.cfg.describe_uncensor(),
                 "basalt_ref": self.cfg.basalt.ref or self.manifest.basalt_tag,
                 "engine_summary": self.cfg.describe_engine(),
@@ -861,6 +886,7 @@ class Manager:
                 "max_hours": self.cfg.colab.max_hours,
                 "effort": self.cfg.basalt.effort,
                 "wait_gpu": self.cfg.colab.wait_gpu,
+                "wait_gpu_min": self.cfg.colab.wait_gpu_min,
                 "strict_model": self.cfg.proxy.strict_model,
                 "started": s.get("started"),
                 "stages": s.get("stages"),

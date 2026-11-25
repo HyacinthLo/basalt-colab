@@ -26,6 +26,7 @@ from basalt_colab.colab import (
     take_lock,
     vmx,
 )
+from basalt_colab.clients import ClientEndpoint, all_client_bundles, opencode_config_dict
 from basalt_colab.config import Config, ConfigError, dump_toml, load_config, parse_toml, save_config
 from basalt_colab.console import render_console_html
 from basalt_colab.lifecycle import Manager, UPSTREAM_TIMEOUT
@@ -42,40 +43,9 @@ HOP = {
 
 
 def write_opencode_config(paths: Paths, cfg: Config, port: int | None = None) -> None:
-    p = port or cfg.proxy.port
-    model_id = cfg.basalt.effective_model_alias
-    image = {"attachment": True, "modalities": {"input": ["text", "image"], "output": ["text"]}} if cfg.basalt.vision != "off" else {}
-    models = {
-        model_id: dict(
-            {
-                "name": f"DeepSeek-V4.1-Flash {cfg.basalt.quant.upper()} (Basalt, effort {cfg.basalt.effort})",
-                "tool_call": True,
-                "reasoning": True,
-                "interleaved": {"field": "reasoning_content"},
-                "options": {"reasoningEffort": str(cfg.basalt.effort)},
-                "limit": {"context": cfg.basalt.max_context, "output": 32768},
-            },
-            **image,
-        )
-    }
-    doc = {
-        "$schema": "https://opencode.ai/config.json",
-        "provider": {
-            "basalt": {
-                "npm": "@ai-sdk/openai-compatible",
-                "name": "DeepSeek-V4.1-Flash on Colab (Basalt)",
-                "options": {
-                    "baseURL": f"http://{cfg.proxy.host}:{p}/v1",
-                    "apiKey": "{file:%s}" % str(paths.key_file).replace("\\", "/"),
-                    "headerTimeout": 1800000,
-                    "chunkTimeout": 900000,
-                },
-                "models": models,
-            }
-        },
-        "model": f"basalt/{model_id}",
-        "small_model": f"basalt/{model_id}",
-    }
+    key = read_api_key(paths) if paths.key_file.exists() else ""
+    ep = ClientEndpoint.from_config(cfg, key, port=port or cfg.proxy.port, paths=paths)
+    doc = opencode_config_dict(ep, inline_key=False)
     paths.ensure_dirs()
     paths.opencode_file.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
 
@@ -483,6 +453,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/_control/status":
             return self.send_json(200, mgr.status())
 
+        if path == "/_control/clients" and body is None:
+            ep = ClientEndpoint.from_config(
+                mgr.cfg,
+                read_api_key(paths),
+                port=self.server.server_port,
+                paths=paths,
+            )
+            return self.send_json(200, all_client_bundles(ep))
+
         if path == "/_control/usage":
             days = int((qs.get("days") or ["30"])[0])
             return self.send_json(200, mgr.usage_summary(days=days))
@@ -528,8 +507,11 @@ class Handler(BaseHTTPRequestHandler):
                         "idle_min": mgr.cfg.colab.idle_min,
                         "max_hours": mgr.cfg.colab.max_hours,
                         "wait_gpu": mgr.cfg.colab.wait_gpu,
+                        "wait_gpu_min": mgr.cfg.colab.wait_gpu_min,
                         "strict_model": mgr.cfg.proxy.strict_model,
                     },
+                    "toml": dump_toml(new_cfg),
+                    "config": new_cfg.to_dict(),
                     "hot_changed": hot,
                     "cold_changed": cold,
                     "restart_required": bool(cold),
@@ -546,7 +528,7 @@ class Handler(BaseHTTPRequestHandler):
                     for sec in ("colab", "proxy", "basalt"):
                         if isinstance(payload.get(sec), dict):
                             merged[sec].update(payload[sec])
-                    # Also accept convenient flat hot keys: effort, idle_min, max_hours, wait_gpu, strict_model
+                    # Also accept convenient flat hot keys: effort, idle_min, max_hours, wait_gpu, wait_gpu_min, strict_model
                     if "effort" in payload:
                         merged["basalt"]["effort"] = payload["effort"]
                     if "idle_min" in payload:
@@ -555,6 +537,8 @@ class Handler(BaseHTTPRequestHandler):
                         merged["colab"]["max_hours"] = payload["max_hours"]
                     if "wait_gpu" in payload:
                         merged["colab"]["wait_gpu"] = payload["wait_gpu"]
+                    if "wait_gpu_min" in payload:
+                        merged["colab"]["wait_gpu_min"] = payload["wait_gpu_min"]
                     if "strict_model" in payload:
                         merged["proxy"]["strict_model"] = payload["strict_model"]
                     new_cfg = Config.from_dict(merged)
@@ -569,6 +553,7 @@ class Handler(BaseHTTPRequestHandler):
                         "idle_min": mgr.cfg.colab.idle_min,
                         "max_hours": mgr.cfg.colab.max_hours,
                         "wait_gpu": mgr.cfg.colab.wait_gpu,
+                        "wait_gpu_min": mgr.cfg.colab.wait_gpu_min,
                         "strict_model": mgr.cfg.proxy.strict_model,
                     },
                     "hot_changed": hot,
@@ -578,7 +563,7 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, ConfigError) as e:
                 return self.fail(400, str(e), obj=error_obj(400, str(e), "invalid_request_error"))
 
-        if path not in ("/_control/up", "/_control/down") or body is None:
+        if path not in ("/_control/up", "/_control/down", "/_control/restart") or body is None:
             return self.fail(404, "unknown control request", obj=error_obj(404, "unknown control request", "not_found_error"))
 
         try:
@@ -588,6 +573,25 @@ class Handler(BaseHTTPRequestHandler):
         self.start_chunked("text/plain; charset=utf-8")
         say = lambda text: self.chunk((text + "\n").encode())
         try:
+            if path == "/_control/restart":
+                if mgr.state != "off" or paths.session_file.exists():
+                    mgr.pop_last_stopped()
+                    mgr.request_stop("restart")
+                    still = mgr.wait_off(lambda n: say(f"wait {n} stopping current G4 for restart"), every=1)
+                    if still:
+                        say("FAILED could not stop running G4 session before restart")
+                        self.wfile.write(b"0\r\n\r\n")
+                        return
+                try:
+                    fresh_cfg = load_config(paths, apply_env=True)
+                    mgr.reload_config(fresh_cfg)
+                    write_opencode_config(paths, mgr.cfg, self.server.server_port)
+                except (OSError, ConfigError) as e:
+                    say(f"FAILED config reload error: {e}")
+                    self.wfile.write(b"0\r\n\r\n")
+                    return
+                path = "/_control/up"
+
             if path == "/_control/up":
                 with mgr.cond:
                     joined = mgr.state == "starting"
@@ -610,6 +614,7 @@ class Handler(BaseHTTPRequestHandler):
                     every=1,
                     explicit=True,
                     wait_gpu=opts.get("wait_gpu"),
+                    wait_gpu_min=opts.get("wait_gpu_min"),
                     basalt_ref=opts.get("basalt_ref"),
                     quant=opts.get("quant"),
                     pack_url=opts.get("pack_url"),
@@ -621,6 +626,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not err:
                     mgr.leave(served=0)
                     emit_steps()
+                    try:
+                        write_opencode_config(paths, mgr.cfg, self.server.server_port)
+                    except OSError:
+                        pass
                 say(f"FAILED {err}" if err else f"READY {int(time.time() - t0)}")
                 self.wfile.write(b"0\r\n\r\n")
                 return

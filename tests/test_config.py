@@ -410,6 +410,79 @@ class ConfigAndUnitTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
+    def test_v03_clients_config_get_set_answer_room_and_wait_gpu(self) -> None:
+        from basalt_colab import clients
+        from basalt_colab.cli import _parse_wait_gpu_args, parse_ask_options
+
+        # Default answer_room is 'auto' (matching Basalt upstream); quant remains ud-iq1_m
+        cfg = config.Config()
+        self.assertEqual(cfg.basalt.quant, "ud-iq1_m")
+        self.assertEqual(cfg.basalt.answer_room, "auto")
+        self.assertEqual(cfg.colab.wait_gpu_min, 0.0)
+        self.assertEqual(cfg.boot_vars(manifest=manifest.load_manifest(self.p.vm_dir))["ANSWER_ROOM"], "auto")
+
+        # config get/set with short & dotted keys
+        k, v = config.get_config_value(cfg, "answer_room")
+        self.assertEqual((k, v), ("basalt.answer_room", "auto"))
+        cfg2, k2, v2 = config.set_config_value(cfg, "answer_room", "2048")
+        self.assertEqual((k2, v2), ("basalt.answer_room", "2048"))
+        cfg3, k3, v3 = config.set_config_value(cfg2, "wait_gpu_min", "45")
+        self.assertEqual((k3, v3), ("colab.wait_gpu_min", 45.0))
+        hot, cold = config.diff_hot_cold(cfg2, cfg3)
+        self.assertEqual((hot, cold), (["colab.wait_gpu_min"], []))
+        with self.assertRaises(config.ConfigError):
+            config.set_config_value(cfg, "answer_room", "badval")
+        with self.assertRaises(config.ConfigError):
+            config.get_config_value(cfg, "nonexistent.key")
+
+        # --wait-gpu optional minutes parser
+        self.assertEqual(_parse_wait_gpu_args([]), (False, None))
+        self.assertEqual(_parse_wait_gpu_args(["--wait-gpu"]), (True, None))
+        self.assertEqual(_parse_wait_gpu_args(["--wait-gpu", "--detach"]), (True, None))
+        self.assertEqual(_parse_wait_gpu_args(["--wait-gpu", "60"]), (True, 60.0))
+        self.assertEqual(_parse_wait_gpu_args(["--wait-gpu=90"]), (True, 90.0))
+
+        # parse_ask_options extended flags
+        opts = parse_ask_options(["--no-think", "--hide-think", "--max-tokens", "512", "--system", "be brief", "hi"])
+        self.assertEqual(opts["effort"], "none")
+        self.assertTrue(opts["no_think"])
+        self.assertTrue(opts["hide_think"])
+        self.assertEqual(opts["max_tokens"], 512)
+        self.assertEqual(opts["system"], "be brief")
+        self.assertEqual(opts["prompt"], "hi")
+
+        # Client config generation (DeepSeek Harness + Claude + Codex + OpenCode + OpenAI)
+        cfg_xxs, _, _ = config.set_config_value(cfg, "quant", "ud-iq2_xxs")
+        ep = clients.ClientEndpoint.from_config(cfg_xxs, "sk-ds41-testkey", port=18080, paths=self.p)
+        all_b = clients.all_client_bundles(ep)
+        self.assertEqual([c["id"] for c in all_b["clients"]], ["dsh", "claude", "codex", "opencode", "openai"])
+        self.assertEqual(all_b["endpoint"]["model"], "DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS")
+
+        dsh_b = clients.client_bundle(ep, "harness")
+        self.assertEqual(dsh_b["id"], "dsh")
+        self.assertIn("- id: llm-pi-ai", dsh_b["snippet"])
+        self.assertIn("apiKeyEnv: BASALT_API_KEY", dsh_b["snippet"])
+        self.assertIn("supportsDeveloperRole: false", dsh_b["snippet"])
+        self.assertIn("maxTokensField: max_tokens", dsh_b["snippet"])
+        self.assertIn("off: none", dsh_b["snippet"])
+        self.assertIn("input: [text, image]", dsh_b["snippet"])
+        self.assertIn("id: DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS", dsh_b["snippet"])
+
+        # Vision off omits image modality in dsh YAML
+        cfg_novis, _, _ = config.set_config_value(cfg_xxs, "vision", "off")
+        ep_nv = clients.ClientEndpoint.from_config(cfg_novis, "sk-ds41-testkey", port=18080, paths=self.p)
+        self.assertIn("input: [text]", clients.dsh_patch_yaml(ep_nv))
+        self.assertNotIn("image", clients.dsh_patch_yaml(ep_nv))
+
+        # Claude, Codex, OpenCode snippets
+        self.assertIn("ANTHROPIC_BASE_URL", clients.client_bundle(ep, "claude")["snippet"])
+        self.assertIn('wire_api = "responses"', clients.client_bundle(ep, "codex")["snippet"])
+        oc = json.loads(clients.client_bundle(ep, "opencode")["snippet"])
+        self.assertEqual(oc["model"], "basalt/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS")
+        self.assertEqual(clients.dsh_effort_default("50"), "medium")
+        self.assertEqual(clients.dsh_effort_default("high"), "high")
+        self.assertEqual(clients.dsh_effort_default("20"), "low")
+
 
 if __name__ == "__main__":
     unittest.main()

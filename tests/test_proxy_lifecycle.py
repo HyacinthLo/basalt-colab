@@ -346,13 +346,14 @@ class ProxyLifecycleTests(unittest.TestCase):
         self.assertIn("max_context = 262144", c.cli("config", "show").stdout)
         self.assertIn("config.toml", c.cli("config", "path").stdout)
 
-        # Start detached proxy + G4 with --basalt-ref override
-        r_up = c.cli("up", "--basalt-ref", "main")
+        # Start detached proxy + G4 with --basalt-ref override and -d (no watch)
+        r_up = c.cli("up", "-d", "--no-notify", "--basalt-ref", "main")
         self.assertEqual(r_up.returncode, 0, r_up.stdout + r_up.stderr)
         self.assertIn(f"Console    http://127.0.0.1:{c.port}/_console", r_up.stdout)
         self.assertIn(f"Web UI     http://127.0.0.1:{c.port}/", r_up.stdout)
         boot_env = json.loads(read(c.res("boot_check.json")))["env"]
         self.assertEqual(boot_env["BASALT_REF"], "main")
+        self.assertEqual(boot_env["ANSWER_ROOM"], "auto")
 
         # Online Control Console config editor: GET -> POST hot change -> POST cold change
         cfg_get = json.loads(c.req(method="GET", path="/_control/config").raw)
@@ -366,29 +367,52 @@ class ProxyLifecycleTests(unittest.TestCase):
         self.assertTrue(cold_post["restart_required"])
         self.assertIn("basalt.parallel", cold_post["cold_changed"])
 
+        # CLI config get / set (live hot-reload) / profile
+        self.assertIn("basalt.effort = max", c.cli("config", "get", "effort").stdout)
+        r_set = c.cli("config", "set", "effort", "high")
+        self.assertEqual(r_set.returncode, 0, r_set.stdout + r_set.stderr)
+        self.assertIn("Applied live", r_set.stdout)
+        self.assertEqual(json.loads(c.req(body={"model": MODEL_ID, "messages": [{"role": "user", "content": "hi"}]}).raw)["effort"], "high")
+        self.assertEqual(c.cli("config", "profile", "solo-fast").returncode, 0)
+        self.assertIn("basalt.parallel = 1", c.cli("config", "get", "parallel").stdout)
+
+        # /_control/clients returns live config bundles for all 5 clients including DeepSeek Harness
+        clients_res = json.loads(c.req(method="GET", path="/_control/clients").raw)
+        self.assertEqual(clients_res["endpoint"]["model"], MODEL_ID)
+        self.assertEqual([x["id"] for x in clients_res["clients"]], ["dsh", "claude", "codex", "opencode", "openai"])
+
         # CLI status shows Telemetry & logs API works
         st = c.cli("status")
         self.assertIn("Telemetry  160.4 tok/s · hit 96% · pcie 0.8%", st.stdout)
         logs_res = json.loads(c.req(method="GET", path="/_control/logs?vm=0").raw)
         self.assertIn("serve:", logs_res["local"])
 
-        # Launchers (claude, codex, opencode, env, console --no-open, ask --image + stdin)
-        fake_bin = os.path.join(c.dir, "bin")
-        os.makedirs(fake_bin)
-        for name, line in (
-            ("claude", 'echo "url=$ANTHROPIC_BASE_URL model=$ANTHROPIC_MODEL args=$*"'),
-            ("codex", 'echo "url=$OPENAI_BASE_URL model=$OPENAI_MODEL args=$*"'),
-            ("opencode", 'echo "cfg=$OPENCODE_CONFIG args=$*"'),
-        ):
-            p = os.path.join(fake_bin, name)
-            with open(p, "w") as f:
-                f.write(f"#!/bin/sh\n{line}\n")
-            os.chmod(p, 0o755)
-        c.env["PATH"] = fake_bin + os.pathsep + c.env["PATH"]
-        self.assertEqual(c.cli("claude", "-p", "hi").stdout.strip(), f"url=http://127.0.0.1:{c.port} model={MODEL_ID} args=-p hi")
-        self.assertEqual(c.cli("codex", "exec").stdout.strip(), f"url=http://127.0.0.1:{c.port}/v1 model={MODEL_ID} args=exec")
-        self.assertIn("opencode.json", c.cli("opencode", ".").stdout)
-        self.assertIn("export ANTHROPIC_MODEL=", c.cli("env").stdout)
+        # Pure config-generation commands (connect, dsh, claude, codex, opencode, env, console --no-open, ask --image + stdin)
+        r_dsh = c.cli("dsh", "--raw")
+        self.assertEqual(r_dsh.returncode, 0, r_dsh.stderr)
+        self.assertIn("apiKeyEnv: BASALT_API_KEY", r_dsh.stdout)
+        self.assertIn(f"baseURL: http://127.0.0.1:{c.port}/v1", r_dsh.stdout)
+        self.assertIn(f"id: {MODEL_ID}", r_dsh.stdout)
+
+        r_claude = c.cli("claude", "--raw")
+        self.assertEqual(r_claude.returncode, 0, r_claude.stderr)
+        self.assertEqual(json.loads(r_claude.stdout)["env"]["ANTHROPIC_MODEL"], MODEL_ID)
+
+        r_codex = c.cli("codex", "--raw")
+        self.assertEqual(r_codex.returncode, 0, r_codex.stderr)
+        self.assertIn(f'base_url = "http://127.0.0.1:{c.port}/v1"', r_codex.stdout)
+
+        r_oc = c.cli("opencode", "--raw")
+        self.assertEqual(r_oc.returncode, 0, r_oc.stderr)
+        self.assertEqual(json.loads(r_oc.stdout)["model"], f"basalt/{MODEL_ID}")
+
+        r_connect = c.cli("connect")
+        self.assertEqual(r_connect.returncode, 0)
+        self.assertIn("DeepSeek Harness", r_connect.stdout)
+
+        env_sh = c.cli("env").stdout
+        self.assertIn("export ANTHROPIC_MODEL=", env_sh)
+        self.assertIn("export BASALT_API_KEY=", env_sh)
         self.assertIn("$env:OPENAI_BASE_URL", c.cli("env", "--powershell").stdout)
         self.assertIn("/_console", c.cli("console", "--no-open").stdout)
 
@@ -397,14 +421,21 @@ class ProxyLifecycleTests(unittest.TestCase):
             f.write(b"\x89PNG\r\n\x1a\nfake")
         self.assertEqual(c.cli("ask", "--max", "--image", img, "describe", input_text="one word").stdout.strip(), "ok")
 
-        # Stop G4 -> verify usage.jsonl ledger recorded the session!
-        r_down = c.cli("down")
+        # Restart G4 in-place via `restart -d --no-notify` -> applies solo-fast (parallel=1)
+        r_rst = c.cli("restart", "-d", "--no-notify")
+        self.assertEqual(r_rst.returncode, 0, r_rst.stdout + r_rst.stderr)
+        boot_env2 = json.loads(read(c.res("boot_check.json")))["env"]
+        self.assertEqual(boot_env2["PARALLEL"], "1")
+        self.assertEqual(boot_env2["ROUTING_MODE"], "fast")
+
+        # Stop G4 -> verify usage.jsonl ledger recorded both sessions!
+        r_down = c.cli("stop")
         self.assertEqual(r_down.returncode, 0, r_down.stdout + r_down.stderr)
         c.wait(lambda: not procs_with(c.dir, "--detached"), 10)
         c.assert_all_stopped(self)
         usage_lines = [json.loads(l) for l in read(os.path.join(c.state, "usage.jsonl")).splitlines() if l.strip()]
-        self.assertEqual(len(usage_lines), 1)
-        self.assertEqual(usage_lines[0]["reason"], "down")
+        self.assertEqual(len(usage_lines), 2)
+        self.assertEqual([u["reason"] for u in usage_lines], ["restart", "down"])
 
     def test_05_alloc_retry_orphan_boot_idle_and_watchdog(self) -> None:
         # 1) Backoff retry succeeds on attempt 2

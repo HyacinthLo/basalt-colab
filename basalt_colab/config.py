@@ -66,6 +66,7 @@ HOT_FIELDS = frozenset({
     "colab.idle_min",
     "colab.max_hours",
     "colab.wait_gpu",
+    "colab.wait_gpu_min",
     "colab.orphan_boot_s",
     "proxy.strict_model",
     "basalt.effort",
@@ -125,6 +126,20 @@ def effort_value(text: str | int) -> str | None:
     return None
 
 
+def answer_room_value(val: str | int) -> str | None:
+    """Validates Basalt answer-room: 'auto' or non-negative integer 0..65536."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return str(val) if 0 <= val <= 65536 else None
+    t = str(val).strip().lower()
+    if t == "auto":
+        return "auto"
+    if t.isdigit() and 0 <= int(t) <= 65536:
+        return str(int(t))
+    return None
+
+
 def _parse_bool(val: Any) -> bool:
     if isinstance(val, bool):
         return val
@@ -143,6 +158,7 @@ class ColabConfig:
     max_hours: float = 6.0
     min_balance: float = 5.0
     wait_gpu: bool = False
+    wait_gpu_min: float = 0.0
     orphan_boot_s: float = 30.0
 
 
@@ -202,6 +218,7 @@ class BasaltConfig:
     conv_cache_mib: int = 32768
     vram_reserve_mib: int = 450
     resident_budget_gib: int = 0
+    answer_room: str = "auto"
     uncensor: bool = True
     uncensor_scale: float = 1.0
     effort: str = "50"
@@ -293,6 +310,7 @@ class Config:
             "conv_cache_mib": b.conv_cache_mib,
             "vram_reserve_mib": b.vram_reserve_mib,
             "resident_budget_gib": b.resident_budget_gib,
+            "answer_room": b.answer_room,
             "uncensor": b.uncensor,
             "uncensor_scale": b.uncensor_scale,
             "sampling": b.sampling.to_basalt_dict(),
@@ -323,6 +341,7 @@ class Config:
             "CONV_CACHE_MIB": str(b.conv_cache_mib),
             "VRAM_RESERVE": str(b.vram_reserve_mib),
             "RAM_BUDGET": str(b.resident_budget_gib),
+            "ANSWER_ROOM": str(b.answer_room),
             "UNCENSOR": "1" if uncensor_active else "0",
             "UNCENSOR_SCALE": f"{b.uncensor_scale:g}",
             "WORKERS": str(b.workers),
@@ -368,6 +387,7 @@ class Config:
             max_hours=float(c_raw.get("max_hours", dc.max_hours)),
             min_balance=float(c_raw.get("min_balance", dc.min_balance)),
             wait_gpu=_parse_bool(c_raw.get("wait_gpu", dc.wait_gpu)),
+            wait_gpu_min=float(c_raw.get("wait_gpu_min", dc.wait_gpu_min)),
             orphan_boot_s=float(c_raw.get("orphan_boot_s", dc.orphan_boot_s)),
         )
         proxy = ProxyConfig(
@@ -394,6 +414,10 @@ class Config:
         rt_parsed = routing_mode_value(rt_in)
         if rt_parsed is None:
             raise ConfigError(f"basalt.routing_mode must be one of {VALID_ROUTING_MODES}, got {rt_in!r}")
+        ar_in = b_raw.get("answer_room", db.answer_room)
+        ar_parsed = answer_room_value(ar_in)
+        if ar_parsed is None:
+            raise ConfigError(f"basalt.answer_room must be 'auto' or 0..65536, got {ar_in!r}")
         basalt = BasaltConfig(
             quant=q_parsed,
             pack_url=str(b_raw.get("pack_url", db.pack_url)).strip(),
@@ -411,6 +435,7 @@ class Config:
             conv_cache_mib=int(b_raw.get("conv_cache_mib", db.conv_cache_mib)),
             vram_reserve_mib=int(b_raw.get("vram_reserve_mib", db.vram_reserve_mib)),
             resident_budget_gib=int(b_raw.get("resident_budget_gib", db.resident_budget_gib)),
+            answer_room=ar_parsed,
             uncensor=_parse_bool(b_raw.get("uncensor", db.uncensor)),
             uncensor_scale=float(b_raw.get("uncensor_scale", db.uncensor_scale)),
             effort=str(b_raw.get("effort", db.effort)).strip().lower(),
@@ -431,6 +456,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("colab.max_hours must be between 0.001 and 24")
     if cfg.colab.min_balance < 0:
         raise ConfigError("colab.min_balance must be >= 0")
+    if not (0.0 <= cfg.colab.wait_gpu_min <= 1440.0):
+        raise ConfigError("colab.wait_gpu_min must be 0 (unlimited) or 0.1..1440")
     if cfg.colab.orphan_boot_s < 0.5:
         raise ConfigError("colab.orphan_boot_s must be >= 0.5")
 
@@ -471,6 +498,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("basalt.vram_reserve_mib must be 256..16384")
     if b.resident_budget_gib != 0 and not (16 <= b.resident_budget_gib <= 160):
         raise ConfigError("basalt.resident_budget_gib must be 0 (auto) or 16..160")
+    if answer_room_value(b.answer_room) is None:
+        raise ConfigError(f"basalt.answer_room must be 'auto' or 0..65536, got {b.answer_room!r}")
     if not (0.0 <= b.uncensor_scale <= 2.0):
         raise ConfigError("basalt.uncensor_scale must be between 0.0 and 2.0")
     if effort_value(b.effort) is None:
@@ -495,6 +524,8 @@ def apply_env_overrides(cfg: Config) -> Config:
         c.colab.min_balance = float(env["BASALT_COLAB_MIN_BALANCE"])
     if env.get("BASALT_COLAB_WAIT_GPU"):
         c.colab.wait_gpu = _parse_bool(env["BASALT_COLAB_WAIT_GPU"])
+    if env.get("BASALT_COLAB_WAIT_GPU_MIN"):
+        c.colab.wait_gpu_min = float(env["BASALT_COLAB_WAIT_GPU_MIN"])
     if env.get("BASALT_COLAB_ORPHAN_BOOT_S"):
         c.colab.orphan_boot_s = float(env["BASALT_COLAB_ORPHAN_BOOT_S"])
     if env.get("BASALT_COLAB_BIND"):
@@ -536,6 +567,11 @@ def apply_env_overrides(cfg: Config) -> Config:
         c.basalt.engram_cache_mib = int(env["BASALT_COLAB_ENGRAM_CACHE_MIB"])
     if env.get("BASALT_COLAB_VRAM_RESERVE"):
         c.basalt.vram_reserve_mib = int(env["BASALT_COLAB_VRAM_RESERVE"])
+    if env.get("BASALT_COLAB_ANSWER_ROOM"):
+        ar = answer_room_value(env["BASALT_COLAB_ANSWER_ROOM"])
+        if ar is None:
+            raise ConfigError(f"invalid BASALT_COLAB_ANSWER_ROOM: {env['BASALT_COLAB_ANSWER_ROOM']!r}")
+        c.basalt.answer_room = ar
     if env.get("BASALT_COLAB_UNCENSOR"):
         c.basalt.uncensor = _parse_bool(env["BASALT_COLAB_UNCENSOR"])
     if env.get("BASALT_COLAB_UNCENSOR_SCALE"):
@@ -576,6 +612,7 @@ def dump_toml(cfg: Config) -> str:
         f"max_hours = {_toml_val(c.max_hours)}",
         f"min_balance = {_toml_val(c.min_balance)}",
         f"wait_gpu = {_toml_val(c.wait_gpu)}",
+        f"wait_gpu_min = {_toml_val(c.wait_gpu_min)}",
         f"orphan_boot_s = {_toml_val(c.orphan_boot_s)}",
         "",
         "[proxy]",
@@ -600,6 +637,7 @@ def dump_toml(cfg: Config) -> str:
         f"conv_cache_mib = {_toml_val(b.conv_cache_mib)}",
         f"vram_reserve_mib = {_toml_val(b.vram_reserve_mib)}",
         f"resident_budget_gib = {_toml_val(b.resident_budget_gib)}",
+        f"answer_room = {_toml_val(b.answer_room)}",
         f"uncensor = {_toml_val(b.uncensor)}",
         f"uncensor_scale = {_toml_val(b.uncensor_scale)}",
         f"effort = {_toml_val(b.effort)}",
@@ -662,3 +700,76 @@ def diff_hot_cold(old: Config, new: Config) -> tuple[list[str], list[str]]:
         if a.get(k) != b.get(k):
             (hot if k in HOT_FIELDS else cold).append(k)
     return hot, cold
+
+
+_SHORT_KEY_MAP = {
+    "session": "colab.session",
+    "idle_min": "colab.idle_min",
+    "idle": "colab.idle_min",
+    "max_hours": "colab.max_hours",
+    "min_balance": "colab.min_balance",
+    "wait_gpu": "colab.wait_gpu",
+    "wait_gpu_min": "colab.wait_gpu_min",
+    "orphan_boot_s": "colab.orphan_boot_s",
+    "bind": "proxy.bind",
+    "port": "proxy.port",
+    "strict_model": "proxy.strict_model",
+    "quant": "basalt.quant",
+    "pack_url": "basalt.pack_url",
+    "ref": "basalt.ref",
+    "model_alias": "basalt.model_alias",
+    "max_context": "basalt.max_context",
+    "context": "basalt.max_context",
+    "parallel": "basalt.parallel",
+    "kv": "basalt.kv",
+    "vision": "basalt.vision",
+    "spec": "basalt.spec",
+    "draft_experts": "basalt.draft_experts",
+    "routing_mode": "basalt.routing_mode",
+    "routing": "basalt.routing_mode",
+    "pool_workers": "basalt.pool_workers",
+    "engram_cache_mib": "basalt.engram_cache_mib",
+    "conv_cache_mib": "basalt.conv_cache_mib",
+    "vram_reserve_mib": "basalt.vram_reserve_mib",
+    "resident_budget_gib": "basalt.resident_budget_gib",
+    "answer_room": "basalt.answer_room",
+    "uncensor": "basalt.uncensor",
+    "uncensor_scale": "basalt.uncensor_scale",
+    "effort": "basalt.effort",
+    "workers": "basalt.workers",
+    "temperature": "basalt.sampling.temperature",
+    "top_p": "basalt.sampling.top_p",
+    "top_k": "basalt.sampling.top_k",
+    "min_p": "basalt.sampling.min_p",
+    "presence_penalty": "basalt.sampling.presence_penalty",
+}
+
+
+def resolve_config_key(key: str) -> str:
+    k = key.strip().lower().replace("-", "_")
+    k = _SHORT_KEY_MAP.get(k, k)
+    flat = _flatten(Config().to_dict())
+    if k not in flat:
+        raise ConfigError(f"unknown config key {key!r} (valid keys: {', '.join(sorted(flat))})")
+    return k
+
+
+def get_config_value(cfg: Config, key: str) -> tuple[str, Any]:
+    canonical = resolve_config_key(key)
+    return canonical, _flatten(cfg.to_dict())[canonical]
+
+
+def set_config_value(cfg: Config, key: str, raw_value: str) -> tuple[Config, str, Any]:
+    """Returns a validated cloned Config with `key` updated to `raw_value`."""
+    canonical = resolve_config_key(key)
+    data = cfg.to_dict()
+    parts = canonical.split(".")
+    val_str = str(raw_value).strip()
+    if parts[0] == "basalt" and parts[1] == "sampling":
+        data["basalt"]["sampling"][parts[2]] = None if val_str.lower() in ("", "none", "null", "unset", "-") else val_str
+    else:
+        sec, field_name = parts[0], parts[1]
+        data[sec][field_name] = "" if (field_name in ("pack_url", "ref", "model_alias") and val_str in ("-", "none", "auto")) else val_str
+    updated = Config.from_dict(data)
+    return updated, canonical, _flatten(updated.to_dict())[canonical]
+

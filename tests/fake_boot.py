@@ -18,7 +18,8 @@ def main():
     with open(os.path.join(R, "boot.pgid"), "w") as f:
         f.write(str(os.getpgid(0)))
     keep = (
-        "MODEL_ALIAS", "CTX", "PARALLEL", "KV_TYPE", "VISION_MODE", "SPEC_MAX", "DRAFT_EXPERTS",
+        "MODEL_ALIAS", "MODEL_QUANT", "CTX", "PARALLEL", "KV_TYPE", "VISION_MODE", "SPEC_MAX", "DRAFT_EXPERTS",
+        "ROUTING_MODE", "ENGRAM_CACHE_MIB", "ANSWER_ROOM",
         "VRAM_RESERVE", "RAM_BUDGET", "UNCENSOR", "MAX_HOURS", "CONV_CACHE_MIB", "BASALT_REF",
         "BASALT_SAMPLING_JSON",
     )
