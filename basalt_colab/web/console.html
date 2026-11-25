@@ -471,15 +471,23 @@ function setTomlField(key, rawVal) {
   syncQuickBarFromToml();
 }
 
+let configMeta = {
+  profiles: {
+    "balanced":  { parallel: 2, routing_mode: "balanced", vram_reserve_mib: 450 },
+    "solo-fast": { parallel: 1, routing_mode: "fast",     vram_reserve_mib: 400 },
+    "exact":     { parallel: 2, routing_mode: "exact",    vram_reserve_mib: 450 },
+  },
+  quants: ["ud-iq1_m", "ud-iq2_xxs", "ud-q2_k_xl", "custom"],
+};
+
+function _tomlLiteral(v) {
+  return typeof v === "string" ? JSON.stringify(v) : String(v);
+}
+
 function applyProfile(name) {
-  const presets = {
-    "balanced":  { parallel: "2", routing_mode: '"balanced"', vram_reserve_mib: "450" },
-    "solo-fast": { parallel: "1", routing_mode: '"fast"',     vram_reserve_mib: "400" },
-    "exact":     { parallel: "2", routing_mode: '"exact"',    vram_reserve_mib: "450" },
-  };
-  const p = presets[name];
+  const p = (configMeta.profiles || {})[name];
   if (!p) return;
-  for (const [k, v] of Object.entries(p)) setTomlField(k, v);
+  for (const [k, v] of Object.entries(p)) setTomlField(k, _tomlLiteral(v));
 }
 
 function syncQuickBarFromToml() {
@@ -491,16 +499,26 @@ function syncQuickBarFromToml() {
   document.querySelectorAll("[data-effort]").forEach(b => b.classList.toggle("active", b.getAttribute("data-effort") === eff));
   const idle = _readTomlField(txt, "idle_min");
   if (idle) document.getElementById("qIdle").value = idle;
-  const par = _readTomlField(txt, "parallel"), rt = _readTomlField(txt, "routing_mode"), res = _readTomlField(txt, "vram_reserve_mib");
-  const prof = (par === "2" && rt === "balanced" && res === "450") ? "balanced"
-             : (par === "1" && rt === "fast" && res === "400") ? "solo-fast"
-             : (par === "2" && rt === "exact" && res === "450") ? "exact" : "";
+  let prof = "";
+  for (const [name, fields] of Object.entries(configMeta.profiles || {})) {
+    if (Object.entries(fields).every(([k, v]) => _readTomlField(txt, k) === String(v))) {
+      prof = name;
+      break;
+    }
+  }
   document.querySelectorAll("[data-prof]").forEach(b => b.classList.toggle("active", b.getAttribute("data-prof") === prof));
 }
 
 async function loadConfig() {
   const r = await api("/_control/config");
   const d = await r.json();
+  if (d.meta) {
+    configMeta = d.meta;
+    if (Array.isArray(d.meta.quants) && d.meta.quants.length) {
+      const qSel = document.getElementById("qQuant");
+      qSel.innerHTML = d.meta.quants.map(q => `<option value="${esc(q)}">${esc(q)}</option>`).join("");
+    }
+  }
   document.getElementById("cfgText").value = d.toml || "";
   if (d.config && d.config.colab) document.getElementById("waitGpuChk").checked = !!d.config.colab.wait_gpu;
   syncQuickBarFromToml();

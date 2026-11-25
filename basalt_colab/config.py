@@ -7,7 +7,6 @@ import os
 import re
 import tomllib
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any
 
 from basalt_colab.manifest import Manifest
@@ -446,6 +445,34 @@ class Config:
         validate_config(cfg)
         return cfg
 
+    def apply_hot_from(self, other: Config) -> None:
+        """Copies all HOT_FIELDS from `other` into `self` (single source of truth)."""
+        for dotted in HOT_FIELDS:
+            sec, field_name = dotted.split(".", 1)
+            setattr(getattr(self, sec), field_name, getattr(getattr(other, sec), field_name))
+
+    def hot_snapshot(self) -> dict[str, Any]:
+        """Returns a flat dict of current values for every field in HOT_FIELDS."""
+        snap: dict[str, Any] = {}
+        for dotted in sorted(HOT_FIELDS):
+            sec, field_name = dotted.split(".", 1)
+            snap[field_name] = getattr(getattr(self, sec), field_name)
+        return snap
+
+    def overlay_hot_dict(self, payload: dict[str, Any]) -> Config:
+        """Returns a validated Config overlaying nested section dicts and flat HOT_FIELDS keys."""
+        if not payload:
+            return self.clone()
+        merged = self.to_dict()
+        for sec in ("colab", "proxy", "basalt"):
+            if isinstance(payload.get(sec), dict):
+                merged[sec].update(payload[sec])
+        for dotted in HOT_FIELDS:
+            sec, field_name = dotted.split(".", 1)
+            if field_name in payload:
+                merged[sec][field_name] = payload[field_name]
+        return Config.from_dict(merged)
+
 
 def validate_config(cfg: Config) -> None:
     if not re.match(r"^[A-Za-z0-9._-]+$", cfg.colab.session):
@@ -732,4 +759,98 @@ def set_config_value(cfg: Config, key: str, raw_value: str) -> tuple[Config, str
         data[sec][field_name] = "" if (field_name in ("pack_url", "ref", "model_alias") and val_str in ("-", "none", "auto")) else val_str
     updated = Config.from_dict(data)
     return updated, canonical, _flatten(updated.to_dict())[canonical]
+
+
+@dataclass(frozen=True, slots=True)
+class BootOverrides:
+    """Validated per-boot overrides passed from CLI / Control API into Manager._launch."""
+
+    wait_gpu: bool | None = None
+    wait_gpu_min: float | None = None
+    basalt_ref: str | None = None
+    quant: str | None = None
+    pack_url: str | None = None
+    uncensor_scale: float | None = None
+    profile: str | None = None
+    routing_mode: str | None = None
+    parallel: int | None = None
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> BootOverrides:
+        if not isinstance(raw, dict):
+            return cls()
+        try:
+            wg = None if raw.get("wait_gpu") is None else _parse_bool(raw["wait_gpu"])
+            wgm = None if raw.get("wait_gpu_min") is None else float(raw["wait_gpu_min"])
+            us = None if raw.get("uncensor_scale") is None else float(raw["uncensor_scale"])
+            par = None if raw.get("parallel") is None else int(raw["parallel"])
+        except (TypeError, ValueError) as e:
+            raise ConfigError(f"invalid boot override value: {e}") from e
+        return cls(
+            wait_gpu=wg,
+            wait_gpu_min=wgm,
+            basalt_ref=None if raw.get("basalt_ref") is None else str(raw["basalt_ref"]).strip(),
+            quant=None if raw.get("quant") is None else str(raw["quant"]).strip(),
+            pack_url=None if raw.get("pack_url") is None else str(raw["pack_url"]).strip(),
+            uncensor_scale=us,
+            profile=None if raw.get("profile") is None else str(raw["profile"]).strip(),
+            routing_mode=None if raw.get("routing_mode") is None else str(raw["routing_mode"]).strip(),
+            parallel=par,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        fields = (
+            "wait_gpu", "wait_gpu_min", "basalt_ref", "quant", "pack_url",
+            "uncensor_scale", "profile", "routing_mode", "parallel",
+        )
+        return {k: getattr(self, k) for k in fields if getattr(self, k) is not None}
+
+    def resolve_wait_gpu(self, cfg: Config) -> tuple[bool, float]:
+        wait = cfg.colab.wait_gpu if self.wait_gpu is None else self.wait_gpu
+        limit = cfg.colab.wait_gpu_min if self.wait_gpu_min is None else self.wait_gpu_min
+        return wait, limit
+
+    def apply_to(self, cfg: Config, *, manifest: Manifest | None = None) -> Config:
+        """Returns a validated cloned Config with all non-None boot overrides applied."""
+        want = cfg.clone()
+        if self.profile is not None:
+            p = profile_value(self.profile)
+            if not p:
+                raise ConfigError(f"invalid --profile {self.profile!r} (expected balanced, solo-fast, or exact)")
+            want.apply_profile(p)
+        if self.basalt_ref is not None:
+            want.basalt.ref = self.basalt_ref.strip()
+        if self.quant is not None:
+            q = quant_value(self.quant)
+            if not q:
+                raise ConfigError(f"invalid --quant {self.quant!r} (expected ud-iq1_m, ud-iq2_xxs, ud-q2_k_xl, or custom)")
+            want.basalt.quant = q
+        if self.pack_url is not None:
+            want.basalt.pack_url = self.pack_url.strip()
+        if self.uncensor_scale is not None:
+            want.basalt.uncensor_scale = float(self.uncensor_scale)
+            want.basalt.uncensor = want.basalt.uncensor_scale > 0.0
+        if self.routing_mode is not None:
+            rt = routing_mode_value(self.routing_mode)
+            if not rt:
+                raise ConfigError(f"invalid --routing-mode {self.routing_mode!r} (expected balanced, exact, or fast)")
+            want.basalt.routing_mode = rt
+        if self.parallel is not None:
+            want.basalt.parallel = int(self.parallel)
+        if self.wait_gpu_min is not None and not (0.0 <= self.wait_gpu_min <= 1440.0):
+            raise ConfigError("wait_gpu_min must be 0 (unlimited) or 0.1..1440")
+        validate_config(want)
+        if manifest is not None:
+            want.boot_vars(manifest=manifest)
+        return want
+
+
+def config_meta() -> dict[str, Any]:
+    """Static config schema metadata shared with the Control Console UI."""
+    return {
+        "profiles": {k: dict(v) for k, v in PERFORMANCE_PROFILES.items()},
+        "quants": list(VALID_QUANTS),
+        "hot_fields": sorted(HOT_FIELDS),
+    }
+
 

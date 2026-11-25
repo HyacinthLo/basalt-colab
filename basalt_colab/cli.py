@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 import mimetypes
@@ -19,7 +18,8 @@ import sys
 import time
 import urllib.parse
 import webbrowser
-from typing import Any, Callable
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from basalt_colab import __version__
 from basalt_colab.clients import (
@@ -52,10 +52,11 @@ from basalt_colab.colab import (
     session_alive,
     spawn_detached,
     take_lock,
-    vmx,
+    vm_logs,
 )
 from basalt_colab.config import (
     HOT_FIELDS,
+    BootOverrides,
     Config,
     ConfigError,
     answer_room_value,
@@ -64,18 +65,29 @@ from basalt_colab.config import (
     effort_value,
     get_config_value,
     load_config,
-    profile_value,
     quant_value,
     routing_mode_value,
     save_config,
     set_config_value,
     short_context,
-    validate_config,
 )
 from basalt_colab.lifecycle import UPSTREAM_TIMEOUT, mmss, run_watchdog, stop_cloud
 from basalt_colab.manifest import Manifest, load_manifest
 from basalt_colab.paths import IS_WIN, Paths, get_paths, migrate_legacy_state
 from basalt_colab.proxy import serve, write_opencode_config
+from basalt_colab.term import (
+    TTY,
+    Live,
+    cli_name,
+    confirm,
+    glyph,
+    init_console,
+    minutes,
+    paint,
+    pick,
+    ring_bell,
+    units,
+)
 from basalt_colab.usage import UsageLedger
 
 USAGE = f"""basalt-colab {__version__} — DeepSeek-V4.1-Flash on Google Colab G4 via Basalt v0.5.7
@@ -114,88 +126,6 @@ env: BASALT_COLAB_HOME, BASALT_COLAB_PORT, BASALT_COLAB_BIND, BASALT_COLAB_QUANT
      BASALT_COLAB_WAIT_GPU, BASALT_COLAB_WAIT_GPU_MIN, BASALT_COLAB_NO_NOTIFY, BASALT_COLAB_REF,
      BASALT_COLAB_MAX_CONTEXT (32K..1M), BASALT_COLAB_PARALLEL (1-4), BASALT_COLAB_KV (fp8|fp16),
      BASALT_COLAB_EFFORT, BASALT_COLAB_STRICT_MODEL, HF_TOKEN, BASALT_COLAB_YES=1"""
-
-TTY, COLOR = [False], [False]
-
-
-def init_console() -> None:
-    TTY[0] = bool(sys.stdout and sys.stdout.isatty())
-    if not TTY[0] or os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
-        return
-    if IS_WIN:
-        try:
-            import ctypes
-
-            k32, mode = ctypes.windll.kernel32, ctypes.c_uint32()
-            h = k32.GetStdHandle(-11)
-            if not (k32.GetConsoleMode(h, ctypes.byref(mode)) and k32.SetConsoleMode(h, mode.value | 4)):
-                return
-        except (AttributeError, OSError):
-            return
-    COLOR[0] = True
-
-
-def ring_bell(enabled: bool = True) -> None:
-    if not enabled or not TTY[0] or os.environ.get("BASALT_COLAB_NO_NOTIFY") in ("1", "true", "yes"):
-        return
-    try:
-        sys.stdout.write("\a")
-        sys.stdout.flush()
-    except OSError:
-        pass
-
-
-def paint(text: str, *styles: str) -> str:
-    codes = {"bold": "1", "dim": "2", "red": "31", "green": "32", "cyan": "36", "yellow": "33"}
-    return f"\x1b[{';'.join(codes[s] for s in styles)}m{text}\x1b[0m" if COLOR[0] else text
-
-
-def glyph(fancy: str, plain: str) -> str:
-    utf = "utf" in (getattr(sys.stdout, "encoding", None) or "").lower()
-    return fancy if utf and (not IS_WIN or os.environ.get("WT_SESSION")) else plain
-
-
-def units(cu: float) -> str:
-    return f"about {cu:.2f} compute units" if cu < 1 else f"about {cu:.1f} compute units"
-
-
-def minutes(n: float) -> str:
-    return f"{n:g} minute{'' if n == 1 else 's'}"
-
-
-def cli_name() -> str:
-    if shutil.which("basalt-colab"):
-        return "basalt-colab"
-    return "python -m basalt_colab" if IS_WIN else "python3 -m basalt_colab"
-
-
-class Live:
-    def __init__(self) -> None:
-        self.width, self.n = 0, 0
-
-    def clear(self) -> None:
-        if self.width:
-            sys.stdout.write("\r" + " " * self.width + "\r")
-            self.width = 0
-
-    def put(self, parts: list[tuple[str, tuple[str, ...]]]) -> None:
-        if not TTY[0]:
-            return
-        cols = shutil.get_terminal_size((80, 24)).columns - 1
-        plain = "".join(t for t, _ in parts)
-        self.clear()
-        sys.stdout.write(plain[:cols] if len(plain) > cols else "".join(paint(t, *st) for t, st in parts))
-        sys.stdout.flush()
-        self.width = min(len(plain), cols)
-
-    def show(self, when: str, text: str) -> None:
-        spin = glyph("⣾⣽⣻⢿⡿⣟⣯⣷", "|/-\\")
-        self.n += 1
-        self.put([("  ", ()), (f"{when:>5}", ("dim",)), ("  ", ()), (spin[self.n % len(spin)], ("cyan",)), ("  " + text, ())])
-
-    def line(self, text: str) -> None:
-        self.clear()
-        print(text, flush=True)
 
 
 def control_call(
@@ -254,17 +184,6 @@ def follow(resp: http.client.HTTPResponse, header: str | None = None) -> tuple[s
     return "", ""
 
 
-def confirm(question: str) -> bool:
-    if os.environ.get("BASALT_COLAB_YES") == "1" or os.environ.get("LLM_YES") == "1":
-        return True
-    if not (sys.stdin and sys.stdin.isatty()):
-        return False
-    try:
-        return input(question + " [Y/n] ").strip().lower() in ("", "y", "yes")
-    except EOFError:
-        return False
-
-
 def install_colab(manifest: Manifest) -> bool:
     home_bin = os.path.join(os.path.expanduser("~"), ".local", "bin")
     uv = shutil.which("uv") or next((p for p in (os.path.join(home_bin, "uv.exe" if IS_WIN else "uv"),) if os.path.exists(p)), None)
@@ -301,7 +220,7 @@ def colab_login() -> None:
         if not chunk:
             break
         *lines, buf = (buf + chunk).split(b"\n")
-        keep = [l + b"\n" for l in lines if not l.lstrip().startswith(hide)]
+        keep = [ln + b"\n" for ln in lines if not ln.lstrip().startswith(hide)]
         if buf and not any(h.startswith(buf.lstrip()) for h in hide):
             keep, buf = keep + [buf], b""
         sys.stdout.flush()
@@ -383,13 +302,15 @@ def format_telemetry(b: dict[str, Any] | None) -> str:
 def endpoint_info(paths: Paths, cfg: Config, manifest: Manifest, port: int, bal: float | None = None) -> None:
     me_cmd = cli_name()
     host = cfg.proxy.host
+    pack = manifest.pack(cfg.basalt.quant)
+    est_speed = pack.estimated_speed_tok_s if pack else manifest.estimated_speed_tok_s
     rows = (
         ("Console", f"http://{host}:{port}/_console"),
         ("Web UI", f"http://{host}:{port}/"),
         ("Base URL", f"http://{host}:{port}/v1"),
         ("API key", read_api_key(paths)),
         ("Model", f"{cfg.basalt.effective_model_alias} (effort {cfg.basalt.effort}, {cfg.describe_uncensor()})"),
-        ("Engine", f"{cfg.describe_engine()} · ~{(manifest.pack(cfg.basalt.quant).estimated_speed_tok_s if manifest.pack(cfg.basalt.quant) else manifest.estimated_speed_tok_s):.0f} tok/s"),
+        ("Engine", f"{cfg.describe_engine()} · ~{est_speed:.0f} tok/s"),
     )
     print()
     for name, value in rows:
@@ -517,23 +438,6 @@ def watch_event(prev: str, state: str, st: dict[str, Any]) -> str:
     return "GPU " + state
 
 
-def pick(label: str, hint: str, default: Any, parse: Callable[[str], Any]) -> Any:
-    d_str = f"[{default}]"
-    row = (
-        f"  {paint(f'{label:<14}', 'bold')}{paint(f'{hint:<30}', 'dim')}"
-        f"{paint(f'{d_str:>10}', 'cyan')} {paint(glyph('›', '>'), 'cyan')} "
-    )
-    while True:
-        try:
-            text = input(row).strip()
-        except EOFError:
-            text = ""
-        val = parse(text or str(default))
-        if val is not None:
-            return val
-        print(f"  {' ' * 14}{paint('not valid, try again', 'red')}")
-
-
 def _parse_num(text: str, low: float, high: float) -> int | float | None:
     try:
         v = float(text)
@@ -610,104 +514,21 @@ def _parse_wait_gpu_args(args: list[str]) -> tuple[bool, float | None]:
     return wait_gpu, wait_gpu_min
 
 
-def _build_up_opts(
-    cfg: Config,
-    manifest: Manifest,
-    *,
-    wait_gpu: bool,
-    wait_gpu_min: float | None,
-    basalt_ref: str | None,
-    quant: str | None,
-    pack_url: str | None,
-    uncensor_scale: float | None,
-    profile: str | None,
-    routing_mode: str | None,
-    parallel: int | None,
-) -> tuple[Config, dict[str, Any]]:
-    want_cfg = cfg.clone()
-    if profile is not None:
-        p = profile_value(profile)
-        if not p:
-            sys.exit(f"invalid --profile {profile!r} (expected balanced, solo-fast, or exact)")
-        want_cfg.apply_profile(p)
-        profile = p
-    if basalt_ref is not None:
-        want_cfg.basalt.ref = basalt_ref
-    if quant is not None:
-        q = quant_value(quant)
-        if not q:
-            sys.exit(f"invalid --quant {quant!r} (expected ud-iq1_m, ud-iq2_xxs, ud-q2_k_xl, or custom)")
-        want_cfg.basalt.quant = q
-    if pack_url is not None:
-        want_cfg.basalt.pack_url = pack_url
-    if uncensor_scale is not None:
-        want_cfg.basalt.uncensor_scale = uncensor_scale
-        want_cfg.basalt.uncensor = uncensor_scale > 0.0
-    if routing_mode is not None:
-        rt = routing_mode_value(routing_mode)
-        if not rt:
-            sys.exit(f"invalid --routing-mode {routing_mode!r} (expected balanced, exact, or fast)")
-        want_cfg.basalt.routing_mode = rt
-    if parallel is not None:
-        want_cfg.basalt.parallel = parallel
-    try:
-        validate_config(want_cfg)
-        want_cfg.boot_vars(manifest=manifest)
-    except ConfigError as e:
-        sys.exit(f"config error: {e}")
-
-    up_opts: dict[str, Any] = {}
-    if wait_gpu:
-        up_opts["wait_gpu"] = True
-    if wait_gpu_min is not None:
-        up_opts["wait_gpu_min"] = wait_gpu_min
-    if basalt_ref is not None:
-        up_opts["basalt_ref"] = basalt_ref
-    if profile is not None:
-        up_opts["profile"] = profile
-    if quant is not None:
-        up_opts["quant"] = want_cfg.basalt.quant
-    if pack_url is not None:
-        up_opts["pack_url"] = want_cfg.basalt.pack_url
-    if uncensor_scale is not None:
-        up_opts["uncensor_scale"] = want_cfg.basalt.uncensor_scale
-    if routing_mode is not None:
-        up_opts["routing_mode"] = want_cfg.basalt.routing_mode
-    if parallel is not None:
-        up_opts["parallel"] = want_cfg.basalt.parallel
-    return want_cfg, up_opts
-
-
 def cmd_up(
     paths: Paths,
     cfg: Config,
     manifest: Manifest,
-    wait_gpu: bool,
-    basalt_ref: str | None,
-    quant: str | None = None,
-    pack_url: str | None = None,
-    uncensor_scale: float | None = None,
-    profile: str | None = None,
-    routing_mode: str | None = None,
-    parallel: int | None = None,
-    wait_gpu_min: float | None = None,
+    overrides: BootOverrides | None = None,
+    *,
     detach: bool = False,
     do_notify: bool = True,
     restart: bool = False,
 ) -> None:
-    want_cfg, up_opts = _build_up_opts(
-        cfg,
-        manifest,
-        wait_gpu=wait_gpu,
-        wait_gpu_min=wait_gpu_min,
-        basalt_ref=basalt_ref,
-        quant=quant,
-        pack_url=pack_url,
-        uncensor_scale=uncensor_scale,
-        profile=profile,
-        routing_mode=routing_mode,
-        parallel=parallel,
-    )
+    ov = overrides or BootOverrides()
+    try:
+        want_cfg = ov.apply_to(cfg, manifest=manifest)
+    except ConfigError as e:
+        sys.exit(f"config error: {e}")
     print(paint(f"basalt-colab {__version__} · {want_cfg.basalt.effective_model_alias} (Basalt {want_cfg.basalt.ref or manifest.basalt_tag})", "bold") + "\n")
     bal = ensure_setup(paths, want_cfg, manifest)
     held = serve_running(paths)
@@ -724,7 +545,7 @@ def cmd_up(
         if restart
         else paint("Starting a Colab G4 GPU", "bold")
     ) + paint(" · ~1.5-2 minutes (prebuilt binary)", "dim")
-    conn, r = control_call(paths, want_cfg, held["port"], endpoint_path, up_opts, 120)
+    conn, r = control_call(paths, want_cfg, held["port"], endpoint_path, ov.to_dict(), 120)
     kind, rest = follow(r, header)
     conn.close()
     if kind != "READY":
@@ -898,28 +719,26 @@ def cmd_config(paths: Paths, cfg: Config, args: list[str]) -> None:
         sys.exit(f"unknown config subcommand {sub!r} (use: show, path, wizard, get, set, profile)")
     if not (sys.stdin and sys.stdin.isatty()):
         sys.exit(f"Config: {cfg.summary()}\nEdit {paths.config_file} or run '{cli_name()} config' in a terminal.")
-    updated = interactive_config_wizard(paths, cfg)
-    if updated:
-        _reload_proxy_if_running(paths, updated)
+    wizard_cfg = interactive_config_wizard(paths, cfg)
+    if wizard_cfg:
+        _reload_proxy_if_running(paths, wizard_cfg)
 
 
-def cmd_logs(paths: Paths, cfg: Config, args: list[str] | None = None) -> None:
-    opts = args or []
-    follow_mode = "-f" in opts or "--follow" in opts
-    only_local = "--local" in opts
-    only_vm = "--vm" in opts
+def cmd_logs(
+    paths: Paths,
+    cfg: Config,
+    *,
+    follow_mode: bool = False,
+    only_local: bool = False,
+    only_vm: bool = False,
+) -> None:
     key = read_api_key(paths) if paths.key_file.exists() else ""
 
     if not only_vm:
         raw = read_bytes(paths.log_file)
         print(redact(raw.decode("utf-8", "replace")[-4000:], key) if raw is not None else "(no local log)")
     if not only_local and not follow_mode and session_alive(cfg.colab.session):
-        _, out = vmx(
-            cfg.colab.session,
-            "cat /content/res/timeline.txt 2>/dev/null; tail -n 25 /content/res/server.log 2>/dev/null; "
-            "tail -n 15 /root/.cache/basalt/*/engine.log 2>/dev/null || true",
-            40,
-        )
+        _, out = vm_logs(cfg.colab.session)
         print(redact(out, key))
     if follow_mode:
         print(paint("--- following local log (Ctrl+C to stop) ---", "dim"), flush=True)
@@ -1146,14 +965,21 @@ def client_env_vars(paths: Paths, cfg: Config, port: int) -> tuple[tuple[str, st
     return env_vars(ep)
 
 
-def cmd_connect(paths: Paths, cfg: Config, target: str | None, args: list[str]) -> None:
+def cmd_connect(
+    paths: Paths,
+    cfg: Config,
+    target: str | None,
+    *,
+    as_json: bool = False,
+    raw_only: bool = False,
+    sh: bool = False,
+    powershell: bool = False,
+    do_write: bool = False,
+) -> None:
     ep, running = fetch_live_endpoint(paths, cfg)
     me_cmd = cli_name()
-    as_json = "--json" in args
-    raw_only = "--raw" in args
-    want_ps = "--powershell" in args or (IS_WIN and "--sh" not in args)
-    only_env = "--sh" in args or "--powershell" in args
-    do_write = "--write" in args
+    want_ps = powershell or (IS_WIN and not sh)
+    only_env = sh or powershell
 
     if not target:
         if as_json:
@@ -1170,18 +996,18 @@ def cmd_connect(paths: Paths, cfg: Config, target: str | None, args: list[str]) 
         print(f"\n  {paint('Tip:', 'dim')} add {paint('--raw', 'cyan')} to print only the snippet for piping, or open {paint(f'{me_cmd} console', 'cyan')} for 1-click Copy.")
         return
 
-    cid = resolve_client(target)
-    if cid is None:
+    resolved = resolve_client(target)
+    if resolved is None:
         sys.exit(f"unknown client {target!r} (supported: {', '.join(VALID_CLIENTS)})")
-    bundle = client_bundle(ep, cid)
+    bundle = client_bundle(ep, resolved)
 
     if do_write:
-        if cid == "opencode":
+        if resolved == "opencode":
             write_opencode_config(paths, cfg, ep.port)
             print(f"  {paint(glyph('✓', '+'), 'green')} Wrote {paths.opencode_file}")
             print(f"  Run: {paint(f'OPENCODE_CONFIG={shlex.quote(str(paths.opencode_file))} opencode', 'cyan')}")
             return
-        sys.exit(f"--write is supported for opencode; for {cid}, copy or pipe `{me_cmd} connect {cid} --raw` into {bundle['file_hint']}")
+        sys.exit(f"--write is supported for opencode; for {resolved}, copy or pipe `{me_cmd} connect {resolved} --raw` into {bundle['file_hint']}")
 
     if as_json:
         print(json.dumps(bundle, indent=2))
@@ -1206,17 +1032,24 @@ def cmd_connect(paths: Paths, cfg: Config, target: str | None, args: list[str]) 
         print("\n" + paint(bundle["notes"], "dim"))
 
 
-def cmd_env(paths: Paths, cfg: Config, args: list[str]) -> None:
+def cmd_env(
+    paths: Paths,
+    cfg: Config,
+    *,
+    as_json: bool = False,
+    sh: bool = False,
+    powershell: bool = False,
+    client: str | None = None,
+) -> None:
     ep, _ = fetch_live_endpoint(paths, cfg)
-    if "--json" in args:
+    if as_json:
         print(json.dumps(dict(env_vars(ep)), indent=2))
         return
-    ps = "--powershell" in args or (IS_WIN and "--sh" not in args)
-    for flag, cid in (("--dsh", "dsh"), ("--claude", "claude"), ("--codex", "codex"), ("--opencode", "opencode")):
-        if flag in args:
-            b = client_bundle(ep, cid)
-            print(b["env_ps"] if ps else b["env_sh"])
-            return
+    ps = powershell or (IS_WIN and not sh)
+    if client:
+        b = client_bundle(ep, client)
+        print(b["env_ps"] if ps else b["env_sh"])
+        return
     print(format_env_lines(env_vars(ep), powershell=ps))
 
 
@@ -1395,7 +1228,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    if sys.version_info < (3, 11):
+    if sys.version_info < (3, 11):  # noqa: UP036
         sys.exit(f"basalt-colab needs Python 3.11+ (this is {sys.version_info.major}.{sys.version_info.minor})")
     if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
@@ -1429,14 +1262,9 @@ def main(argv: list[str] | None = None) -> None:
         elif cmd == "setup":
             cmd_setup(paths, cfg, manifest)
         elif cmd in ("up", "restart"):
-            wait_gpu = ns.wait_gpu is not None
-            wait_gpu_min = None if ns.wait_gpu in (None, _WAIT_GPU_DEFAULT) else float(ns.wait_gpu)
-            cmd_up(
-                paths,
-                cfg,
-                manifest,
-                wait_gpu=wait_gpu,
-                wait_gpu_min=wait_gpu_min,
+            overrides = BootOverrides(
+                wait_gpu=True if ns.wait_gpu is not None else None,
+                wait_gpu_min=None if ns.wait_gpu in (None, _WAIT_GPU_DEFAULT) else float(ns.wait_gpu),
                 basalt_ref=ns.basalt_ref,
                 quant=ns.quant,
                 pack_url=ns.pack_url,
@@ -1444,6 +1272,12 @@ def main(argv: list[str] | None = None) -> None:
                 profile=ns.profile,
                 routing_mode=ns.routing_mode,
                 parallel=ns.parallel,
+            )
+            cmd_up(
+                paths,
+                cfg,
+                manifest,
+                overrides,
                 detach=ns.detach,
                 do_notify=not ns.no_notify,
                 restart=(cmd == "restart"),
@@ -1469,10 +1303,7 @@ def main(argv: list[str] | None = None) -> None:
                 cfg_args = [ns.config_cmd]
             cmd_config(paths, cfg, cfg_args)
         elif cmd == "logs":
-            log_args = [
-                f for f, on in (("--follow", ns.follow), ("--local", ns.local), ("--vm", ns.vm)) if on
-            ]
-            cmd_logs(paths, cfg, log_args)
+            cmd_logs(paths, cfg, follow_mode=ns.follow, only_local=ns.local, only_vm=ns.vm)
         elif cmd == "ask":
             effort = "none" if ns.no_think else ("max" if ns.effort_max else ns.effort)
             ask_opts: dict[str, Any] = {
@@ -1486,33 +1317,22 @@ def main(argv: list[str] | None = None) -> None:
             }
             cmd_ask(paths, cfg, [], opts=ask_opts)
         elif cmd == "connect":
-            conn_flags = [
-                f
-                for f, on in (
-                    ("--raw", ns.raw),
-                    ("--json", ns.as_json),
-                    ("--sh", ns.sh),
-                    ("--powershell", ns.powershell),
-                    ("--write", ns.write),
-                )
-                if on
-            ]
-            cmd_connect(paths, cfg, ns.target, conn_flags)
+            cmd_connect(
+                paths,
+                cfg,
+                ns.target,
+                as_json=ns.as_json,
+                raw_only=ns.raw,
+                sh=ns.sh,
+                powershell=ns.powershell,
+                do_write=ns.write,
+            )
         elif cmd == "env":
-            env_flags = [
-                f
-                for f, on in (
-                    ("--sh", ns.sh),
-                    ("--powershell", ns.powershell),
-                    ("--json", ns.as_json),
-                    ("--dsh", ns.dsh),
-                    ("--claude", ns.claude),
-                    ("--codex", ns.codex),
-                    ("--opencode", ns.opencode),
-                )
-                if on
-            ]
-            cmd_env(paths, cfg, env_flags)
+            env_client = next(
+                (cid for cid, on in (("dsh", ns.dsh), ("claude", ns.claude), ("codex", ns.codex), ("opencode", ns.opencode)) if on),
+                None,
+            )
+            cmd_env(paths, cfg, as_json=ns.as_json, sh=ns.sh, powershell=ns.powershell, client=env_client)
         elif cmd == "doctor":
             cmd_doctor(paths, cfg, manifest)
     except KeyboardInterrupt:

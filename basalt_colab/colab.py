@@ -11,6 +11,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tarfile
 import threading
 import time
@@ -141,7 +142,18 @@ def vm_timeline(session: str) -> tuple[int, str]:
     return vmx(session, "cat /content/res/timeline.txt 2>/dev/null; ls /content/res/READY 2>/dev/null", 40)
 
 
+def vm_logs(session: str) -> tuple[int, str]:
+    return vmx(
+        session,
+        "cat /content/res/timeline.txt 2>/dev/null; tail -n 25 /content/res/server.log 2>/dev/null; "
+        "tail -n 15 /root/.cache/basalt/*/engine.log 2>/dev/null || true",
+        40,
+    )
+
+
 def _win_start(pid: int) -> str | None:
+    if sys.platform != "win32":
+        return None
     import ctypes
     from ctypes import wintypes
 
@@ -215,7 +227,7 @@ def alive(rec: dict[str, Any] | None) -> bool:
 
 
 def kill_rec(rec: dict[str, Any] | None) -> None:
-    if alive(rec):
+    if rec and alive(rec):
         kill_tree(int(rec["pid"]))
 
 
@@ -284,7 +296,7 @@ _LOCK_GUARD = threading.Lock()
 
 def _try_kernel_lock(fd: int) -> bool:
     """Acquires a non-blocking exclusive OS kernel lock on fd (Unix flock / Windows msvcrt)."""
-    if IS_WIN:
+    if sys.platform == "win32":
         import msvcrt
 
         try:
@@ -307,7 +319,7 @@ def _try_kernel_lock(fd: int) -> bool:
 
 def _release_kernel_lock(fd: int) -> None:
     try:
-        if IS_WIN:
+        if sys.platform == "win32":
             import msvcrt
 
             os.lseek(fd, 0, os.SEEK_SET)
@@ -493,7 +505,8 @@ def build_bundle(paths: Paths, out_path: Path) -> None:
     """Writes VM tarball with LF line endings and strict 0600 secret permissions."""
     items: list[tuple[Path | None, str, int, bytes | None]] = [
         (paths.vm_dir / f, "vm/" + f, 0o644, None) for f in vm_files(paths.vm_dir)
-    ] + [(paths.key_file, "secrets/key", 0o600, None)]
+    ]
+    items.append((paths.key_file, "secrets/key", 0o600, None))
     if os.environ.get("HF_TOKEN"):
         hdr = f"Authorization: Bearer {os.environ['HF_TOKEN'].strip()}\n".encode()
         items.append((None, "secrets/hf_hdr", 0o600, hdr))

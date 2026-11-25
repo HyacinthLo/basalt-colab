@@ -4,7 +4,6 @@ from __future__ import annotations
 import hmac
 import http.client
 import json
-import os
 import selectors
 import signal
 import socket
@@ -16,6 +15,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+from basalt_colab.clients import ClientEndpoint, all_client_bundles, opencode_config_dict
 from basalt_colab.colab import (
     Logger,
     read_api_key,
@@ -25,12 +25,20 @@ from basalt_colab.colab import (
     session_alive,
     take_lock,
     update_lock,
-    vmx,
+    vm_logs,
 )
-from basalt_colab.clients import ClientEndpoint, all_client_bundles, opencode_config_dict
-from basalt_colab.config import Config, ConfigError, dump_toml, load_config, parse_toml, save_config
+from basalt_colab.config import (
+    BootOverrides,
+    Config,
+    ConfigError,
+    config_meta,
+    dump_toml,
+    load_config,
+    parse_toml,
+    save_config,
+)
 from basalt_colab.console import render_console_html
-from basalt_colab.lifecycle import Manager, UPSTREAM_TIMEOUT
+from basalt_colab.lifecycle import UPSTREAM_TIMEOUT, Manager, VmState
 from basalt_colab.manifest import Manifest
 from basalt_colab.paths import IS_WIN, Paths
 from basalt_colab.usage import UsageLedger
@@ -152,10 +160,11 @@ class ProxyServer(ThreadingHTTPServer):
     paths: Paths
 
     def server_bind(self) -> None:
-        if IS_WIN:
+        if sys.platform == "win32":
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
         socketserver.TCPServer.server_bind(self)
-        self.server_name, self.server_port = self.server_address[:2]
+        host, port = self.server_address[:2]
+        self.server_name, self.server_port = str(host), int(port)
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         e = sys.exc_info()[1]
@@ -218,9 +227,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(code, obj)
             return
         path = self.path.split("?")[0]
-        err = (
-            obj.get("error")
-            if isinstance(obj, dict) and isinstance(obj.get("error"), dict)
+        raw_err = obj.get("error") if isinstance(obj, dict) else None
+        err: dict[str, Any] = (
+            raw_err
+            if isinstance(raw_err, dict)
             else {"code": code, "message": msg or str(obj), "type": "unavailable_error"}
         )
         if path == "/v1/messages":
@@ -252,7 +262,8 @@ class Handler(BaseHTTPRequestHandler):
     def read_body(self) -> bytes | None:
         try:
             if "chunked" in self.headers.get("Transfer-Encoding", "").lower():
-                parts, total = [], 0
+                parts: list[bytes] = []
+                total = 0
                 while True:
                     n = int(self.rfile.readline(1024).split(b";")[0].strip(), 16)
                     if n == 0:
@@ -522,168 +533,151 @@ class Handler(BaseHTTPRequestHandler):
         if chunked:
             self.wfile.write(b"0\r\n\r\n")
 
+    def _sync_lock_and_opencode(self) -> None:
+        mgr, paths = self.server.mgr, self.server.paths
+        update_lock(paths, {"cold_signature": mgr.cfg.cold_signature(), "engine_summary": mgr.cfg.describe_engine()})
+        try:
+            write_opencode_config(paths, mgr.cfg, self.server.server_port)
+        except OSError:
+            pass
+
     def control(self, path: str, query: str, body: bytes | None) -> None:
         if not self.authed():
             return
-        mgr = self.server.mgr
-        paths = self.server.paths
         qs = urllib.parse.parse_qs(query)
-
         if path == "/_control/status":
-            return self.send_json(200, mgr.status())
-
+            return self.send_json(200, self.server.mgr.status())
         if path == "/_control/events" and body is None:
-            self.start_chunked("text/event-stream")
-            self.close_connection = True
-            try:
-                rev = mgr.event_rev()
-                st = mgr.status()
-                self.chunk(b"data: " + json.dumps(st).encode("utf-8") + b"\n\n")
-                while not mgr.closing:
-                    if self.client_gone():
-                        break
-                    active_mode = st["state"] != "off"
-                    new_rev = mgr.wait_event(rev, timeout=1.0 if active_mode else 15.0)
-                    if mgr.closing or self.client_gone():
-                        break
-                    if new_rev == rev and not active_mode:
-                        self.chunk(b": ping\n\n")
-                        continue
-                    rev = new_rev
-                    st = mgr.status()
-                    self.chunk(b"data: " + json.dumps(st).encode("utf-8") + b"\n\n")
-            except OSError:
-                pass
-            try:
-                self.wfile.write(b"0\r\n\r\n")
-            except OSError:
-                pass
-            return
-
+            return self._ctrl_events()
         if path == "/_control/clients" and body is None:
-            ep = ClientEndpoint.from_config(
-                mgr.cfg,
-                read_api_key(paths),
-                port=self.server.server_port,
-                paths=paths,
-            )
-            return self.send_json(200, all_client_bundles(ep))
-
+            return self._ctrl_clients()
         if path == "/_control/usage":
             days = int((qs.get("days") or ["30"])[0])
-            return self.send_json(200, mgr.usage_summary(days=days))
-
+            return self.send_json(200, self.server.mgr.usage_summary(days=days))
         if path == "/_control/logs":
-            raw = read_bytes(paths.log_file)
-            key = read_api_key(paths)
-            local_txt = redact(raw.decode("utf-8", "replace")[-6000:], key) if raw is not None else ""
-            vm_txt = ""
-            if (qs.get("vm") or ["0"])[0] == "1" and session_alive(mgr.cfg.colab.session):
-                _, out = vmx(
-                    mgr.cfg.colab.session,
-                    "cat /content/res/timeline.txt 2>/dev/null; tail -n 25 /content/res/server.log 2>/dev/null; "
-                    "tail -n 15 /root/.cache/basalt/*/engine.log 2>/dev/null || true",
-                    40,
-                )
-                vm_txt = redact(out, key)
-            return self.send_json(200, {"local": local_txt, "vm": vm_txt})
-
+            return self._ctrl_logs(include_vm=(qs.get("vm") or ["0"])[0] == "1")
         if path == "/_control/config":
-            if body is None:
-                disk_cfg = load_config(paths, apply_env=False)
-                return self.send_json(200, {"config": disk_cfg.to_dict(), "toml": dump_toml(disk_cfg), "path": str(paths.config_file)})
-            try:
-                prev_disk = load_config(paths, apply_env=False)
-                payload = json.loads(body or b"{}")
-                if "toml" in payload:
-                    new_cfg = parse_toml(str(payload["toml"]))
-                elif "config" in payload:
-                    new_cfg = Config.from_dict(payload["config"])
-                else:
-                    raise ConfigError("expected 'toml' or 'config' in request body")
-                save_config(new_cfg, paths)
-                hot, cold = mgr.reload_config(new_cfg, prev_cfg=prev_disk)
-                update_lock(paths, {"cold_signature": mgr.cfg.cold_signature(), "engine_summary": mgr.cfg.describe_engine()})
-                try:
-                    write_opencode_config(paths, mgr.cfg, self.server.server_port)
-                except OSError:
-                    pass
-                mgr.logger.log(f"config saved: hot={hot} cold={cold}", echo=False)
-                return self.send_json(200, {
-                    "applied": {
-                        "effort": mgr.cfg.basalt.effort,
-                        "idle_min": mgr.cfg.colab.idle_min,
-                        "max_hours": mgr.cfg.colab.max_hours,
-                        "wait_gpu": mgr.cfg.colab.wait_gpu,
-                        "wait_gpu_min": mgr.cfg.colab.wait_gpu_min,
-                        "strict_model": mgr.cfg.proxy.strict_model,
-                    },
-                    "toml": dump_toml(new_cfg),
-                    "config": new_cfg.to_dict(),
-                    "hot_changed": hot,
-                    "cold_changed": cold,
-                    "restart_required": bool(cold),
-                })
-            except (ValueError, ConfigError) as e:
-                return self.fail(400, str(e), obj=error_obj(400, str(e), "invalid_request_error"))
-
+            return self._ctrl_config(body)
         if path == "/_control/reload" and body is not None:
-            try:
-                payload = json.loads(body or b"{}")
-                new_cfg = load_config(paths, apply_env=False)
-                if isinstance(payload, dict) and payload:
-                    merged = new_cfg.to_dict()
-                    for sec in ("colab", "proxy", "basalt"):
-                        if isinstance(payload.get(sec), dict):
-                            merged[sec].update(payload[sec])
-                    # Also accept convenient flat hot keys: effort, idle_min, max_hours, wait_gpu, wait_gpu_min, strict_model
-                    if "effort" in payload:
-                        merged["basalt"]["effort"] = payload["effort"]
-                    if "idle_min" in payload:
-                        merged["colab"]["idle_min"] = payload["idle_min"]
-                    if "max_hours" in payload:
-                        merged["colab"]["max_hours"] = payload["max_hours"]
-                    if "wait_gpu" in payload:
-                        merged["colab"]["wait_gpu"] = payload["wait_gpu"]
-                    if "wait_gpu_min" in payload:
-                        merged["colab"]["wait_gpu_min"] = payload["wait_gpu_min"]
-                    if "strict_model" in payload:
-                        merged["proxy"]["strict_model"] = payload["strict_model"]
-                    new_cfg = Config.from_dict(merged)
-                hot, cold = mgr.reload_config(new_cfg)
-                update_lock(paths, {"cold_signature": mgr.cfg.cold_signature(), "engine_summary": mgr.cfg.describe_engine()})
-                try:
-                    write_opencode_config(paths, mgr.cfg, self.server.server_port)
-                except OSError:
-                    pass
-                return self.send_json(200, {
-                    "applied": {
-                        "effort": mgr.cfg.basalt.effort,
-                        "idle_min": mgr.cfg.colab.idle_min,
-                        "max_hours": mgr.cfg.colab.max_hours,
-                        "wait_gpu": mgr.cfg.colab.wait_gpu,
-                        "wait_gpu_min": mgr.cfg.colab.wait_gpu_min,
-                        "strict_model": mgr.cfg.proxy.strict_model,
-                    },
-                    "hot_changed": hot,
-                    "cold_changed": cold,
-                    "restart_required": bool(cold),
-                })
-            except (ValueError, ConfigError) as e:
-                return self.fail(400, str(e), obj=error_obj(400, str(e), "invalid_request_error"))
+            return self._ctrl_reload(body)
+        if path in ("/_control/up", "/_control/down", "/_control/restart") and body is not None:
+            return self._ctrl_lifecycle(path, body)
+        return self.fail(404, "unknown control request", obj=error_obj(404, "unknown control request", "not_found_error"))
 
-        if path not in ("/_control/up", "/_control/down", "/_control/restart") or body is None:
-            return self.fail(404, "unknown control request", obj=error_obj(404, "unknown control request", "not_found_error"))
+    def _ctrl_events(self) -> None:
+        mgr = self.server.mgr
+        self.start_chunked("text/event-stream")
+        self.close_connection = True
+        try:
+            rev = mgr.event_rev()
+            st = mgr.status()
+            self.chunk(b"data: " + json.dumps(st).encode("utf-8") + b"\n\n")
+            while not mgr.closing:
+                if self.client_gone():
+                    break
+                active_mode = st["state"] != VmState.OFF
+                new_rev = mgr.wait_event(rev, timeout=1.0 if active_mode else 15.0)
+                if mgr.closing or self.client_gone():
+                    break
+                if new_rev == rev and not active_mode:
+                    self.chunk(b": ping\n\n")
+                    continue
+                rev = new_rev
+                st = mgr.status()
+                self.chunk(b"data: " + json.dumps(st).encode("utf-8") + b"\n\n")
+        except OSError:
+            pass
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+        except OSError:
+            pass
 
+    def _ctrl_clients(self) -> None:
+        ep = ClientEndpoint.from_config(
+            self.server.mgr.cfg,
+            read_api_key(self.server.paths),
+            port=self.server.server_port,
+            paths=self.server.paths,
+        )
+        self.send_json(200, all_client_bundles(ep))
+
+    def _ctrl_logs(self, *, include_vm: bool) -> None:
+        mgr, paths = self.server.mgr, self.server.paths
+        raw = read_bytes(paths.log_file)
+        key = read_api_key(paths)
+        local_txt = redact(raw.decode("utf-8", "replace")[-6000:], key) if raw is not None else ""
+        vm_txt = ""
+        if include_vm and session_alive(mgr.cfg.colab.session):
+            _, out = vm_logs(mgr.cfg.colab.session)
+            vm_txt = redact(out, key)
+        self.send_json(200, {"local": local_txt, "vm": vm_txt})
+
+    def _ctrl_config(self, body: bytes | None) -> None:
+        mgr, paths = self.server.mgr, self.server.paths
+        if body is None:
+            disk_cfg = load_config(paths, apply_env=False)
+            return self.send_json(200, {
+                "config": disk_cfg.to_dict(),
+                "toml": dump_toml(disk_cfg),
+                "path": str(paths.config_file),
+                "meta": config_meta(),
+            })
+        try:
+            prev_disk = load_config(paths, apply_env=False)
+            payload = json.loads(body or b"{}")
+            if "toml" in payload:
+                new_cfg = parse_toml(str(payload["toml"]))
+            elif "config" in payload:
+                new_cfg = Config.from_dict(payload["config"])
+            else:
+                raise ConfigError("expected 'toml' or 'config' in request body")
+            save_config(new_cfg, paths)
+            hot, cold = mgr.reload_config(new_cfg, prev_cfg=prev_disk)
+            self._sync_lock_and_opencode()
+            mgr.logger.log(f"config saved: hot={hot} cold={cold}", echo=False)
+            self.send_json(200, {
+                "applied": mgr.cfg.hot_snapshot(),
+                "toml": dump_toml(new_cfg),
+                "config": new_cfg.to_dict(),
+                "hot_changed": hot,
+                "cold_changed": cold,
+                "restart_required": bool(cold),
+            })
+        except (ValueError, ConfigError) as e:
+            self.fail(400, str(e), obj=error_obj(400, str(e), "invalid_request_error"))
+
+    def _ctrl_reload(self, body: bytes) -> None:
+        mgr, paths = self.server.mgr, self.server.paths
+        try:
+            payload = json.loads(body or b"{}")
+            new_cfg = load_config(paths, apply_env=False)
+            if isinstance(payload, dict) and payload:
+                new_cfg = new_cfg.overlay_hot_dict(payload)
+            hot, cold = mgr.reload_config(new_cfg)
+            self._sync_lock_and_opencode()
+            self.send_json(200, {
+                "applied": mgr.cfg.hot_snapshot(),
+                "hot_changed": hot,
+                "cold_changed": cold,
+                "restart_required": bool(cold),
+            })
+        except (ValueError, ConfigError) as e:
+            self.fail(400, str(e), obj=error_obj(400, str(e), "invalid_request_error"))
+
+    def _ctrl_lifecycle(self, path: str, body: bytes) -> None:
+        mgr, paths = self.server.mgr, self.server.paths
         try:
             opts = json.loads(body or b"{}")
         except ValueError:
             opts = {}
         self.start_chunked("text/plain; charset=utf-8")
-        say = lambda text: self.chunk((text + "\n").encode())
+
+        def say(text: str) -> None:
+            self.chunk((text + "\n").encode())
+
         try:
             if path == "/_control/restart":
-                if mgr.state != "off" or paths.session_file.exists():
+                if mgr.state is not VmState.OFF or paths.session_file.exists():
                     mgr.pop_last_stopped()
                     mgr.request_stop("restart")
                     still = mgr.wait_off(lambda n: say(f"wait {n} stopping current G4 for restart"), every=1)
@@ -694,8 +688,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     fresh_cfg = load_config(paths, apply_env=True)
                     mgr.reload_config(fresh_cfg)
-                    update_lock(paths, {"cold_signature": mgr.cfg.cold_signature(), "engine_summary": mgr.cfg.describe_engine()})
-                    write_opencode_config(paths, mgr.cfg, self.server.server_port)
+                    self._sync_lock_and_opencode()
                 except (OSError, ConfigError) as e:
                     say(f"FAILED config reload error: {e}")
                     self.wfile.write(b"0\r\n\r\n")
@@ -703,8 +696,14 @@ class Handler(BaseHTTPRequestHandler):
                 path = "/_control/up"
 
             if path == "/_control/up":
+                try:
+                    overrides = BootOverrides.from_dict(opts)
+                except ConfigError as e:
+                    say(f"FAILED {e}")
+                    self.wfile.write(b"0\r\n\r\n")
+                    return
                 with mgr.cond:
-                    joined = mgr.state == "starting"
+                    joined = mgr.state is VmState.STARTING
                     t0, sent = (mgr.begun if joined else time.time()), [0 if joined else len(mgr.steps)]
 
                 def emit_steps() -> None:
@@ -719,28 +718,11 @@ class Handler(BaseHTTPRequestHandler):
                     emit_steps()
                     say(f"wait {n} {mgr.activity()}")
 
-                err = mgr.acquire(
-                    tick,
-                    every=1,
-                    explicit=True,
-                    wait_gpu=opts.get("wait_gpu"),
-                    wait_gpu_min=opts.get("wait_gpu_min"),
-                    basalt_ref=opts.get("basalt_ref"),
-                    quant=opts.get("quant"),
-                    pack_url=opts.get("pack_url"),
-                    uncensor_scale=opts.get("uncensor_scale"),
-                    profile=opts.get("profile"),
-                    routing_mode=opts.get("routing_mode"),
-                    parallel=opts.get("parallel"),
-                )
+                err = mgr.acquire(tick, every=1, explicit=True, overrides=overrides)
                 if not err:
                     mgr.leave(served=0)
                     emit_steps()
-                    update_lock(paths, {"cold_signature": mgr.cfg.cold_signature(), "engine_summary": mgr.cfg.describe_engine()})
-                    try:
-                        write_opencode_config(paths, mgr.cfg, self.server.server_port)
-                    except OSError:
-                        pass
+                    self._sync_lock_and_opencode()
                 say(f"FAILED {err}" if err else f"READY {int(time.time() - t0)}")
                 self.wfile.write(b"0\r\n\r\n")
                 return

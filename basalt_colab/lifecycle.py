@@ -8,7 +8,9 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from enum import StrEnum
+from typing import Any
 
 from basalt_colab.colab import (
     CHILD_FLAGS,
@@ -36,7 +38,7 @@ from basalt_colab.colab import (
     vm_timeline,
     vmx,
 )
-from basalt_colab.config import Config, ConfigError, diff_hot_cold
+from basalt_colab.config import BootOverrides, Config, ConfigError, diff_hot_cold
 from basalt_colab.manifest import Manifest
 from basalt_colab.paths import IS_WIN, Paths
 from basalt_colab.usage import UsageLedger
@@ -66,12 +68,20 @@ LATER = (
 )
 
 
+class VmState(StrEnum):
+    OFF = "off"
+    STARTING = "starting"
+    READY = "ready"
+    STOPPING = "stopping"
+
+
 class StartError(Exception):
     pass
 
 
 def mmss(seconds: float) -> str:
-    return "%d:%02d" % divmod(max(0, int(float(seconds))), 60)
+    mins, secs = divmod(max(0, int(float(seconds))), 60)
+    return f"{mins}:{secs:02d}"
 
 
 def poll_interval() -> float:
@@ -162,19 +172,20 @@ def stop_cloud(
     still = session_alive(session)
     bal, _ = colab_usage()
     alloc_t0 = s.get("allocated_ts") or s.get("t0")
-    billed = bool(alloc_t0) and (was_alive or (s.get("stages") or {}).get("allocated") is not None)
-    ran = max(0.0, time.time() - float(alloc_t0)) if billed else None
+    billed = was_alive or (s.get("stages") or {}).get("allocated") is not None
+    alloc_ts = float(alloc_t0) if (alloc_t0 is not None and billed) else None
+    ran = max(0.0, time.time() - alloc_ts) if alloc_ts is not None else None
     cu = (ran / 3600.0 * manifest.g4_cu_per_hour) if ran is not None else None
     cost_str = f", ran {mmss(ran)}, about {cu:.2f} CU" if (ran is not None and cu is not None) else ""
     logger.log(
         f"down ({reason}): session {'STILL ACTIVE, run: basalt-colab down' if still else 'stopped'}, "
         f"balance {bal} CU{cost_str}"
     )
-    if billed and ran is not None and cu is not None:
+    if alloc_ts is not None and ran is not None and cu is not None:
         try:
             ledger.record(
                 session=session,
-                started_ts=float(alloc_t0),
+                started_ts=alloc_ts,
                 reason=reason,
                 ran_s=ran,
                 cu_est=cu,
@@ -205,7 +216,7 @@ class Manager:
         self.logger = logger
         self.cond = threading.Condition()
         self._rev = 0
-        self.state = "off"
+        self.state: VmState = VmState.OFF
         self.steps: list[tuple[str, float, str | None]] = []
         self.attempt = 0
         self.errors: dict[int, str] = {}
@@ -234,15 +245,7 @@ class Manager:
         self._stats_lock = threading.Lock()
         self._stats_at = 0.0
         self._stats_cache: dict[str, Any] | None = None
-        self._override_wait_gpu: bool | None = None
-        self._override_wait_gpu_min: float | None = None
-        self._override_ref: str | None = None
-        self._override_quant: str | None = None
-        self._override_pack_url: str | None = None
-        self._override_uncensor_scale: float | None = None
-        self._override_profile: str | None = None
-        self._override_routing_mode: str | None = None
-        self._override_parallel: int | None = None
+        self._overrides: BootOverrides = BootOverrides()
 
     def _bump(self) -> None:
         self._rev += 1
@@ -255,7 +258,7 @@ class Manager:
             return self._rev
 
     def ready(self) -> bool:
-        return self.state == "ready" and self.tunnel_ok
+        return self.state is VmState.READY and self.tunnel_ok
 
     def enter(self) -> bool:
         with self.cond:
@@ -275,15 +278,9 @@ class Manager:
     def reload_config(self, new_cfg: Config, prev_cfg: Config | None = None) -> tuple[list[str], list[str]]:
         with self.cond:
             hot, cold = diff_hot_cold(prev_cfg or self.cfg, new_cfg)
-            self.cfg.colab.idle_min = new_cfg.colab.idle_min
-            self.cfg.colab.max_hours = new_cfg.colab.max_hours
-            self.cfg.colab.wait_gpu = new_cfg.colab.wait_gpu
-            self.cfg.colab.wait_gpu_min = new_cfg.colab.wait_gpu_min
-            self.cfg.colab.orphan_boot_s = new_cfg.colab.orphan_boot_s
-            self.cfg.proxy.strict_model = new_cfg.proxy.strict_model
-            self.cfg.basalt.effort = new_cfg.basalt.effort
+            self.cfg.apply_hot_from(new_cfg)
             # If VM is off, cold basalt settings take effect immediately for the next boot too!
-            if self.state == "off":
+            if self.state is VmState.OFF:
                 self.cfg.basalt = new_cfg.basalt
                 cold = []
             self._bump()
@@ -295,15 +292,7 @@ class Manager:
         every: float = KEEPALIVE_S,
         explicit: bool = False,
         is_gone: Callable[[], bool] | None = None,
-        wait_gpu: bool | None = None,
-        wait_gpu_min: float | None = None,
-        basalt_ref: str | None = None,
-        quant: str | None = None,
-        pack_url: str | None = None,
-        uncensor_scale: float | None = None,
-        profile: str | None = None,
-        routing_mode: str | None = None,
-        parallel: int | None = None,
+        overrides: BootOverrides | None = None,
     ) -> str | None:
         t0 = time.time()
         tick, mine = t0 + every, None
@@ -323,22 +312,14 @@ class Manager:
                         return None
                     if mine is not None and mine in self.errors:
                         return self.errors[mine]
-                    if mine is None and self.state in ("off", "stopping") and time.time() < self.fail_until:
+                    if mine is None and self.state in (VmState.OFF, VmState.STOPPING) and time.time() < self.fail_until:
                         return self.fail_msg
-                    if self.state == "off":
+                    if self.state is VmState.OFF:
                         if self.closing:
                             return "proxy is shutting down"
-                        self._override_wait_gpu = wait_gpu
-                        self._override_wait_gpu_min = wait_gpu_min
-                        self._override_ref = basalt_ref
-                        self._override_quant = quant
-                        self._override_pack_url = pack_url
-                        self._override_uncensor_scale = uncensor_scale
-                        self._override_profile = profile
-                        self._override_routing_mode = routing_mode
-                        self._override_parallel = parallel
+                        self._overrides = overrides or BootOverrides()
                         self._begin(True, explicit=explicit)
-                    if self.state == "starting":
+                    if self.state is VmState.STARTING:
                         mine = self.attempt
                         if explicit:
                             self.explicit_up = True
@@ -351,7 +332,7 @@ class Manager:
         finally:
             with self.cond:
                 self.waiters = max(0, self.waiters - 1)
-                if self.waiters == 0 and self.state == "starting" and not self.explicit_up:
+                if self.waiters == 0 and self.state is VmState.STARTING and not self.explicit_up:
                     self.waiter_lost_at = time.time()
 
     def wait_off(self, on_tick: Callable[[int], None] | None = None, limit: float = 900, every: float = KEEPALIVE_S) -> bool:
@@ -359,7 +340,7 @@ class Manager:
         tick = t0 + every
         while time.time() - t0 < limit:
             with self.cond:
-                if self.state == "off":
+                if self.state is VmState.OFF:
                     return self.paths.session_file.exists()
                 self.cond.wait(max(0.05, tick - time.time()))
             if time.time() >= tick:
@@ -370,12 +351,13 @@ class Manager:
 
     def adopt(self) -> None:
         with self.cond:
-            if self.state == "off":
+            if self.state is VmState.OFF:
                 self._begin(False, explicit=True)
 
     def _begin(self, new: bool, explicit: bool = False) -> None:
         self.attempt += 1
-        self.state, self.steps, self.stop_reason, self.no_tunnel, self.begun = "starting", [], None, False, time.time()
+        self.state = VmState.STARTING
+        self.steps, self.stop_reason, self.no_tunnel, self.begun = [], None, False, time.time()
         self.explicit_up, self.waiter_lost_at, self.alloc_note = explicit, None, ""
         self._bump()
         threading.Thread(target=self._run_start, args=(self.attempt, new), daemon=True).start()
@@ -394,17 +376,17 @@ class Manager:
         with self.cond:
             self.alloc_note = ""
             if ok and not self.stop_reason:
-                self.state, self.tunnel_ok, self.last_activity = "ready", True, time.time()
+                self.state, self.tunnel_ok, self.last_activity = VmState.READY, True, time.time()
                 self._bump()
                 return
             if ok:
                 err = f"start cancelled ({self.stop_reason})"
             if err is None:
-                self.state = "off"
+                self.state = VmState.OFF
                 self._bump()
                 return
             self.errors[attempt], self.fail_msg, self.fail_until = err, err, time.time() + FAIL_COOLDOWN
-            self.state = "stopping"
+            self.state = VmState.STOPPING
             self._bump()
         self.logger.log("start failed: " + err)
         self._stop("start failed")
@@ -412,18 +394,18 @@ class Manager:
     def request_stop(self, reason: str, only_idle: bool = False) -> None:
         with self.cond:
             if only_idle and not (
-                self.state == "ready"
+                self.state is VmState.READY
                 and self.active == 0
                 and time.time() - self.last_activity > self.cfg.colab.idle_min * 60
             ):
                 return
-            if self.state == "starting":
+            if self.state is VmState.STARTING:
                 self.stop_reason = reason
                 self._bump()
                 return
-            if self.state == "stopping" or (self.state == "off" and not self.paths.session_file.exists()):
+            if self.state is VmState.STOPPING or (self.state is VmState.OFF and not self.paths.session_file.exists()):
                 return
-            self.state = "stopping"
+            self.state = VmState.STOPPING
             self._bump()
         self.logger.log(f"stopping the VM ({reason})")
         threading.Thread(target=self._stop, args=(reason,), daemon=True).start()
@@ -447,7 +429,7 @@ class Manager:
         except Exception as e:
             self.logger.log(f"stop failed: {e!r}")
         with self.cond:
-            self.state, self.tunnel_ok, self.sess, self.alloc_note = "off", False, None, ""
+            self.state, self.tunnel_ok, self.sess, self.alloc_note = VmState.OFF, False, None, ""
             self._stats_cache = None
             self._bump()
 
@@ -511,42 +493,16 @@ class Manager:
     def _launch(self) -> dict[str, Any]:
         cfg = self.cfg
         session = cfg.colab.session
-        if self._override_profile is not None:
-            try:
-                cfg.apply_profile(self._override_profile)
-            except ConfigError as e:
-                raise StartError(str(e))
-        if self._override_quant is not None:
-            from basalt_colab.config import quant_value
-            q = quant_value(self._override_quant)
-            if not q:
-                raise StartError(f"invalid --quant value: {self._override_quant!r}")
-            cfg.basalt.quant = q
-        if self._override_pack_url is not None:
-            cfg.basalt.pack_url = self._override_pack_url.strip()
-        if self._override_uncensor_scale is not None:
-            cfg.basalt.uncensor_scale = float(self._override_uncensor_scale)
-            cfg.basalt.uncensor = cfg.basalt.uncensor_scale > 0.0
-        if self._override_routing_mode is not None:
-            from basalt_colab.config import routing_mode_value
-            rt = routing_mode_value(self._override_routing_mode)
-            if not rt:
-                raise StartError(f"invalid --routing-mode value: {self._override_routing_mode!r}")
-            cfg.basalt.routing_mode = rt
-        if self._override_parallel is not None:
-            cfg.basalt.parallel = int(self._override_parallel)
-        if self._override_ref is not None:
-            cfg.basalt.ref = self._override_ref.strip()
         try:
-            from basalt_colab.config import validate_config
-            validate_config(cfg)
+            applied = self._overrides.apply_to(cfg, manifest=self.manifest)
+            cfg.basalt = applied.basalt
             env_vars = cfg.boot_vars(manifest=self.manifest)
         except ConfigError as e:
-            raise StartError(str(e))
+            raise StartError(str(e)) from e
         try:
             missing = missing_vm_files(self.paths.vm_dir)
         except OSError as e:
-            raise StartError(f"cannot read vm/ ({self.paths.vm_dir}): {e}")
+            raise StartError(f"cannot read vm/ ({self.paths.vm_dir}): {e}") from e
         if missing:
             raise StartError("vm/ is incomplete, missing: " + ", ".join(missing))
         for p in (self.paths.key_file, self.paths.ssh_key):
@@ -580,8 +536,7 @@ class Manager:
             f"up: {model_id} ({cfg.describe_engine()}, {cfg.describe_uncensor()}), balance {bal:.2f} CU, "
             f"hard stop {cfg.colab.max_hours:.1f} h, idle stop {cfg.colab.idle_min:.1f} min"
         )
-        wait_gpu = cfg.colab.wait_gpu if self._override_wait_gpu is None else self._override_wait_gpu
-        wait_limit_min = cfg.colab.wait_gpu_min if self._override_wait_gpu_min is None else self._override_wait_gpu_min
+        wait_gpu, wait_limit_min = self._overrides.resolve_wait_gpu(cfg)
         alloc_start = time.time()
         if wait_gpu:
             deadline = None if wait_limit_min <= 0 else alloc_start + wait_limit_min * 60.0
@@ -653,7 +608,8 @@ class Manager:
         session = self.cfg.colab.session
         poll_s = poll_interval()
         health_s = min(1.0, poll_s)
-        t0, seen, fails, spawns, next_tl, box = time.time(), 0, 0, 0, time.time(), None
+        t0, seen, fails, spawns, next_tl = time.time(), 0, 0, 0, time.time()
+        box: list[tuple[int, str]] | None = None
         base = float(s.get("t0", t0)) + float(s.get("stages", {}).get("boot_started", 0))
         kill_rec(s.get("tunnel"))
         while time.time() - t0 < BOOT_TIMEOUT:
@@ -664,14 +620,14 @@ class Manager:
                 (rc, out), box = box[0], None
                 if rc != 0:
                     self.logger.log(f"vm timeline read failed (rc {rc})", echo=False)
-                lines = [l for l in out.splitlines() if re.match(r"^\d+s ", l)]
+                lines = [ln for ln in out.splitlines() if re.match(r"^\d+s ", ln)]
                 if adopted and rc == 0 and not lines:
                     raise StartError(f"running session {session} has no boot timeline")
                 adopted, fails = False, (0 if rc == 0 else fails + 1)
                 if fails >= 5 and not session_alive(session):
                     raise StartError("the VM disappeared during boot")
                 seen = self._take(lines, seen, base)
-                bad = [l for l in lines if re.search(r"FAILED|died|GUARD|\[PATCH FAIL\]", l)]
+                bad = [ln for ln in lines if re.search(r"FAILED|died|GUARD|\[PATCH FAIL\]", ln)]
                 if bad:
                     raise StartError("boot failed on VM: " + bad[0])
             if self.tunnel is None or self.tunnel.poll() is not None:
@@ -682,7 +638,7 @@ class Manager:
                 spawns += 1
             elif self.port is not None and tunnel_health(self.paths, self.port, timeout=5):
                 rc, out = vm_timeline(session)
-                self._take([l for l in out.splitlines() if re.match(r"^\d+s ", l)], seen, base)
+                self._take([ln for ln in out.splitlines() if re.match(r"^\d+s ", ln)], seen, base)
                 self._stage(s, "endpoint_ready", float(s.get("t0", t0)))
                 self.logger.log(f"READY after {time.time() - float(s.get('t0', t0)):.0f} s (stages {s['stages']})")
                 return
@@ -692,10 +648,12 @@ class Manager:
 
     def _take(self, lines: list[str], seen: int, base: float) -> int:
         added = False
-        for l in lines[seen:]:
-            self.logger.log("  vm " + l)
-            m = re.match(r"^(\d+)s \S+ (.*)$", l)
-            for key, rx, label in (STEPS if m else ()):
+        for ln in lines[seen:]:
+            self.logger.log("  vm " + ln)
+            m = re.match(r"^(\d+)s \S+ (.*)$", ln)
+            if m is None:
+                continue
+            for key, rx, label in STEPS:
                 if re.match(rx, m.group(2)):
                     with self.cond:
                         self.steps.append((key, min(base + int(m.group(1)), time.time()), label))
@@ -721,7 +679,7 @@ class Manager:
                     start_new_session=not IS_WIN,
                 )
             except OSError as e:
-                raise StartError(f"cannot run ssh: {e}")
+                raise StartError(f"cannot run ssh: {e}") from e
             self.tunnel, self.port = p, port
         threading.Thread(target=drain_stderr, args=(p, self.logger, self._auto_created), daemon=True).start()
         s["tunnel"] = {"pid": p.pid, "start": proc_start(p.pid), "port": port}
@@ -764,7 +722,7 @@ class Manager:
             if session_alive(session):
                 reason = "tunnel failed 3 times"
                 for _ in range(3):
-                    if self.state != "ready":
+                    if self.state is not VmState.READY:
                         return
                     if self._tunnel_up(s):
                         with self.cond:
@@ -787,13 +745,13 @@ class Manager:
         self._start_repair()
         t0 = time.time()
         with self.cond:
-            while self.state == "ready" and not self.tunnel_ok and time.time() - t0 < 90:
+            while self.state is VmState.READY and not self.tunnel_ok and time.time() - t0 < 90:
                 self.cond.wait(1)
             return self.ready()
 
     def _start_repair(self) -> None:
         with self.cond:
-            if self.state != "ready" or self.repairing:
+            if self.state is not VmState.READY or self.repairing:
                 return
             self.repairing, self.tunnel_ok = True, False
             self._bump()
@@ -813,21 +771,21 @@ class Manager:
                 idle_m = self.cfg.colab.idle_min
                 orphan_s = self.cfg.colab.orphan_boot_s
                 orphan_boot = (
-                    st == "starting"
+                    st is VmState.STARTING
                     and not self.explicit_up
                     and self.waiters == 0
                     and self.waiter_lost_at is not None
                     and now - self.waiter_lost_at > orphan_s
                 )
-            if st in ("starting", "ready") and s and now > float(s.get("t0", now)) + max_h * 3600:
+            if st in (VmState.STARTING, VmState.READY) and s and now > float(s.get("t0", now)) + max_h * 3600:
                 self.request_stop(f"hard stop after {max_h:.2f} h")
             elif orphan_boot:
                 self.request_stop("all waiting clients disconnected")
-            elif st == "ready":
+            elif st is VmState.READY:
                 self.request_stop(f"idle {idle_m:.1f} min", only_idle=True)
                 if p is not None and p.poll() is not None:
                     self._start_repair()
-            elif st == "off" and self.paths.session_file.exists() and now - self.last_retry > 60:
+            elif st is VmState.OFF and self.paths.session_file.exists() and now - self.last_retry > 60:
                 self.last_retry = now
                 self.request_stop("retrying the stop")
 
@@ -835,7 +793,7 @@ class Manager:
         with self.cond:
             self.closing = True
             self._bump()
-            busy = self.state != "off" or self.paths.session_file.exists()
+            busy = self.state is not VmState.OFF or self.paths.session_file.exists()
         if busy:
             self.logger.log("proxy exiting: stopping the VM first (Ctrl+C again leaves it to the watchdog)")
             self.request_stop("proxy exit")
@@ -894,9 +852,9 @@ class Manager:
         basalt = self.basalt_stats()
         with self.cond:
             s = self.sess or {}
-            state = "ready (tunnel reconnecting)" if self.state == "ready" and not self.tunnel_ok else self.state
+            state: str = "ready (tunnel reconnecting)" if self.state is VmState.READY and not self.tunnel_ok else str(self.state)
             alloc_ts = s.get("allocated_ts")
-            ran = (time.time() - float(alloc_ts)) if (alloc_ts and self.state != "off") else None
+            ran = (time.time() - float(alloc_ts)) if (alloc_ts and self.state is not VmState.OFF) else None
             cu = (ran / 3600.0 * self.manifest.g4_cu_per_hour) if ran is not None else None
             steps_view = [
                 {"key": k, "elapsed_s": max(0, int(at - self.begun)), "label": lbl}
@@ -905,7 +863,7 @@ class Manager:
             ]
             return {
                 "state": state,
-                "stage": self.activity() if self.state == "starting" else "",
+                "stage": self.activity() if self.state is VmState.STARTING else "",
                 "steps": steps_view,
                 "session": self.cfg.colab.session,
                 "model": self.cfg.basalt.effective_model_alias,
@@ -943,6 +901,6 @@ class Manager:
         with self.cond:
             s = self.sess or {}
             alloc_ts = s.get("allocated_ts")
-            ran = (time.time() - float(alloc_ts)) if (alloc_ts and self.state != "off") else None
+            ran = (time.time() - float(alloc_ts)) if (alloc_ts and self.state is not VmState.OFF) else None
             cu = (ran / 3600.0 * self.manifest.g4_cu_per_hour) if ran is not None else None
         return self.ledger.summary(days=days, active_ran_s=ran, active_cu=cu)

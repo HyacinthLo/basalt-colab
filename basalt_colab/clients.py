@@ -128,7 +128,8 @@ def opencode_config_dict(ep: ClientEndpoint, *, key_mode: str = "env") -> dict[s
         else {}
     )
     if key_mode == "file" and ep.key_file:
-        api_key_val = "{file:%s}" % ep.key_file.replace("\\", "/")
+        clean_key = ep.key_file.replace("\\", "/")
+        api_key_val = f"{{file:{clean_key}}}"
     else:
         api_key_val = "{env:OPENAI_API_KEY}"
     models = {
@@ -245,6 +246,7 @@ def client_bundle(ep: ClientEndpoint, client: str) -> dict[str, Any]:
     if c is None:
         raise ValueError(f"unknown client {client!r} (expected one of {VALID_CLIENTS})")
 
+    env_pairs: tuple[tuple[str, str], ...]
     if c == "dsh":
         env_pairs = (("BASALT_API_KEY", ep.api_key),)
         return {

@@ -608,6 +608,48 @@ class ConfigAndUnitTests(unittest.TestCase):
         colab.release_lock(lp)
         self.assertFalse(colab.is_lock_held(lp))
 
+    def test_boot_overrides_hot_fields_meta_and_vm_state(self) -> None:
+        from basalt_colab.lifecycle import VmState
+
+        # VmState StrEnum serializes cleanly as plain JSON strings
+        self.assertEqual(json.dumps({"state": VmState.READY}), '{"state": "ready"}')
+        self.assertEqual(VmState.OFF, "off")
+
+        # BootOverrides single-source validation + serialization + apply_to
+        m = manifest.load_manifest(self.p.vm_dir)
+        cfg = config.Config()
+        ov = config.BootOverrides.from_dict({
+            "wait_gpu": True,
+            "wait_gpu_min": 45,
+            "profile": "solo-fast",
+            "quant": "ud-iq2_xxs",
+            "uncensor_scale": 1.2,
+            "basalt_ref": "main",
+        })
+        applied = ov.apply_to(cfg, manifest=m)
+        self.assertEqual((applied.basalt.parallel, applied.basalt.routing_mode, applied.basalt.vram_reserve_mib), (1, "fast", 400))
+        self.assertEqual((applied.basalt.quant, applied.basalt.uncensor_scale, applied.basalt.ref), ("ud-iq2_xxs", 1.2, "main"))
+        self.assertEqual(ov.resolve_wait_gpu(cfg), (True, 45.0))
+        self.assertEqual(ov.to_dict()["quant"], "ud-iq2_xxs")
+        # Original cfg is untouched (immutable apply_to)
+        self.assertEqual(cfg.basalt.quant, "ud-iq1_m")
+        with self.assertRaises(config.ConfigError):
+            config.BootOverrides(quant="bogus").apply_to(cfg, manifest=m)
+
+        # HOT_FIELDS-driven apply_hot_from, hot_snapshot, and overlay_hot_dict
+        overlaid = cfg.overlay_hot_dict({"effort": "max", "idle_min": 45, "orphan_boot_s": 60, "strict_model": True})
+        dst = config.Config()
+        dst.apply_hot_from(overlaid)
+        snap = dst.hot_snapshot()
+        self.assertEqual((snap["effort"], snap["idle_min"], snap["orphan_boot_s"], snap["strict_model"]), ("max", 45.0, 60.0, True))
+        self.assertEqual(set(snap.keys()), {k.split(".", 1)[1] for k in config.HOT_FIELDS})
+
+        # Shared Console schema metadata
+        meta = config.config_meta()
+        self.assertEqual(meta["quants"], list(config.VALID_QUANTS))
+        self.assertEqual(set(meta["profiles"].keys()), set(config.PERFORMANCE_PROFILES.keys()))
+        self.assertEqual(meta["hot_fields"], sorted(config.HOT_FIELDS))
+
 
 if __name__ == "__main__":
     unittest.main()

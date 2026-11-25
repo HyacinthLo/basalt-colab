@@ -47,6 +47,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Static analysis (ruff & mypy, dev-only CI guardrail)
+        run: |
+          python -m pip install --quiet ruff mypy
+          ruff check basalt_colab
+          mypy basalt_colab
       - name: Shell syntax check (VM scripts)
         run: bash -n basalt_colab/vm/*.sh
       - name: Console HTML inline JS syntax check

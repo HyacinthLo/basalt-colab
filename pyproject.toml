@@ -25,3 +25,21 @@ include = ["basalt_colab*"]
 
 [tool.setuptools.package-data]
 basalt_colab = ["vm/*", "web/*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 140
+exclude = ["basalt_colab/vm"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "E701"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+no_implicit_optional = true
+exclude = ["basalt_colab/vm/"]
+
