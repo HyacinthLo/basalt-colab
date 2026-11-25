@@ -10,7 +10,7 @@ Zero-dependency Python 3.11+ CLI · Visual Web Control Console · OpenAI / Anthr
 
 ## Install & Quick Start
 
-Requires **Python 3.11+**, an OpenSSH client (`ssh`, `ssh-keygen`), and a Google AI Pro (200 CU/month) or Colab Pro (100 CU/month) subscription. Zero third-party Python dependencies.
+Requires **Python 3.11+**, an OpenSSH client (`ssh`, `ssh-keygen`), and a Google AI Pro (200 CU/month) or Colab Pro (100 CU/month) subscription. Zero third-party Python dependencies. **Cross-platform CI-verified on Linux, macOS, and Windows 10/11** (also works on WSL2, Docker/Remote SSH, and Android Termux).
 
 ```bash
 # Install globally with uv (recommended)

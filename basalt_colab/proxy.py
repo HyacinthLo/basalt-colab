@@ -5,7 +5,7 @@ import hmac
 import http.client
 import json
 import os
-import select
+import selectors
 import signal
 import socket
 import socketserver
@@ -282,8 +282,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def client_gone(self) -> bool:
         try:
-            readable, _, _ = select.select([self.connection], [], [], 0)
-            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+            with selectors.DefaultSelector() as sel:
+                sel.register(self.connection, selectors.EVENT_READ)
+                ready = sel.select(timeout=0)
+            return bool(ready) and self.connection.recv(1, socket.MSG_PEEK) == b""
         except (ConnectionError, TimeoutError):
             return True
         except (OSError, ValueError):
@@ -407,31 +409,46 @@ class Handler(BaseHTTPRequestHandler):
     def forward(self, body: bytes | None, sse: bool = False) -> None:
         mgr = self.server.mgr
         headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
-        done, cur_conn, aborted = threading.Event(), [None], [False]
+        done = threading.Event()
+        cur_conn: list[http.client.HTTPConnection | None] = [None]
+        aborted = [False]
+        wake_r, wake_w = socket.socketpair()
 
         def watch_client() -> None:
             sock = self.connection
-            while not done.wait(0.5):
+            try:
+                with selectors.DefaultSelector() as sel:
+                    sel.register(sock, selectors.EVENT_READ, "client")
+                    sel.register(wake_r, selectors.EVENT_READ, "done")
+                    while not done.is_set():
+                        for key, _ in sel.select():
+                            if key.data == "done":
+                                return
+                            try:
+                                if sock.recv(1, socket.MSG_PEEK) == b"":
+                                    aborted[0] = True
+                                    abort_upstream(cur_conn[0])
+                                    return
+                                return
+                            except (ConnectionError, TimeoutError):
+                                aborted[0] = True
+                                abort_upstream(cur_conn[0])
+                                return
+            except (OSError, ValueError):
+                return
+            finally:
                 try:
-                    readable, _, _ = select.select([sock], [], [], 0)
-                    if not readable:
-                        continue
-                    if sock.recv(1, socket.MSG_PEEK) == b"":
-                        aborted[0] = True
-                        abort_upstream(cur_conn[0])
-                        return
-                    return
-                except (ConnectionError, TimeoutError):
-                    aborted[0] = True
-                    abort_upstream(cur_conn[0])
-                    return
-                except (OSError, ValueError):
-                    return
+                    wake_r.close()
+                except OSError:
+                    pass
 
         threading.Thread(target=watch_client, daemon=True).start()
         conn: http.client.HTTPConnection | None = None
         try:
             for attempt in range(2):
+                if aborted[0]:
+                    self.close_connection = True
+                    return
                 assert mgr.port is not None
                 c = http.client.HTTPConnection("127.0.0.1", mgr.port, timeout=UPSTREAM_TIMEOUT)
                 cur_conn[0] = c
@@ -482,6 +499,14 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
         finally:
             done.set()
+            try:
+                wake_w.send(b"\x01")
+            except OSError:
+                pass
+            try:
+                wake_w.close()
+            except OSError:
+                pass
             if conn is not None:
                 conn.close()
 
@@ -506,6 +531,34 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/_control/status":
             return self.send_json(200, mgr.status())
+
+        if path == "/_control/events" and body is None:
+            self.start_chunked("text/event-stream")
+            self.close_connection = True
+            try:
+                rev = mgr.event_rev()
+                st = mgr.status()
+                self.chunk(b"data: " + json.dumps(st).encode("utf-8") + b"\n\n")
+                while not mgr.closing:
+                    if self.client_gone():
+                        break
+                    active_mode = st["state"] != "off"
+                    new_rev = mgr.wait_event(rev, timeout=1.0 if active_mode else 15.0)
+                    if mgr.closing or self.client_gone():
+                        break
+                    if new_rev == rev and not active_mode:
+                        self.chunk(b": ping\n\n")
+                        continue
+                    rev = new_rev
+                    st = mgr.status()
+                    self.chunk(b"data: " + json.dumps(st).encode("utf-8") + b"\n\n")
+            except OSError:
+                pass
+            try:
+                self.wfile.write(b"0\r\n\r\n")
+            except OSError:
+                pass
+            return
 
         if path == "/_control/clients" and body is None:
             ep = ClientEndpoint.from_config(

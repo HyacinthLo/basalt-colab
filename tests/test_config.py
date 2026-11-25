@@ -144,7 +144,8 @@ class ConfigAndUnitTests(unittest.TestCase):
         migrated = paths.migrate_legacy_state(new_p, legacy_dir=legacy)
         self.assertEqual(sorted(migrated), ["api_key", "id_ed25519"])
         self.assertEqual(new_p.key_file.read_text(encoding="utf-8"), "sk-ds41-legacy\n")
-        self.assertEqual(os.stat(new_p.key_file).st_mode & 0o777, 0o600)
+        if not paths.IS_WIN:
+            self.assertEqual(os.stat(new_p.key_file).st_mode & 0o777, 0o600)
         # Idempotent second run migrates nothing
         self.assertEqual(paths.migrate_legacy_state(new_p, legacy_dir=legacy), [])
 
@@ -515,6 +516,93 @@ class ConfigAndUnitTests(unittest.TestCase):
         self.assertEqual(clients.dsh_effort_default("high"), "high")
         self.assertEqual(clients.dsh_effort_default("95"), "max")
         self.assertEqual(clients.dsh_effort_default("20"), "low")
+
+    def test_kernel_lock_argparse_and_static_console(self) -> None:
+        from basalt_colab import console
+        from basalt_colab.cli import _WAIT_GPU_DEFAULT, build_parser
+
+        # Static web/console.html loaded cleanly via importlib.resources
+        html = console.render_console_html()
+        self.assertIn(b"<!doctype html>", html.lower())
+        self.assertIn(b"/_control/events", html)
+        self.assertIn(b"basalt-colab", html)
+
+        # Strict argparse subparsers: valid combos & typo rejection
+        parser = build_parser()
+        ns1 = parser.parse_args(["up", "--quant", "ud-iq2_xxs", "--wait-gpu", "--detach"])
+        self.assertEqual((ns1.cmd, ns1.quant, ns1.detach), ("up", "ud-iq2_xxs", True))
+        self.assertIs(ns1.wait_gpu, _WAIT_GPU_DEFAULT)
+        ns2 = parser.parse_args(["up", "--wait-gpu", "45"])
+        self.assertEqual(ns2.wait_gpu, 45.0)
+        ns3 = parser.parse_args(["up", "--wait-gpu=0"])
+        self.assertEqual(ns3.wait_gpu, 0.0)
+        ns4 = parser.parse_args(["ask", "--effort", "high", "--max-tokens", "256", "hello", "world"])
+        self.assertEqual((ns4.effort, ns4.max_tokens, ns4.prompt), ("high", 256, ["hello", "world"]))
+
+        env = dict(os.environ, PYTHONPATH=str(ROOT))
+        r_typo = subprocess.run(
+            [sys.executable, "-m", "basalt_colab", "up", "--qunat", "ud-iq2_xxs"],
+            env=env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(r_typo.returncode, 2)
+        self.assertIn("unrecognized arguments", r_typo.stderr)
+        r_help = subprocess.run(
+            [sys.executable, "-m", "basalt_colab", "up", "--help"],
+            env=env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(r_help.returncode, 0)
+        self.assertIn("--wait-gpu", r_help.stdout)
+
+        # Cross-platform OS kernel file lock (fcntl.flock / msvcrt.locking):
+        # survives concurrent contention and releases instantly on hard kill (SIGKILL / TerminateProcess)
+        lock_home = self.tmp / "lock_home"
+        lp = paths.get_paths(home_override=lock_home, vm_override=self.p.vm_dir)
+        lp.ensure_dirs()
+        holder_code = (
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from basalt_colab import colab, paths\n"
+            "p = paths.get_paths(home_override=Path(sys.argv[1]), vm_override=Path(sys.argv[2]))\n"
+            "assert colab.take_lock(p, {'port': 18999}) is None\n"
+            "print('LOCKED', flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", holder_code, str(lock_home), str(self.p.vm_dir)],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            line = proc.stdout.readline().strip()
+            if line != "LOCKED":
+                err = proc.stderr.read() if proc.stderr else ""
+                self.fail(f"lock holder did not print LOCKED (got {line!r}): {err}")
+            self.assertTrue(colab.is_lock_held(lp))
+            running = colab.serve_running(lp)
+            self.assertIsNotNone(running)
+            self.assertEqual(running["port"], 18999)
+            # Second caller cannot steal the lock and sees holder metadata
+            contended = colab.take_lock(lp, {"port": 19000})
+            self.assertIsNotNone(contended)
+            self.assertEqual(contended["port"], 18999)
+        finally:
+            proc.kill()
+            proc.wait(timeout=10)
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+
+        # Even though serve.lock JSON remains on disk after hard kill, kernel released serve.lck immediately
+        self.assertTrue(lp.lock_file.exists())
+        self.assertFalse(colab.is_lock_held(lp))
+        self.assertIsNone(colab.serve_running(lp))
+        # Parent can immediately take and cleanly release the lock
+        self.assertIsNone(colab.take_lock(lp, {"port": 19001}))
+        self.assertTrue(colab.is_lock_held(lp))
+        self.assertEqual(colab.serve_running(lp)["port"], 19001)
+        colab.release_lock(lp)
+        self.assertFalse(colab.is_lock_held(lp))
 
 
 if __name__ == "__main__":

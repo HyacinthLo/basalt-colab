@@ -350,6 +350,8 @@ class ProxyLifecycleTests(unittest.TestCase):
         self.assertIn("config.toml", c.cli("config", "path").stdout)
         r_ask_off = c.cli("ask", "hello")
         self.assertNotEqual(r_ask_off.returncode, 0)
+        r_typo = c.cli("up", "--qunat", "ud-iq2_xxs")
+        self.assertEqual(r_typo.returncode, 2)
         self.assertEqual(c.calls("new"), [])
 
         # Start detached proxy + G4 with --basalt-ref override and -d (no watch)
@@ -373,11 +375,37 @@ class ProxyLifecycleTests(unittest.TestCase):
         self.assertTrue(cold_post["restart_required"])
         self.assertIn("basalt.parallel", cold_post["cold_changed"])
 
-        # CLI config get / set (live hot-reload) / profile
-        self.assertIn("basalt.effort = max", c.cli("config", "get", "effort").stdout)
-        r_set = c.cli("config", "set", "effort", "high")
-        self.assertEqual(r_set.returncode, 0, r_set.stdout + r_set.stderr)
-        self.assertIn("Applied live", r_set.stdout)
+        # Native SSE event stream (GET /_control/events) pushes initial snapshot and live reload update
+        sse_conn = http.client.HTTPConnection("127.0.0.1", c.port, timeout=5)
+        try:
+            sse_conn.request("GET", "/_control/events", headers={"Authorization": "Bearer " + c.key})
+            sse_r = sse_conn.getresponse()
+            self.assertEqual(sse_r.status, 200)
+            self.assertIn("text/event-stream", sse_r.getheader("Content-Type", ""))
+            first_line = sse_r.readline().decode("utf-8", "replace").strip()
+            self.assertTrue(first_line.startswith("data: "), first_line)
+            first_ev = json.loads(first_line[6:])
+            self.assertEqual(first_ev["effort"], "max")
+            # Consume blank separator line, then trigger live reload and assert immediate push
+            sse_r.readline()
+            t_push = time.time()
+            r_set = c.cli("config", "set", "effort", "high")
+            self.assertEqual(r_set.returncode, 0, r_set.stdout + r_set.stderr)
+            self.assertIn("Applied live", r_set.stdout)
+            pushed_effort = None
+            while time.time() - t_push < 3.0:
+                ln = sse_r.readline().decode("utf-8", "replace").strip()
+                if ln.startswith("data: "):
+                    ev = json.loads(ln[6:])
+                    if ev.get("effort") == "high":
+                        pushed_effort = ev["effort"]
+                        break
+            self.assertEqual(pushed_effort, "high")
+        finally:
+            sse_conn.close()
+
+        # CLI config get / profile
+        self.assertIn("basalt.effort = high", c.cli("config", "get", "effort").stdout)
         self.assertEqual(json.loads(c.req(body={"model": MODEL_ID, "messages": [{"role": "user", "content": "hi"}]}).raw)["effort"], "high")
         self.assertEqual(c.cli("config", "profile", "solo-fast").returncode, 0)
         self.assertIn("basalt.parallel = 1", c.cli("config", "get", "parallel").stdout)

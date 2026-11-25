@@ -1,7 +1,9 @@
 """CLI entrypoint for basalt-colab."""
 from __future__ import annotations
 
+import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 import json
 import mimetypes
@@ -162,7 +164,9 @@ def minutes(n: float) -> str:
 
 
 def cli_name() -> str:
-    return "basalt-colab" if shutil.which("basalt-colab") else "python3 -m basalt_colab"
+    if shutil.which("basalt-colab"):
+        return "basalt-colab"
+    return "python -m basalt_colab" if IS_WIN else "python3 -m basalt_colab"
 
 
 class Live:
@@ -391,11 +395,16 @@ def endpoint_info(paths: Paths, cfg: Config, manifest: Manifest, port: int, bal:
     for name, value in rows:
         print(f"  {name:<10} {paint(value, 'bold')}")
     print()
+    shell_hint = (
+        f"{me_cmd} env --powershell | Out-String | Invoke-Expression"
+        if IS_WIN
+        else f'eval "$({me_cmd} env)"'
+    )
     for name, value in (
         ("Try it", f'{me_cmd} ask "Hello!"'),
         ("Console", f"{me_cmd} console"),
         ("Agents", f"{me_cmd} connect [dsh|claude|codex|opencode|openai]"),
-        ("Shell env", f'eval "$({me_cmd} env)"'),
+        ("Shell env", shell_hint),
         ("Stop", f"{me_cmd} down"),
     ):
         print(f"  {name:<10} {paint(value, 'cyan')}")
@@ -414,42 +423,71 @@ def stopped_note(kind: str, rest: str) -> None:
         print(f"{done} · nothing is running or billed now")
 
 
+def _render_watch_frame(
+    st: dict[str, Any], live: Live, prev: str | None, dots: tuple[str, str, str]
+) -> str:
+    state = "ready" if st["state"].startswith("ready") else st["state"]
+    if prev and state != prev:
+        live.line(f"  {paint(time.strftime('%H:%M'), 'dim')}  {watch_event(prev, state, st)}")
+    spent = f"ran {mmss(st['ran'])} · {units(st['cu'])}" if st.get("ran") is not None else ""
+    if state == "ready":
+        left = min(st["idle_stop_min"] * 60 - st["idle_s"], st["max_hours"] * 3600 - (st["ran"] or 0))
+        doing = (
+            f"answering {st['active']} request{'' if st['active'] == 1 else 's'}"
+            if st["active"]
+            else f"idle {mmss(st['idle_s'])} · stops in {mmss(left)}"
+        )
+        perf = format_telemetry(st.get("basalt"))
+        tail = " · ".join(p for p in (perf, spent) if p)
+        live.put([("  ", ()), (dots[0] + " GPU running", ("green", "bold")), ("   " + doing + "   ", ()), (tail, ("dim",))])
+    elif state in ("starting", "stopping"):
+        what = "starting · " + st["stage"] if state == "starting" else "stopping"
+        live.put([("  ", ()), (dots[1] + " GPU " + what, ("cyan",)), ("   " + spent, ("dim",))])
+    else:
+        live.put([("  ", ()), (dots[2] + " GPU off", ("bold",)), ("   starts on the next request (~2-3 min)", ("dim",))])
+    return state
+
+
 def watch_loop(paths: Paths, cfg: Config, port: int) -> None:
     if not TTY[0]:
         return
     print(paint("\n  Ctrl+C closes this view; the endpoint keeps running.\n", "dim"))
     live, prev, dots = Live(), None, (glyph("●", "*"), glyph("◌", "~"), glyph("○", "o"))
+    conn: http.client.HTTPConnection | None = None
     try:
         while True:
             try:
-                conn, r = control_call(paths, cfg, port, "/_control/status", None, 5)
-                st = json.loads(r.read())
+                conn, r = control_call(paths, cfg, port, "/_control/events", None, 30)
+                if r.status != 200:
+                    conn.close()
+                    conn = None
+                    raise OSError(f"HTTP {r.status}")
+                for raw in r:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line.startswith("data: "):
+                        continue
+                    st = json.loads(line[6:])
+                    if isinstance(st, dict) and "state" in st:
+                        prev = _render_watch_frame(st, live, prev, dots)
                 conn.close()
+                conn = None
             except (OSError, ValueError, http.client.HTTPException):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    conn = None
+            if fetch_live_status(paths, cfg, port, timeout=1.5) is None:
                 live.line(f"  {paint(time.strftime('%H:%M'), 'dim')}  the endpoint has stopped")
                 return
-            state = "ready" if st["state"].startswith("ready") else st["state"]
-            if prev and state != prev:
-                live.line(f"  {paint(time.strftime('%H:%M'), 'dim')}  {watch_event(prev, state, st)}")
-            prev = state
-            spent = f"ran {mmss(st['ran'])} · {units(st['cu'])}" if st.get("ran") is not None else ""
-            if state == "ready":
-                left = min(st["idle_stop_min"] * 60 - st["idle_s"], st["max_hours"] * 3600 - (st["ran"] or 0))
-                doing = (
-                    f"answering {st['active']} request{'' if st['active'] == 1 else 's'}"
-                    if st["active"]
-                    else f"idle {mmss(st['idle_s'])} · stops in {mmss(left)}"
-                )
-                perf = format_telemetry(st.get("basalt"))
-                tail = " · ".join(p for p in (perf, spent) if p)
-                live.put([("  ", ()), (dots[0] + " GPU running", ("green", "bold")), ("   " + doing + "   ", ()), (tail, ("dim",))])
-            elif state in ("starting", "stopping"):
-                what = "starting · " + st["stage"] if state == "starting" else "stopping"
-                live.put([("  ", ()), (dots[1] + " GPU " + what, ("cyan",)), ("   " + spent, ("dim",))])
-            else:
-                live.put([("  ", ()), (dots[2] + " GPU off", ("bold",)), ("   starts on the next request (~2-3 min)", ("dim",))])
-            time.sleep(1)
+            time.sleep(0.5)
     except KeyboardInterrupt:
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
         live.clear()
         me_cmd = cli_name()
         print(
@@ -737,41 +775,45 @@ def cmd_down(paths: Paths, cfg: Config, manifest: Manifest, everything: bool = F
 def cmd_status(paths: Paths, cfg: Config) -> None:
     held = serve_running(paths)
     rows: list[tuple[str, str]] = []
-    if held:
-        try:
-            conn, r = control_call(paths, cfg, held["port"], "/_control/status", None, 10)
-            st = json.loads(r.read())
-            conn.close()
-            gpu = {"off": "off, starts on the next request", "starting": "starting: " + st["stage"]}.get(st["state"], st["state"])
-            if st["state"].startswith("ready"):
-                gpu = (
-                    f"{st['state']}, idle {mmss(st['idle_s'])} of {minutes(st['idle_stop_min'])}, "
-                    f"{st['served']} request{'' if st['served'] == 1 else 's'} served, "
-                    f"ran {mmss(st['ran'] or 0)}, {units(st['cu'] or 0)}"
-                )
-            rows += [
-                ("Console", f"http://{cfg.proxy.host}:{held['port']}/_console"),
-                ("Web UI", f"http://{cfg.proxy.host}:{held['port']}/"),
-                ("Endpoint", f"http://{cfg.proxy.host}:{held['port']}/v1 · {st.get('engine_summary') or ''}"),
-                ("Model", f"{st.get('model') or cfg.basalt.effective_model_alias} (effort {st.get('effort', cfg.basalt.effort)}, {st.get('uncensor', cfg.describe_uncensor())}, ref {st.get('basalt_ref', 'pinned')})"),
-                ("GPU", gpu),
-            ]
-            perf = format_telemetry(st.get("basalt"))
-            if perf:
-                rows.append(("Telemetry", perf))
-            if st.get("last_error"):
-                rows.append(("Last error", st["last_error"]))
-        except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
-            rows.append(("Endpoint", f"pid {held['pid']} not answering ({e.__class__.__name__})"))
-    else:
-        rows.append(("Endpoint", f"not running (start it: {cli_name()} up)"))
-    ledger = UsageLedger(paths.usage_file).summary(days=30)
-    if ledger["sessions_count"]:
-        rows.append(("Ledger", f"today {ledger['today_cu']:.2f} CU · month {ledger['month_cu']:.2f} CU · {ledger['sessions_count']} sessions"))
-    bal, _ = colab_usage()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_usage = pool.submit(colab_usage)
+        f_alive = pool.submit(session_alive, cfg.colab.session)
+        if held:
+            try:
+                conn, r = control_call(paths, cfg, held["port"], "/_control/status", None, 10)
+                st = json.loads(r.read())
+                conn.close()
+                gpu = {"off": "off, starts on the next request", "starting": "starting: " + st["stage"]}.get(st["state"], st["state"])
+                if st["state"].startswith("ready"):
+                    gpu = (
+                        f"{st['state']}, idle {mmss(st['idle_s'])} of {minutes(st['idle_stop_min'])}, "
+                        f"{st['served']} request{'' if st['served'] == 1 else 's'} served, "
+                        f"ran {mmss(st['ran'] or 0)}, {units(st['cu'] or 0)}"
+                    )
+                rows += [
+                    ("Console", f"http://{cfg.proxy.host}:{held['port']}/_console"),
+                    ("Web UI", f"http://{cfg.proxy.host}:{held['port']}/"),
+                    ("Endpoint", f"http://{cfg.proxy.host}:{held['port']}/v1 · {st.get('engine_summary') or ''}"),
+                    ("Model", f"{st.get('model') or cfg.basalt.effective_model_alias} (effort {st.get('effort', cfg.basalt.effort)}, {st.get('uncensor', cfg.describe_uncensor())}, ref {st.get('basalt_ref', 'pinned')})"),
+                    ("GPU", gpu),
+                ]
+                perf = format_telemetry(st.get("basalt"))
+                if perf:
+                    rows.append(("Telemetry", perf))
+                if st.get("last_error"):
+                    rows.append(("Last error", st["last_error"]))
+            except (OSError, ValueError, KeyError, http.client.HTTPException) as e:
+                rows.append(("Endpoint", f"pid {held['pid']} not answering ({e.__class__.__name__})"))
+        else:
+            rows.append(("Endpoint", f"not running (start it: {cli_name()} up)"))
+        ledger = UsageLedger(paths.usage_file).summary(days=30)
+        if ledger["sessions_count"]:
+            rows.append(("Ledger", f"today {ledger['today_cu']:.2f} CU · month {ledger['month_cu']:.2f} CU · {ledger['sessions_count']} sessions"))
+        bal, _ = f_usage.result()
+        is_alive = f_alive.result()
     rows.append((
         "Colab",
-        f"session {cfg.colab.session} {'running' if session_alive(cfg.colab.session) else 'not running'}, "
+        f"session {cfg.colab.session} {'running' if is_alive else 'not running'}, "
         f"balance {f'{bal:.1f}' if bal is not None else 'unknown'} compute units",
     ))
     if held and paths.key_file.exists():
@@ -988,14 +1030,14 @@ def read_piped_stdin(has_prompt: bool) -> str:
     return sys.stdin.read().strip()
 
 
-def cmd_ask(paths: Paths, cfg: Config, words: list[str]) -> None:
+def cmd_ask(paths: Paths, cfg: Config, words: list[str], opts: dict[str, Any] | None = None) -> None:
     held = serve_running(paths)
     if not held:
         sys.exit(f"The endpoint is not running. Start it first: {cli_name()} up")
     port = int(held["port"])
     live_st = fetch_live_status(paths, cfg, port)
     model = str((live_st or {}).get("model") or cfg.basalt.effective_model_alias)
-    opts = parse_ask_options(words)
+    opts = parse_ask_options(words) if opts is None else opts
     prompt = opts["prompt"]
     images = opts["images"]
     piped = read_piped_stdin(bool(prompt or images))
@@ -1218,13 +1260,138 @@ def cmd_doctor(paths: Paths, cfg: Config, manifest: Manifest) -> None:
         sys.exit(1)
 
 
-def _extract_flag_val(args: list[str], flag: str) -> str | None:
-    for i, a in enumerate(args):
-        if a == flag and i + 1 < len(args):
-            return args[i + 1]
-        if a.startswith(flag + "="):
-            return a.split("=", 1)[1]
-    return None
+_WAIT_GPU_DEFAULT = object()
+
+
+def _wait_gpu_min_type(raw: str) -> float:
+    try:
+        val = float(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"invalid --wait-gpu minutes {raw!r} (expected number >= 0)") from e
+    if val < 0 or val > 1440:
+        raise argparse.ArgumentTypeError("--wait-gpu minutes must be 0 (unlimited) or 0.1..1440")
+    return val
+
+
+def _positive_int_type(raw: str) -> int:
+    try:
+        val = int(raw)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"invalid integer {raw!r}") from e
+    if val <= 0:
+        raise argparse.ArgumentTypeError("expected positive integer")
+    return val
+
+
+def _ask_effort_type(raw: str) -> str:
+    low = raw.strip().lower()
+    if low in ("none", "off"):
+        return "none"
+    val = effort_value(low)
+    if not val:
+        raise argparse.ArgumentTypeError(f"invalid --effort {raw!r} (use 1-100, low, high, max, none)")
+    return val
+
+
+def _add_up_flags(p: argparse.ArgumentParser) -> None:
+    p.add_argument("-d", "--detach", "--no-watch", dest="detach", action="store_true", help="return immediately after G4 is ready")
+    p.add_argument("--quant", help="ud-iq1_m | ud-iq2_xxs | ud-q2_k_xl | custom")
+    p.add_argument("--pack-url", dest="pack_url", help="override .basalt URL (required for ud-q2_k_xl / custom)")
+    p.add_argument("--profile", help="balanced | solo-fast | exact")
+    p.add_argument("--routing-mode", dest="routing_mode", help="balanced | exact | fast")
+    p.add_argument("--parallel", type=int, help="concurrent slots (1-4)")
+    p.add_argument("--uncensor-scale", dest="uncensor_scale", type=float, help="refusal-removal multiplier (0.0-2.0)")
+    p.add_argument(
+        "--wait-gpu",
+        dest="wait_gpu",
+        nargs="?",
+        const=_WAIT_GPU_DEFAULT,
+        default=None,
+        type=_wait_gpu_min_type,
+        metavar="MIN",
+        help="retry G4 allocation (default 120m; 0 = unlimited)",
+    )
+    p.add_argument("--no-notify", dest="no_notify", action="store_true", help="disable terminal bell on ready/failure")
+    p.add_argument("--basalt-ref", dest="basalt_ref", help="build an upstream Basalt tag/branch/SHA from source")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="basalt-colab",
+        description=f"basalt-colab {__version__} — DeepSeek-V4.1-Flash on Google Colab G4 via Basalt",
+        add_help=True,
+    )
+    parser.add_argument("-V", "--version", action="version", version=f"basalt-colab {__version__}")
+    sub = parser.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    p_up = sub.add_parser("up", help="start G4 (~1.5-2 min), print endpoints & live status")
+    _add_up_flags(p_up)
+
+    p_restart = sub.add_parser("restart", help="stop current G4, reload config.toml, and boot fresh")
+    _add_up_flags(p_restart)
+
+    p_down = sub.add_parser("down", help="stop G4, wipe VM secrets, record CU ledger, stop detached proxy")
+    p_down.add_argument("--all", dest="everything", action="store_true", help="also stop foreground serve process")
+
+    sub.add_parser("status", help="Console & Web UI URLs, Basalt telemetry, billing ledger, Colab balance")
+    sub.add_parser("watch", help="live terminal status bar (SSE push)")
+
+    p_console = sub.add_parser("console", help="ensure local proxy is running and open /_console")
+    p_console.add_argument("--no-open", dest="no_open", action="store_true", help="print URL without opening browser")
+
+    p_cfg = sub.add_parser("config", help="inspect or update config.toml (hot-reloads live)")
+    cfg_sub = p_cfg.add_subparsers(dest="config_cmd", metavar="ACTION")
+    cfg_sub.add_parser("show", help="print resolved config.toml")
+    cfg_sub.add_parser("path", help="print config.toml path")
+    cfg_sub.add_parser("wizard", help="interactive terminal configuration wizard")
+    p_cfg_get = cfg_sub.add_parser("get", help="read a config value")
+    p_cfg_get.add_argument("key", help="config key (e.g. effort, idle_min, basalt.quant)")
+    p_cfg_set = cfg_sub.add_parser("set", help="update a config value and hot-reload proxy")
+    p_cfg_set.add_argument("key", help="config key")
+    p_cfg_set.add_argument("value", nargs="+", help="new value")
+    p_cfg_prof = cfg_sub.add_parser("profile", help="apply balanced | solo-fast | exact preset")
+    p_cfg_prof.add_argument("name", help="balanced | solo-fast | exact")
+
+    p_conn = sub.add_parser("connect", help="generate config for dsh | claude | codex | opencode | openai")
+    p_conn.add_argument("target", nargs="?", default=None, help="dsh | claude | codex | opencode | openai")
+    p_conn.add_argument("--raw", action="store_true", help="print raw config snippet only")
+    p_conn.add_argument("--json", dest="as_json", action="store_true", help="print JSON bundle")
+    p_conn.add_argument("--sh", action="store_true", help="print POSIX shell exports")
+    p_conn.add_argument("--powershell", action="store_true", help="print PowerShell exports")
+    p_conn.add_argument("--write", action="store_true", help="write config file (opencode)")
+
+    p_env = sub.add_parser("env", help="print live-synced OPENAI_*, ANTHROPIC_*, BASALT_API_KEY exports")
+    p_env.add_argument("--sh", action="store_true", help="POSIX shell exports")
+    p_env.add_argument("--powershell", action="store_true", help="PowerShell exports")
+    p_env.add_argument("--json", dest="as_json", action="store_true", help="JSON dictionary")
+    p_env.add_argument("--dsh", action="store_true", help="DeepSeek Harness env vars")
+    p_env.add_argument("--claude", action="store_true", help="Claude Code env vars")
+    p_env.add_argument("--codex", action="store_true", help="Codex CLI env vars")
+    p_env.add_argument("--opencode", action="store_true", help="OpenCode env vars")
+
+    p_ask = sub.add_parser("ask", help="one-shot streaming chat request")
+    p_ask.add_argument("--effort", type=_ask_effort_type, default=None, help="1-100, low, high, max, none")
+    p_ask.add_argument("--max", dest="effort_max", action="store_true", help="shortcut for --effort max")
+    p_ask.add_argument("--no-think", dest="no_think", action="store_true", help="disable reasoning (--effort none)")
+    p_ask.add_argument("--hide-think", dest="hide_think", action="store_true", help="suppress reasoning block output")
+    p_ask.add_argument("--max-tokens", dest="max_tokens", type=_positive_int_type, default=None, help="max completion tokens")
+    p_ask.add_argument("--system", default=None, help="optional system prompt")
+    p_ask.add_argument("--image", dest="images", action="append", default=[], help="attach image path (repeatable)")
+    p_ask.add_argument("prompt", nargs="*", help="prompt text")
+
+    p_logs = sub.add_parser("logs", help="show local proxy log and VM boot/Basalt logs")
+    p_logs.add_argument("-f", "--follow", action="store_true", help="live-tail local proxy log")
+    p_logs.add_argument("--local", action="store_true", help="local proxy log only")
+    p_logs.add_argument("--vm", action="store_true", help="VM logs only")
+
+    sub.add_parser("doctor", help="diagnose Python, OpenSSH, Colab CLI, OAuth balance, config, VM payload & port")
+    sub.add_parser("setup", help="install Colab CLI, complete Google OAuth, create keys & migrate legacy state/")
+
+    p_serve = sub.add_parser("serve", help="run the local proxy in the foreground")
+    p_serve.add_argument("--detached", action="store_true", help="run detached without echoing logs to stdout")
+
+    sub.add_parser("help", help="show full command summary")
+    return parser
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1233,20 +1400,21 @@ def main(argv: list[str] | None = None) -> None:
     if sys.stdout is not None and hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
     args = list(sys.argv[1:] if argv is None else argv)
-    cmd = args[0] if args else "help"
     init_console()
 
     paths = get_paths()
-    if cmd == "_watchdog" and len(args) == 6:
+    if args and args[0] == "_watchdog" and len(args) == 6:
         run_watchdog(paths, args[1], float(args[2]), float(args[3]), float(args[4]), float(args[5]))
         return
-    if cmd in ("help", "-h", "--help") or (
-        cmd != "ask" and any(a in ("-h", "--help") for a in args[1:])
-    ):
+    if not args or args in (["help"], ["-h"], ["--help"]):
         print(USAGE)
         return
-    if cmd in ("-V", "--version"):
-        print(f"basalt-colab {__version__}")
+
+    parser = build_parser()
+    ns = parser.parse_args(args)
+    cmd = ns.cmd
+    if cmd in (None, "help"):
+        print(USAGE)
         return
 
     try:
@@ -1257,65 +1425,96 @@ def main(argv: list[str] | None = None) -> None:
 
     try:
         if cmd == "serve":
-            serve(paths, cfg, manifest, detached="--detached" in args[1:])
+            serve(paths, cfg, manifest, detached=ns.detached)
         elif cmd == "setup":
             cmd_setup(paths, cfg, manifest)
         elif cmd in ("up", "restart"):
-            sub_args = args[1:]
-            raw_scale = _extract_flag_val(sub_args, "--uncensor-scale")
-            try:
-                parsed_scale = float(raw_scale) if raw_scale is not None else None
-            except ValueError:
-                sys.exit(f"invalid --uncensor-scale {raw_scale!r} (expected float 0.0-2.0)")
-            raw_par = _extract_flag_val(sub_args, "--parallel")
-            try:
-                parsed_par = int(raw_par) if raw_par is not None else None
-            except ValueError:
-                sys.exit(f"invalid --parallel {raw_par!r} (expected integer 1-4)")
-            wait_gpu, wait_gpu_min = _parse_wait_gpu_args(sub_args)
-            detach = any(f in sub_args for f in ("-d", "--detach", "--no-watch"))
-            do_notify = "--no-notify" not in sub_args
+            wait_gpu = ns.wait_gpu is not None
+            wait_gpu_min = None if ns.wait_gpu in (None, _WAIT_GPU_DEFAULT) else float(ns.wait_gpu)
             cmd_up(
                 paths,
                 cfg,
                 manifest,
                 wait_gpu=wait_gpu,
                 wait_gpu_min=wait_gpu_min,
-                basalt_ref=_extract_flag_val(sub_args, "--basalt-ref"),
-                quant=_extract_flag_val(sub_args, "--quant"),
-                pack_url=_extract_flag_val(sub_args, "--pack-url"),
-                uncensor_scale=parsed_scale,
-                profile=_extract_flag_val(sub_args, "--profile"),
-                routing_mode=_extract_flag_val(sub_args, "--routing-mode"),
-                parallel=parsed_par,
-                detach=detach,
-                do_notify=do_notify,
+                basalt_ref=ns.basalt_ref,
+                quant=ns.quant,
+                pack_url=ns.pack_url,
+                uncensor_scale=ns.uncensor_scale,
+                profile=ns.profile,
+                routing_mode=ns.routing_mode,
+                parallel=ns.parallel,
+                detach=ns.detach,
+                do_notify=not ns.no_notify,
                 restart=(cmd == "restart"),
             )
         elif cmd == "down":
-            cmd_down(paths, cfg, manifest, everything="--all" in args[1:])
+            cmd_down(paths, cfg, manifest, everything=ns.everything)
         elif cmd == "status":
             cmd_status(paths, cfg)
         elif cmd == "watch":
             cmd_watch(paths, cfg)
         elif cmd == "console":
-            cmd_console(paths, cfg, manifest, no_open="--no-open" in args[1:])
+            cmd_console(paths, cfg, manifest, no_open=ns.no_open)
         elif cmd == "config":
-            cmd_config(paths, cfg, args[1:])
+            if ns.config_cmd is None:
+                cfg_args: list[str] = []
+            elif ns.config_cmd == "get":
+                cfg_args = ["get", ns.key]
+            elif ns.config_cmd == "set":
+                cfg_args = ["set", ns.key, *ns.value]
+            elif ns.config_cmd == "profile":
+                cfg_args = ["profile", ns.name]
+            else:
+                cfg_args = [ns.config_cmd]
+            cmd_config(paths, cfg, cfg_args)
         elif cmd == "logs":
-            cmd_logs(paths, cfg, args[1:])
+            log_args = [
+                f for f, on in (("--follow", ns.follow), ("--local", ns.local), ("--vm", ns.vm)) if on
+            ]
+            cmd_logs(paths, cfg, log_args)
         elif cmd == "ask":
-            cmd_ask(paths, cfg, args[1:])
+            effort = "none" if ns.no_think else ("max" if ns.effort_max else ns.effort)
+            ask_opts: dict[str, Any] = {
+                "effort": effort,
+                "images": list(ns.images),
+                "prompt": " ".join(ns.prompt).strip(),
+                "max_tokens": ns.max_tokens,
+                "system": ns.system,
+                "no_think": ns.no_think or effort == "none",
+                "hide_think": ns.hide_think,
+            }
+            cmd_ask(paths, cfg, [], opts=ask_opts)
         elif cmd == "connect":
-            rest = [a for a in args[1:] if not a.startswith("-")]
-            flags = [a for a in args[1:] if a.startswith("-")]
-            cmd_connect(paths, cfg, rest[0] if rest else None, flags)
+            conn_flags = [
+                f
+                for f, on in (
+                    ("--raw", ns.raw),
+                    ("--json", ns.as_json),
+                    ("--sh", ns.sh),
+                    ("--powershell", ns.powershell),
+                    ("--write", ns.write),
+                )
+                if on
+            ]
+            cmd_connect(paths, cfg, ns.target, conn_flags)
         elif cmd == "env":
-            cmd_env(paths, cfg, args[1:])
+            env_flags = [
+                f
+                for f, on in (
+                    ("--sh", ns.sh),
+                    ("--powershell", ns.powershell),
+                    ("--json", ns.as_json),
+                    ("--dsh", ns.dsh),
+                    ("--claude", ns.claude),
+                    ("--codex", ns.codex),
+                    ("--opencode", ns.opencode),
+                )
+                if on
+            ]
+            cmd_env(paths, cfg, env_flags)
         elif cmd == "doctor":
             cmd_doctor(paths, cfg, manifest)
-        else:
-            sys.exit(USAGE)
     except KeyboardInterrupt:
         print()
         if cmd in ("up", "restart") and serve_running(paths):

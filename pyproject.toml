@@ -24,4 +24,4 @@ basalt-colab = "basalt_colab.cli:main"
 include = ["basalt_colab*"]
 
 [tool.setuptools.package-data]
-basalt_colab = ["vm/*"]
+basalt_colab = ["vm/*", "web/*"]

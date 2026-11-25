@@ -37,6 +37,10 @@ class Paths:
         return self.state_dir / "serve.lock"
 
     @property
+    def lock_sentinel(self) -> Path:
+        return self.state_dir / "serve.lck"
+
+    @property
     def log_file(self) -> Path:
         return self.state_dir / "basalt-colab.log"
 

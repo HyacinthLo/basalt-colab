@@ -278,6 +278,73 @@ class Logger:
             print(clean, flush=True)
 
 
+_HELD_LOCKS: dict[Path, int] = {}
+_LOCK_GUARD = threading.Lock()
+
+
+def _try_kernel_lock(fd: int) -> bool:
+    """Acquires a non-blocking exclusive OS kernel lock on fd (Unix flock / Windows msvcrt)."""
+    if IS_WIN:
+        import msvcrt
+
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            if os.fstat(fd).st_size == 0:
+                os.write(fd, b"\0")
+                os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    import fcntl
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _release_kernel_lock(fd: int) -> None:
+    try:
+        if IS_WIN:
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def is_lock_held(paths: Paths) -> bool:
+    """Checks via OS kernel lock whether a live process currently owns serve.lck."""
+    sentinel = paths.lock_sentinel.resolve()
+    with _LOCK_GUARD:
+        if sentinel in _HELD_LOCKS:
+            return True
+    if not paths.lock_sentinel.exists():
+        # Legacy fallback when an older process wrote only serve.lock
+        return alive(read_lock(paths))
+    try:
+        fd = os.open(str(paths.lock_sentinel), os.O_RDWR | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return False
+    try:
+        if _try_kernel_lock(fd):
+            _release_kernel_lock(fd)
+            return False
+        return True
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def read_lock(paths: Paths) -> dict[str, Any] | None:
     raw = read_bytes(paths.lock_file)
     if raw is None:
@@ -292,25 +359,45 @@ def read_lock(paths: Paths) -> dict[str, Any] | None:
         return {"pid": None, "busy": True} if young else {"pid": None}
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        for _ in range(30):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(0.05)
+        os.replace(tmp, path)
+    except OSError:
+        remove_file(tmp)
+        raise
+
+
 def take_lock(paths: Paths, info: dict[str, Any]) -> dict[str, Any] | None:
+    """Acquires OS kernel lock on serve.lck and atomically writes metadata to serve.lock."""
     paths.ensure_dirs()
-    for _ in range(5):
-        try:
-            fd = os.open(str(paths.lock_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            raw, held = read_bytes(paths.lock_file), read_lock(paths)
-            if held and (held.get("busy") or alive(held)):
-                return held
-            if read_bytes(paths.lock_file) == raw:
-                try:
-                    paths.lock_file.unlink()
-                except OSError:
-                    time.sleep(0.2)
-            continue
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(dict(info, **me()), f)
-        return None
-    return read_lock(paths) or {"pid": None, "busy": True}
+    sentinel = paths.lock_sentinel.resolve()
+    with _LOCK_GUARD:
+        if sentinel in _HELD_LOCKS:
+            return read_lock(paths) or me()
+        fd = os.open(
+            str(paths.lock_sentinel),
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        if not _try_kernel_lock(fd):
+            os.close(fd)
+            return read_lock(paths) or {"pid": None, "busy": True}
+        _HELD_LOCKS[sentinel] = fd
+    meta = dict(info, **me())
+    try:
+        _atomic_write_text(paths.lock_file, json.dumps(meta))
+    except OSError:
+        release_lock(paths)
+        raise
+    return None
 
 
 def update_lock(paths: Paths, updates: dict[str, Any]) -> None:
@@ -319,23 +406,32 @@ def update_lock(paths: Paths, updates: dict[str, Any]) -> None:
     if not held or held.get("pid") != os.getpid():
         return
     held.update(updates)
-    tmp = paths.lock_file.with_suffix(f".{os.getpid()}.tmp")
     try:
-        tmp.write_text(json.dumps(held), encoding="utf-8")
-        os.replace(tmp, paths.lock_file)
+        _atomic_write_text(paths.lock_file, json.dumps(held))
     except OSError:
-        remove_file(tmp)
+        pass
 
 
 def release_lock(paths: Paths) -> None:
     held = read_lock(paths)
     if held and held.get("pid") == os.getpid():
         remove_file(paths.lock_file)
+    sentinel = paths.lock_sentinel.resolve()
+    with _LOCK_GUARD:
+        fd = _HELD_LOCKS.pop(sentinel, None)
+    if fd is not None:
+        _release_kernel_lock(fd)
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def serve_running(paths: Paths) -> dict[str, Any] | None:
+    if not is_lock_held(paths):
+        return None
     held = read_lock(paths)
-    return held if held and held.get("port") and alive(held) else None
+    return held if held and held.get("port") else None
 
 
 def load_session(paths: Paths) -> dict[str, Any] | None:

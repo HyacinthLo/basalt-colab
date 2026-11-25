@@ -204,6 +204,7 @@ class Manager:
         self.ledger = ledger
         self.logger = logger
         self.cond = threading.Condition()
+        self._rev = 0
         self.state = "off"
         self.steps: list[tuple[str, float, str | None]] = []
         self.attempt = 0
@@ -243,6 +244,16 @@ class Manager:
         self._override_routing_mode: str | None = None
         self._override_parallel: int | None = None
 
+    def _bump(self) -> None:
+        self._rev += 1
+        self.cond.notify_all()
+
+    def wait_event(self, last_rev: int, timeout: float) -> int:
+        with self.cond:
+            if self._rev == last_rev and not self.closing:
+                self.cond.wait(timeout)
+            return self._rev
+
     def ready(self) -> bool:
         return self.state == "ready" and self.tunnel_ok
 
@@ -250,6 +261,7 @@ class Manager:
         with self.cond:
             if self.ready():
                 self.active += 1
+                self._bump()
                 return True
         return False
 
@@ -258,6 +270,7 @@ class Manager:
             self.active -= 1
             self.served += served
             self.last_activity = time.time()
+            self._bump()
 
     def reload_config(self, new_cfg: Config, prev_cfg: Config | None = None) -> tuple[list[str], list[str]]:
         with self.cond:
@@ -273,6 +286,7 @@ class Manager:
             if self.state == "off":
                 self.cfg.basalt = new_cfg.basalt
                 cold = []
+            self._bump()
         return hot, cold
 
     def acquire(
@@ -305,6 +319,7 @@ class Manager:
                 with self.cond:
                     if self.ready():
                         self.active += 1
+                        self._bump()
                         return None
                     if mine is not None and mine in self.errors:
                         return self.errors[mine]
@@ -362,6 +377,7 @@ class Manager:
         self.attempt += 1
         self.state, self.steps, self.stop_reason, self.no_tunnel, self.begun = "starting", [], None, False, time.time()
         self.explicit_up, self.waiter_lost_at, self.alloc_note = explicit, None, ""
+        self._bump()
         threading.Thread(target=self._run_start, args=(self.attempt, new), daemon=True).start()
 
     def _check_stop(self) -> None:
@@ -379,17 +395,17 @@ class Manager:
             self.alloc_note = ""
             if ok and not self.stop_reason:
                 self.state, self.tunnel_ok, self.last_activity = "ready", True, time.time()
-                self.cond.notify_all()
+                self._bump()
                 return
             if ok:
                 err = f"start cancelled ({self.stop_reason})"
             if err is None:
                 self.state = "off"
-                self.cond.notify_all()
+                self._bump()
                 return
             self.errors[attempt], self.fail_msg, self.fail_until = err, err, time.time() + FAIL_COOLDOWN
             self.state = "stopping"
-            self.cond.notify_all()
+            self._bump()
         self.logger.log("start failed: " + err)
         self._stop("start failed")
 
@@ -403,11 +419,12 @@ class Manager:
                 return
             if self.state == "starting":
                 self.stop_reason = reason
+                self._bump()
                 return
             if self.state == "stopping" or (self.state == "off" and not self.paths.session_file.exists()):
                 return
             self.state = "stopping"
-            self.cond.notify_all()
+            self._bump()
         self.logger.log(f"stopping the VM ({reason})")
         threading.Thread(target=self._stop, args=(reason,), daemon=True).start()
 
@@ -432,7 +449,7 @@ class Manager:
         with self.cond:
             self.state, self.tunnel_ok, self.sess, self.alloc_note = "off", False, None, ""
             self._stats_cache = None
-            self.cond.notify_all()
+            self._bump()
 
     def _stage(self, s: dict[str, Any], key: str, t0: float) -> None:
         s["stages"][key] = round(time.time() - t0, 1)
@@ -469,7 +486,9 @@ class Manager:
                 )
             save_session(self.paths, s)
             self.sess = s
-            self.steps += [("allocated", time.time(), None), ("uploaded", time.time(), None)]
+            with self.cond:
+                self.steps += [("allocated", time.time(), None), ("uploaded", time.time(), None)]
+                self._bump()
             self._await_ready(s, adopted=True)
         elif not new:
             if s:
@@ -580,7 +599,9 @@ class Manager:
         while True:
             rc, out = colab_run(["new", "-s", session, "--gpu", "G4"], 300)
             if rc == 0 and "READY" in out:
-                self.alloc_note = ""
+                with self.cond:
+                    self.alloc_note = ""
+                    self._bump()
                 break
             attempt += 1
             self.logger.log(f"allocation attempt {attempt} failed: {out.strip()[-300:]}")
@@ -594,14 +615,18 @@ class Manager:
             wait_s = min(60.0, 10.0 * (2 ** min(attempt - 1, 3))) * max(0.02, delay_scale)
             elapsed_s = time.time() - alloc_start
             cap_note = f" / {wait_limit_min:g}m" if (wait_gpu and wait_limit_min > 0) else ""
-            self.alloc_note = (
-                f"waiting for G4 GPU (attempt {attempt + 1}, elapsed {mmss(elapsed_s)}{cap_note}, retry in {max(1, int(wait_s))}s)"
-            )
+            with self.cond:
+                self.alloc_note = (
+                    f"waiting for G4 GPU (attempt {attempt + 1}, elapsed {mmss(elapsed_s)}{cap_note}, retry in {max(1, int(wait_s))}s)"
+                )
+                self._bump()
             self._sleep_cancelable(wait_s)
         s["allocated_ts"] = time.time()
         self._stage(s, "allocated", t0)
         self.logger.log(f"G4 allocated after {s['stages']['allocated']:.0f} s")
-        self.steps.append(("allocated", time.time(), "G4 GPU allocated"))
+        with self.cond:
+            self.steps.append(("allocated", time.time(), "G4 GPU allocated"))
+            self._bump()
         bundle = self.paths.state_dir / "bundle.tgz"
         try:
             build_bundle(self.paths, bundle)
@@ -618,7 +643,9 @@ class Manager:
         if "BOOT_STARTED" not in out:
             raise StartError("boot start failed: " + out.strip()[-300:])
         self._stage(s, "boot_started", t0)
-        self.steps.append(("uploaded", time.time(), None))
+        with self.cond:
+            self.steps.append(("uploaded", time.time(), None))
+            self._bump()
         self.logger.log(f"boot started on GPU VM after {s['stages']['boot_started']:.0f} s; ready in ~2-3 minutes")
         return s
 
@@ -664,12 +691,18 @@ class Manager:
         raise StartError(f"boot did not finish in {BOOT_TIMEOUT // 60} min")
 
     def _take(self, lines: list[str], seen: int, base: float) -> int:
+        added = False
         for l in lines[seen:]:
             self.logger.log("  vm " + l)
             m = re.match(r"^(\d+)s \S+ (.*)$", l)
             for key, rx, label in (STEPS if m else ()):
                 if re.match(rx, m.group(2)):
-                    self.steps.append((key, min(base + int(m.group(1)), time.time()), label))
+                    with self.cond:
+                        self.steps.append((key, min(base + int(m.group(1)), time.time()), label))
+                    added = True
+        if added:
+            with self.cond:
+                self._bump()
         return max(seen, len(lines))
 
     def _spawn_tunnel(self, s: dict[str, Any]) -> None:
@@ -736,7 +769,7 @@ class Manager:
                     if self._tunnel_up(s):
                         with self.cond:
                             self.tunnel_ok = True
-                            self.cond.notify_all()
+                            self._bump()
                         self.logger.log("tunnel restored")
                         return
             self.logger.log(f"gpu vm unreachable ({reason})")
@@ -763,7 +796,12 @@ class Manager:
             if self.state != "ready" or self.repairing:
                 return
             self.repairing, self.tunnel_ok = True, False
+            self._bump()
         threading.Thread(target=self._repair, daemon=True).start()
+
+    def event_rev(self) -> int:
+        with self.cond:
+            return self._rev
 
     def monitor(self) -> None:
         while True:
@@ -796,6 +834,7 @@ class Manager:
     def shutdown(self) -> None:
         with self.cond:
             self.closing = True
+            self._bump()
             busy = self.state != "off" or self.paths.session_file.exists()
         if busy:
             self.logger.log("proxy exiting: stopping the VM first (Ctrl+C again leaves it to the watchdog)")
