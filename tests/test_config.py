@@ -337,6 +337,9 @@ class ConfigAndUnitTests(unittest.TestCase):
         cfg = config.Config()
         self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib, cfg.basalt.engram_cache_mib),
                          (2, "balanced", 450, 1024))
+        partial = config.parse_toml("[basalt]\nquant = 'ud-iq2_xxs'\n")
+        self.assertEqual((partial.basalt.quant, partial.basalt.routing_mode, partial.basalt.vram_reserve_mib, partial.basalt.pool_workers),
+                         ("ud-iq2_xxs", "balanced", 450, 0))
         cfg.apply_profile("solo-fast")
         self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib), (1, "fast", 400))
         cfg.apply_profile("exact")

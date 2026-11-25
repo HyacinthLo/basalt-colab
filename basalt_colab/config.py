@@ -361,18 +361,19 @@ class Config:
         if not all(isinstance(x, dict) for x in (c_raw, p_raw, b_raw, s_raw)):
             raise ConfigError("config sections [colab], [proxy], [basalt], [basalt.sampling] must be tables")
 
+        dc, dp, db = ColabConfig(), ProxyConfig(), BasaltConfig()
         colab = ColabConfig(
-            session=str(c_raw.get("session", ColabConfig.session)).strip(),
-            idle_min=float(c_raw.get("idle_min", ColabConfig.idle_min)),
-            max_hours=float(c_raw.get("max_hours", ColabConfig.max_hours)),
-            min_balance=float(c_raw.get("min_balance", ColabConfig.min_balance)),
-            wait_gpu=_parse_bool(c_raw.get("wait_gpu", ColabConfig.wait_gpu)),
-            orphan_boot_s=float(c_raw.get("orphan_boot_s", ColabConfig.orphan_boot_s)),
+            session=str(c_raw.get("session", dc.session)).strip(),
+            idle_min=float(c_raw.get("idle_min", dc.idle_min)),
+            max_hours=float(c_raw.get("max_hours", dc.max_hours)),
+            min_balance=float(c_raw.get("min_balance", dc.min_balance)),
+            wait_gpu=_parse_bool(c_raw.get("wait_gpu", dc.wait_gpu)),
+            orphan_boot_s=float(c_raw.get("orphan_boot_s", dc.orphan_boot_s)),
         )
         proxy = ProxyConfig(
-            bind=str(p_raw.get("bind", ProxyConfig.bind)).strip(),
-            port=int(p_raw.get("port", ProxyConfig.port)),
-            strict_model=_parse_bool(p_raw.get("strict_model", ProxyConfig.strict_model)),
+            bind=str(p_raw.get("bind", dp.bind)).strip(),
+            port=int(p_raw.get("port", dp.port)),
+            strict_model=_parse_bool(p_raw.get("strict_model", dp.strict_model)),
         )
         sampling = SamplingConfig(
             temperature=None if s_raw.get("temperature") in (None, "") else float(s_raw["temperature"]),
@@ -381,39 +382,39 @@ class Config:
             min_p=None if s_raw.get("min_p") in (None, "") else float(s_raw["min_p"]),
             presence_penalty=None if s_raw.get("presence_penalty") in (None, "") else float(s_raw["presence_penalty"]),
         )
-        q_in = b_raw.get("quant", BasaltConfig.quant)
+        q_in = b_raw.get("quant", db.quant)
         q_parsed = quant_value(q_in)
         if q_parsed is None:
             raise ConfigError(f"basalt.quant must be one of {VALID_QUANTS}, got {q_in!r}")
-        ctx_in = b_raw.get("max_context", BasaltConfig.max_context)
+        ctx_in = b_raw.get("max_context", db.max_context)
         ctx_parsed = context_value(ctx_in)
         if ctx_parsed is None:
             raise ConfigError(f"basalt.max_context must be 4096..1048576 (or 32K..1M), got {ctx_in!r}")
-        rt_in = b_raw.get("routing_mode", BasaltConfig.routing_mode)
+        rt_in = b_raw.get("routing_mode", db.routing_mode)
         rt_parsed = routing_mode_value(rt_in)
         if rt_parsed is None:
             raise ConfigError(f"basalt.routing_mode must be one of {VALID_ROUTING_MODES}, got {rt_in!r}")
         basalt = BasaltConfig(
             quant=q_parsed,
-            pack_url=str(b_raw.get("pack_url", BasaltConfig.pack_url)).strip(),
-            ref=str(b_raw.get("ref", BasaltConfig.ref)).strip(),
-            model_alias=str(b_raw.get("model_alias", BasaltConfig.model_alias)).strip(),
+            pack_url=str(b_raw.get("pack_url", db.pack_url)).strip(),
+            ref=str(b_raw.get("ref", db.ref)).strip(),
+            model_alias=str(b_raw.get("model_alias", db.model_alias)).strip(),
             max_context=ctx_parsed,
-            parallel=int(b_raw.get("parallel", BasaltConfig.parallel)),
-            kv=str(b_raw.get("kv", BasaltConfig.kv)).strip().lower(),
-            vision=str(b_raw.get("vision", BasaltConfig.vision)).strip().lower(),
-            spec=int(b_raw.get("spec", BasaltConfig.spec)),
-            draft_experts=int(b_raw.get("draft_experts", BasaltConfig.draft_experts)),
+            parallel=int(b_raw.get("parallel", db.parallel)),
+            kv=str(b_raw.get("kv", db.kv)).strip().lower(),
+            vision=str(b_raw.get("vision", db.vision)).strip().lower(),
+            spec=int(b_raw.get("spec", db.spec)),
+            draft_experts=int(b_raw.get("draft_experts", db.draft_experts)),
             routing_mode=rt_parsed,
-            pool_workers=int(b_raw.get("pool_workers", BasaltConfig.pool_workers)),
-            engram_cache_mib=int(b_raw.get("engram_cache_mib", BasaltConfig.engram_cache_mib)),
-            conv_cache_mib=int(b_raw.get("conv_cache_mib", BasaltConfig.conv_cache_mib)),
-            vram_reserve_mib=int(b_raw.get("vram_reserve_mib", BasaltConfig.vram_reserve_mib)),
-            resident_budget_gib=int(b_raw.get("resident_budget_gib", BasaltConfig.resident_budget_gib)),
-            uncensor=_parse_bool(b_raw.get("uncensor", BasaltConfig.uncensor)),
-            uncensor_scale=float(b_raw.get("uncensor_scale", BasaltConfig.uncensor_scale)),
-            effort=str(b_raw.get("effort", BasaltConfig.effort)).strip().lower(),
-            workers=int(b_raw.get("workers", BasaltConfig.workers)),
+            pool_workers=int(b_raw.get("pool_workers", db.pool_workers)),
+            engram_cache_mib=int(b_raw.get("engram_cache_mib", db.engram_cache_mib)),
+            conv_cache_mib=int(b_raw.get("conv_cache_mib", db.conv_cache_mib)),
+            vram_reserve_mib=int(b_raw.get("vram_reserve_mib", db.vram_reserve_mib)),
+            resident_budget_gib=int(b_raw.get("resident_budget_gib", db.resident_budget_gib)),
+            uncensor=_parse_bool(b_raw.get("uncensor", db.uncensor)),
+            uncensor_scale=float(b_raw.get("uncensor_scale", db.uncensor_scale)),
+            effort=str(b_raw.get("effort", db.effort)).strip().lower(),
+            workers=int(b_raw.get("workers", db.workers)),
             sampling=sampling,
         )
         cfg = cls(colab=colab, proxy=proxy, basalt=basalt)
