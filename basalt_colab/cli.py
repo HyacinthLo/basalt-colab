@@ -947,7 +947,10 @@ def main(argv: list[str] | None = None) -> None:
     if cmd == "_watchdog" and len(args) == 6:
         run_watchdog(paths, args[1], float(args[2]), float(args[3]), float(args[4]), float(args[5]))
         return
-    if cmd in ("help", "-h", "--help"):
+    if cmd in ("help", "-h", "--help") or (
+        cmd not in ("claude", "codex", "opencode", "ask")
+        and any(a in ("-h", "--help") for a in args[1:])
+    ):
         print(USAGE)
         return
     if cmd in ("-V", "--version"):

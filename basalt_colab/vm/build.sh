@@ -88,7 +88,16 @@ if [ ! -x "$S/bin/basalt" ]; then
     > $R/build_make.log 2>&1 || { st "basalt make FAILED: $(grep -m3 -i error $R/build_make.log | tr '\n' ' ')"; exit 1; }
 fi
 
-pip install -q -r "$S/requirements.txt" > $R/build_pip.log 2>&1 || { st "basalt pip FAILED"; exit 1; }
+MISSING_PY=$(python3 - <<'EOF'
+import importlib.util
+pkgs = [("numpy", "numpy"), ("jinja2", "jinja2"), ("markupsafe", "markupsafe"),
+        ("regex", "regex"), ("PIL", "pillow"), ("psutil", "psutil"), ("pypdf", "pypdf")]
+print(" ".join(pip_name for mod, pip_name in pkgs if importlib.util.find_spec(mod) is None))
+EOF
+)
+if [ -n "$MISSING_PY" ]; then
+  pip install -q --no-deps $MISSING_PY > $R/build_pip.log 2>&1 || pip install -q -r "$S/requirements.txt" > $R/build_pip.log 2>&1 || { st "basalt pip FAILED"; exit 1; }
+fi
 
 if [ ! -x "$D/abliterate" ] && [ -f "$V/abliterate.c" ]; then
   gcc -O3 -fopenmp -DABLITERATE_STANDALONE "$V/abliterate.c" -lm -o "$D/abliterate" \
