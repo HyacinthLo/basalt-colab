@@ -312,7 +312,10 @@ class ProxyLifecycleTests(unittest.TestCase):
 
         r = c.req(method="GET", path="/v1/models", extra_headers={"Origin": "http://localhost:3000"})
         parsed = json.loads(r.raw)
-        self.assertEqual((r.status, parsed["data"][0]["id"], parsed["models"][0]["id"]), (200, MODEL_ID, MODEL_ID))
+        m0 = parsed["data"][0]
+        self.assertEqual((r.status, m0["id"], parsed["models"][0]["id"]), (200, MODEL_ID, MODEL_ID))
+        self.assertEqual(m0["max_model_len"], m0["context_length"])
+        self.assertEqual(m0["reasoning"]["supported_efforts"], ["max", "high", "low", "none"])
         self.assertEqual(c.req(host=f"evil.example:{c.port}").status, 403)
         self.assertEqual(c.calls("new"), [])
 

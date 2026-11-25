@@ -51,8 +51,26 @@ def write_opencode_config(paths: Paths, cfg: Config, port: int | None = None) ->
     paths.opencode_file.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
 
 
+# Official DeepSeek API compatibility aliases (api-docs.deepseek.com/api/create-message):
+# DeepSeek-V4.1 natively accepts none | low (50) | high (75, default) | max (100) | 1..100.
+DEEPSEEK_EFFORT_ALIASES: dict[str, str] = {
+    "minimal": "low",
+    "medium": "high",
+    "xhigh": "high",
+    "ultra": "max",
+}
+
+
+def _normalize_effort(val: Any) -> Any:
+    if isinstance(val, str):
+        mapped = DEEPSEEK_EFFORT_ALIASES.get(val.strip().lower())
+        if mapped is not None:
+            return mapped
+    return val
+
+
 def rewrite_request(body: bytes, cfg: Config, path: str = "/v1/chat/completions") -> bytes:
-    """Single-model routing to cfg.basalt.effective_model_alias (unless strict_model) + saved default effort injection."""
+    """Single-model routing (unless strict_model), DeepSeek effort alias normalization, and default effort injection."""
     try:
         req = json.loads(body)
     except ValueError:
@@ -64,6 +82,35 @@ def rewrite_request(body: bytes, cfg: Config, path: str = "/v1/chat/completions"
     if not cfg.proxy.strict_model and req.get("model") != target_model:
         req["model"] = target_model
         changed = True
+
+    # Normalize compatibility effort aliases (e.g. Codex default "medium" -> "high") so Basalt DS4.1 never 500s.
+    if path == "/v1/chat/completions":
+        if "reasoning_effort" in req:
+            norm = _normalize_effort(req["reasoning_effort"])
+            if norm != req["reasoning_effort"]:
+                req["reasoning_effort"] = norm
+                changed = True
+        ctk = req.get("chat_template_kwargs")
+        if isinstance(ctk, dict) and "reasoning_effort" in ctk:
+            norm = _normalize_effort(ctk["reasoning_effort"])
+            if norm != ctk["reasoning_effort"]:
+                req["chat_template_kwargs"] = dict(ctk, reasoning_effort=norm)
+                changed = True
+    elif path == "/v1/responses":
+        reasoning = req.get("reasoning")
+        if isinstance(reasoning, dict) and "effort" in reasoning:
+            norm = _normalize_effort(reasoning["effort"])
+            if norm != reasoning["effort"]:
+                req["reasoning"] = dict(reasoning, effort=norm)
+                changed = True
+    elif path in ("/v1/messages", "/v1/messages/count_tokens"):
+        oc = req.get("output_config")
+        if isinstance(oc, dict) and "effort" in oc:
+            norm = _normalize_effort(oc["effort"])
+            if norm != oc["effort"]:
+                req["output_config"] = dict(oc, effort=norm)
+                changed = True
+
     effort = str(cfg.basalt.effort)
     if effort != "50":
         if path == "/v1/chat/completions" and req.get("reasoning_effort") is None:
@@ -268,7 +315,13 @@ class Handler(BaseHTTPRequestHandler):
             "quant": cfg.basalt.quant,
             "reasoning_effort": str(cfg.basalt.effort),
             "context_length": cfg.basalt.max_context,
+            "max_model_len": cfg.basalt.max_context,
             "image_input": cfg.basalt.vision != "off",
+            "reasoning": {
+                "default_enabled": True,
+                "default_effort": str(cfg.basalt.effort),
+                "supported_efforts": ["max", "high", "low", "none"],
+            },
         }
         return {"object": "list", "data": [entry], "models": [entry]}
 

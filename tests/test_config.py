@@ -174,6 +174,31 @@ class ConfigAndUnitTests(unittest.TestCase):
         strict = json.loads(proxy.rewrite_request(json.dumps({"model": "other", "messages": []}).encode(), cfg))
         self.assertEqual(strict["model"], "other")
 
+        # Official DeepSeek compatibility aliases across all 3 APIs (minimal->low, medium/xhigh->high, ultra->max)
+        cfg.proxy.strict_model = False
+        cfg.basalt.effort = "50"
+        c_med = json.loads(proxy.rewrite_request(
+            json.dumps({"model": "x", "reasoning_effort": "medium", "chat_template_kwargs": {"reasoning_effort": "minimal"}, "messages": []}).encode(),
+            cfg, "/v1/chat/completions",
+        ))
+        self.assertEqual(c_med["reasoning_effort"], "high")
+        self.assertEqual(c_med["chat_template_kwargs"]["reasoning_effort"], "low")
+        r_med = json.loads(proxy.rewrite_request(
+            json.dumps({"model": "gpt-5", "reasoning": {"effort": "medium"}, "input": "hi"}).encode(),
+            cfg, "/v1/responses",
+        ))
+        self.assertEqual(r_med["reasoning"]["effort"], "high")
+        r_xhi = json.loads(proxy.rewrite_request(
+            json.dumps({"model": "gpt-5", "reasoning": {"effort": "xhigh"}, "input": "hi"}).encode(),
+            cfg, "/v1/responses",
+        ))
+        self.assertEqual(r_xhi["reasoning"]["effort"], "high")
+        m_ult = json.loads(proxy.rewrite_request(
+            json.dumps({"model": "claude", "output_config": {"effort": "ultra"}, "messages": []}).encode(),
+            cfg, "/v1/messages",
+        ))
+        self.assertEqual(m_ult["output_config"]["effort"], "max")
+
         self.assertEqual(parse_ask_args(["--max", "--image", "a.png", "hi"]), ("max", ["a.png"], "hi"))
         self.assertEqual(parse_ask_args(["--effort", "75", "hello", "world"]), ("75", [], "hello world"))
 
