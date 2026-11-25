@@ -220,7 +220,7 @@ class BasaltConfig:
     answer_room: str = "auto"
     uncensor: bool = True
     uncensor_scale: float = 1.0
-    effort: str = "50"
+    effort: str = "high"
     workers: int = 64
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
 

@@ -162,11 +162,18 @@ class ConfigAndUnitTests(unittest.TestCase):
 
     def test_rewrite_request_and_parse_ask(self) -> None:
         cfg = config.Config()
-        cfg.basalt.effort = "high"
+        self.assertEqual(cfg.basalt.effort, "high")
+        # Default "high" matches Basalt/DeepSeek native default (omits redundant injection)
+        chat_def = json.loads(proxy.rewrite_request(json.dumps({"model": "claude-haiku-4-5", "messages": []}).encode(), cfg))
+        self.assertEqual(chat_def["model"], config.DEFAULT_MODEL_ALIAS)
+        self.assertNotIn("reasoning_effort", chat_def)
+
+        # Non-default configured effort ("low", "50", "max") injects into OpenAI chat & responses
+        cfg.basalt.effort = "low"
         chat = json.loads(proxy.rewrite_request(json.dumps({"model": "claude-haiku-4-5", "messages": []}).encode(), cfg))
-        self.assertEqual((chat["model"], chat["reasoning_effort"]), (config.DEFAULT_MODEL_ALIAS, "high"))
+        self.assertEqual((chat["model"], chat["reasoning_effort"]), (config.DEFAULT_MODEL_ALIAS, "low"))
         resp = json.loads(proxy.rewrite_request(json.dumps({"model": "gpt-5", "input": "hi"}).encode(), cfg, "/v1/responses"))
-        self.assertEqual((resp["model"], resp["reasoning"]), (config.DEFAULT_MODEL_ALIAS, {"effort": "high"}))
+        self.assertEqual((resp["model"], resp["reasoning"]), (config.DEFAULT_MODEL_ALIAS, {"effort": "low"}))
         self.assertNotIn("reasoning_effort", resp)
         anth = json.loads(proxy.rewrite_request(json.dumps({"model": "claude-sonnet-4-5", "messages": []}).encode(), cfg, "/v1/messages"))
         self.assertEqual(anth["model"], config.DEFAULT_MODEL_ALIAS)
@@ -177,7 +184,7 @@ class ConfigAndUnitTests(unittest.TestCase):
 
         # Official DeepSeek compatibility aliases across all 3 APIs (minimal->low, medium/xhigh->high, ultra->max)
         cfg.proxy.strict_model = False
-        cfg.basalt.effort = "50"
+        cfg.basalt.effort = "high"
         c_med = json.loads(proxy.rewrite_request(
             json.dumps({"model": "x", "reasoning_effort": "medium", "chat_template_kwargs": {"reasoning_effort": "minimal"}, "messages": []}).encode(),
             cfg, "/v1/chat/completions",
@@ -498,7 +505,7 @@ class ConfigAndUnitTests(unittest.TestCase):
         self.assertIn("supportsDeveloperRole: false", dsh_b["snippet"])
         self.assertIn("maxTokensField: max_tokens", dsh_b["snippet"])
         self.assertIn("off: none", dsh_b["snippet"])
-        self.assertIn("reasoning: low", dsh_b["snippet"])
+        self.assertIn("reasoning: high", dsh_b["snippet"])
         # Regression check: Basalt DeepSeek-V4.1 rejects 'medium'
         self.assertNotIn("medium", dsh_b["snippet"])
         self.assertIn("input: [text, image]", dsh_b["snippet"])

@@ -119,8 +119,10 @@ def rewrite_request(body: bytes, cfg: Config, path: str = "/v1/chat/completions"
                 req["output_config"] = dict(oc, effort=norm)
                 changed = True
 
-    effort = str(cfg.basalt.effort)
-    if effort != "50":
+    # Basalt DeepSeek-V4.1 & official DeepSeek API both default to "high" (75);
+    # only inject when the user explicitly configured a non-default effort (e.g. "low", "50", "max").
+    effort = str(cfg.basalt.effort).strip().lower()
+    if effort != "high":
         if path == "/v1/chat/completions" and req.get("reasoning_effort") is None:
             req["reasoning_effort"] = effort
             changed = True

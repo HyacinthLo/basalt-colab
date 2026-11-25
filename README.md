@@ -51,7 +51,7 @@ Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
   Web UI     http://127.0.0.1:18080/
   Base URL   http://127.0.0.1:18080/v1
   API key    sk-ds41-...
-  Model      DeepSeek-V4.1-Flash-1017-UD-IQ1_M (effort 50, uncensored)
+  Model      DeepSeek-V4.1-Flash-1017-UD-IQ1_M (effort high, uncensored)
   Engine     UD-IQ1_M · 262K×2 FP8 KV · vision dynamic · route balanced · ~160 tok/s
 
   Try it     basalt-colab ask "Hello!"
@@ -96,7 +96,7 @@ Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
 | `basalt-colab connect [CLIENT] [opts]` | Pure config generator for **`dsh`** (DeepSeek Harness), **`claude`**, **`codex`**, **`opencode`**, **`openai`** (`--raw`, `--json`, `--sh`, `--powershell`, `--write`) — synced to the live running model! |
 | `basalt-colab env [--sh\|--powershell\|--json]` | Print live-synced `OPENAI_*`, `ANTHROPIC_*`, and `BASALT_API_KEY` exports |
 | `basalt-colab ask [opts] TEXT` | One-shot stream (`--effort`, `--max`, `--no-think`, `--hide-think`, `--max-tokens`, `--system`, `--image`, or piped `stdin`) |
-| `basalt-colab config [show\|path\|wizard\|get\|set\|profile]` | Inspect or update `config.toml` (`config set effort high`, `config profile solo-fast` — hot-reloads live!) |
+| `basalt-colab config [show\|path\|wizard\|get\|set\|profile]` | Inspect or update `config.toml` (`config set effort low`, `config profile solo-fast` — hot-reloads live!) |
 | `basalt-colab status` / `watch` | Snapshot or live terminal bar (`tok/s`, VRAM hit %, PCIe %, idle countdown, CU cost) |
 | `basalt-colab logs [-f\|--follow] [--local\|--vm]` | Local proxy log (`-f` live tail) + VM boot timeline + Basalt server & engine logs |
 | `basalt-colab doctor` / `setup` | Environment diagnostics and one-time Colab OAuth + key setup |
@@ -148,7 +148,7 @@ conv_cache_mib = 32768   # 32 GiB disk conversation cache
 resident_budget_gib = 0  # 0 = auto-planned per storage mode (55 / ~87 / ~130 GiB)
 uncensor = true          # 43 KB mrfakename rank-2 stochastic-rounding abliteration (0% decode slowdown)
 uncensor_scale = 1.0     # strength multiplier (0.0=off, 1.0=default KL 0.067, 1.15-1.25=stronger)
-effort = "50"            # hot-reloadable live (1-100, low, high, max)
+effort = "high"          # hot-reloadable live (low=50, high=75 default, max=100, or 1-100)
 
 [basalt.sampling]
 # temperature = 1.0

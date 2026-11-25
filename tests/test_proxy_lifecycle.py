@@ -365,7 +365,7 @@ class ProxyLifecycleTests(unittest.TestCase):
 
         # Online Control Console config editor: GET -> POST hot change -> POST cold change
         cfg_get = json.loads(c.req(method="GET", path="/_control/config").raw)
-        new_toml = cfg_get["toml"].replace('effort = "50"', 'effort = "max"')
+        new_toml = cfg_get["toml"].replace('effort = "high"', 'effort = "max"')
         cfg_post = json.loads(c.req(path="/_control/config", body={"toml": new_toml}).raw)
         self.assertEqual((cfg_post["applied"]["effort"], cfg_post["restart_required"]), ("max", False))
         self.assertEqual(json.loads(c.req(body={"model": MODEL_ID, "messages": [{"role": "user", "content": "hi"}]}).raw)["effort"], "max")
@@ -389,7 +389,7 @@ class ProxyLifecycleTests(unittest.TestCase):
             # Consume blank separator line, then trigger live reload and assert immediate push
             sse_r.readline()
             t_push = time.time()
-            r_set = c.cli("config", "set", "effort", "high")
+            r_set = c.cli("config", "set", "effort", "low")
             self.assertEqual(r_set.returncode, 0, r_set.stdout + r_set.stderr)
             self.assertIn("Applied live", r_set.stdout)
             pushed_effort = None
@@ -397,16 +397,16 @@ class ProxyLifecycleTests(unittest.TestCase):
                 ln = sse_r.readline().decode("utf-8", "replace").strip()
                 if ln.startswith("data: "):
                     ev = json.loads(ln[6:])
-                    if ev.get("effort") == "high":
+                    if ev.get("effort") == "low":
                         pushed_effort = ev["effort"]
                         break
-            self.assertEqual(pushed_effort, "high")
+            self.assertEqual(pushed_effort, "low")
         finally:
             sse_conn.close()
 
         # CLI config get / profile
-        self.assertIn("basalt.effort = high", c.cli("config", "get", "effort").stdout)
-        self.assertEqual(json.loads(c.req(body={"model": MODEL_ID, "messages": [{"role": "user", "content": "hi"}]}).raw)["effort"], "high")
+        self.assertIn("basalt.effort = low", c.cli("config", "get", "effort").stdout)
+        self.assertEqual(json.loads(c.req(body={"model": MODEL_ID, "messages": [{"role": "user", "content": "hi"}]}).raw)["effort"], "low")
         self.assertEqual(c.cli("config", "profile", "solo-fast").returncode, 0)
         self.assertIn("basalt.parallel = 1", c.cli("config", "get", "parallel").stdout)
 
