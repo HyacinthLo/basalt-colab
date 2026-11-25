@@ -193,9 +193,9 @@
       </h2>
       <div class="quick-bar">
         <span class="qgroup">Profile:
-          <button class="sm" data-prof="balanced" onclick="applyProfile('balanced')">Balanced</button>
-          <button class="sm" data-prof="solo-fast" onclick="applyProfile('solo-fast')">Solo-Fast</button>
-          <button class="sm" data-prof="exact" onclick="applyProfile('exact')">Exact</button>
+          <button class="sm" data-prof="exact" onclick="applyProfile('exact')" title="2 slots · lossless exact routing (default)">Exact</button>
+          <button class="sm" data-prof="solo" onclick="applyProfile('solo')" title="1 slot · max VRAM experts · lossless exact routing">Solo</button>
+          <button class="sm" data-prof="balanced" onclick="applyProfile('balanced')" title="2 slots · opt-in lossy routing (route-prior 0.1 + tail-skip 5)">Balanced (lossy)</button>
         </span>
         <span class="qgroup">Quant:
           <select id="qQuant" onchange="setTomlField('quant', JSON.stringify(this.value))">
@@ -472,9 +472,9 @@ function setTomlField(key, rawVal) {
 
 let configMeta = {
   profiles: {
-    "balanced":  { parallel: 2, routing_mode: "balanced", vram_reserve_mib: 450 },
-    "solo-fast": { parallel: 1, routing_mode: "fast",     vram_reserve_mib: 400 },
-    "exact":     { parallel: 2, routing_mode: "exact",    vram_reserve_mib: 450 },
+    "exact":    { parallel: 2, routing_mode: "exact",    vram_reserve_mib: 450 },
+    "solo":     { parallel: 1, routing_mode: "exact",    vram_reserve_mib: 400 },
+    "balanced": { parallel: 2, routing_mode: "balanced", vram_reserve_mib: 450 },
   },
   quants: ["ud-iq1_m", "ud-iq2_xxs", "ud-q2_k_xl", "custom"],
 };

@@ -52,7 +52,7 @@ Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
   Base URL   http://127.0.0.1:18080/v1
   API key    sk-ds41-...
   Model      DeepSeek-V4.1-Flash-1017-UD-IQ1_M (effort high, uncensored)
-  Engine     UD-IQ1_M · 262K×2 FP8 KV · vision dynamic · route balanced · ~160 tok/s
+  Engine     UD-IQ1_M · 262K×2 FP8 KV · vision dynamic · route exact · ~160 tok/s
 
   Try it     basalt-colab ask "Hello!"
   Console    basalt-colab console
@@ -80,7 +80,7 @@ Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
 
 - **Control Console (`/_console`)**: Self-contained dark UI (zero CDN deps) featuring:
   - **One-Click Client Integration Tabs**: live-synced, copy-ready config snippets & shell env exports for **DeepSeek Harness (`dsh`)**, **Claude Code**, **Codex CLI**, **OpenCode**, and **Cursor / Cherry Studio / OpenAI** (`GET /_control/clients`).
-  - **Single-Source `config.toml` + Quick Bar**: Quick controls for `Profile` (`Balanced` / `Solo-Fast` / `Exact`), `Quant`, `Effort`, and `Idle` that edit `config.toml` directly (never clobbering custom fields), with **Save & Apply** and **Save & Restart G4** buttons.
+  - **Single-Source `config.toml` + Quick Bar**: Quick controls for `Profile` (`Exact` / `Solo` / `Balanced (lossy)`), `Quant`, `Effort`, and `Idle` that edit `config.toml` directly (never clobbering custom fields), with **Save & Apply** and **Save & Restart G4** buttons.
   - **Live Telemetry & Billing**: real-time Basalt `tok/s` + VRAM hit % + PCIe %, boot timeline, 14-day CU cost curve & session ledger (`usage.jsonl`), and local/VM log viewer.
 - **Basalt Native Web UI (`/`)**: Once G4 is ready, `/` proxies 100% natively to Basalt's built-in chat & diagnostics console without rewriting any asset paths.
 - Run `basalt-colab console` to open `/_console#key=...` auto-authenticated (the URL fragment is stored in `localStorage` and immediately stripped from the URL; never sent over HTTP).
@@ -89,14 +89,14 @@ Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
 
 | Command | Description |
 | --- | --- |
-| `basalt-colab up [opts]` | Start G4 (`-d`/`--no-watch`, `--quant`, `--profile balanced\|solo-fast\|exact`, `--routing-mode`, `--parallel`, `--uncensor-scale`, `--wait-gpu [MIN]` default 120m / `0`=unlimited, `--no-notify`, `--basalt-ref`) |
+| `basalt-colab up [opts]` | Start G4 (`-d`/`--no-watch`, `--quant`, `--profile exact\|solo\|balanced`, `--routing-mode`, `--parallel`, `--uncensor-scale`, `--wait-gpu [MIN]` default 120m / `0`=unlimited, `--no-notify`, `--basalt-ref`) |
 | `basalt-colab restart [opts]` | Stop current G4, reload saved `config.toml`, and boot fresh (keeps local proxy running) |
 | `basalt-colab down [--all]` | Stop G4, wipe VM secrets, record session in `usage.jsonl`, stop detached proxy |
 | `basalt-colab console [--no-open]` | Ensure local proxy is up (without waking G4) and open `/_console` |
 | `basalt-colab connect [CLIENT] [opts]` | Pure config generator for **`dsh`** (DeepSeek Harness), **`claude`**, **`codex`**, **`opencode`**, **`openai`** (`--raw`, `--json`, `--sh`, `--powershell`, `--write`) — synced to the live running model! |
 | `basalt-colab env [--sh\|--powershell\|--json]` | Print live-synced `OPENAI_*`, `ANTHROPIC_*`, and `BASALT_API_KEY` exports |
 | `basalt-colab ask [opts] TEXT` | One-shot stream (`--effort`, `--max`, `--no-think`, `--hide-think`, `--max-tokens`, `--system`, `--image`, or piped `stdin`) |
-| `basalt-colab config [show\|path\|wizard\|get\|set\|profile]` | Inspect or update `config.toml` (`config set effort low`, `config profile solo-fast` — hot-reloads live!) |
+| `basalt-colab config [show\|path\|wizard\|get\|set\|profile]` | Inspect or update `config.toml` (`config set effort low`, `config profile solo` — hot-reloads live!) |
 | `basalt-colab status` / `watch` | Snapshot or live terminal bar (`tok/s`, VRAM hit %, PCIe %, idle countdown, CU cost) |
 | `basalt-colab logs [-f\|--follow] [--local\|--vm]` | Local proxy log (`-f` live tail) + VM boot timeline + Basalt server & engine logs |
 | `basalt-colab doctor` / `setup` | Environment diagnostics and one-time Colab OAuth + key setup |
@@ -142,7 +142,7 @@ kv = "fp8"               # "fp8" or "fp16"
 vision = "dynamic"       # 0 MiB idle VRAM/RAM
 spec = 6                 # DSpark speculative window (0..8)
 draft_experts = 32       # 32, 64, 96, 128, or 0
-routing_mode = "balanced" # "balanced" (+20-37% speed), "fast", or "exact" (lossless)
+routing_mode = "exact"   # "exact" (default, lossless) or "balanced" (opt-in lossy: route-prior 0.1 + tail-skip 5)
 answer_room = "auto"     # "auto" reserves room for final answer so thinking never truncates it
 conv_cache_mib = 32768   # 32 GiB disk conversation cache
 resident_budget_gib = 0  # 0 = auto-planned per storage mode (55 / ~87 / ~130 GiB)

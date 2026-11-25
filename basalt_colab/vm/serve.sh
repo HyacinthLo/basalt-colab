@@ -16,7 +16,7 @@ export SPEC_MAX=${SPEC_MAX:-6}
 export DRAFT_EXPERTS=${DRAFT_EXPERTS:-32}
 export VRAM_RESERVE=${VRAM_RESERVE:-450}
 export RAM_BUDGET=${RAM_BUDGET:-55}
-export ROUTING_MODE=${ROUTING_MODE:-balanced}
+export ROUTING_MODE=${ROUTING_MODE:-exact}
 export POOL_WORKERS=${POOL_WORKERS:-0}
 export ENGRAM_CACHE_MIB=${ENGRAM_CACHE_MIB:-1024}
 export ANSWER_ROOM=${ANSWER_ROOM:-auto}
@@ -58,13 +58,10 @@ if int(os.environ["RAM_BUDGET"]) > 0:
     engine["resident-budget-gib"] = int(os.environ["RAM_BUDGET"])
 if int(os.environ["POOL_WORKERS"]) > 0:
     engine["pool-workers"] = int(os.environ["POOL_WORKERS"])
-rt = os.environ.get("ROUTING_MODE", "balanced").strip().lower()
+rt = os.environ.get("ROUTING_MODE", "exact").strip().lower()
 if rt == "balanced":
     engine["route-prior"] = 0.1
     engine["route-tail-skip"] = 5
-elif rt == "fast":
-    engine["route-prior"] = 0.1
-    engine["route-tail-skip"] = 3
 if int(os.environ["CONV_CACHE_MIB"]) > 0:
     engine["conversation-cache-disk-mib"] = int(os.environ["CONV_CACHE_MIB"])
     engine["conversation-cache-dir"] = os.environ["CONV_CACHE_DIR"]

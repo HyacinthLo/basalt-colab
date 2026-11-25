@@ -50,16 +50,15 @@ DEFAULT_QUANT = "ud-iq1_m"
 DEFAULT_MODEL_ALIAS = QUANT_DEFAULT_MODEL_ALIAS[DEFAULT_QUANT]
 VALID_QUANTS = ("ud-iq1_m", "ud-iq2_xxs", "ud-q2_k_xl", "custom")
 VALID_DRAFT_EXPERTS = (0, 32, 64, 96, 128)
-VALID_ROUTING_MODES = ("exact", "balanced", "fast")
+VALID_ROUTING_MODES = ("exact", "balanced")
 ROUTING_MODE_FLAGS: dict[str, dict[str, Any]] = {
     "exact": {},
     "balanced": {"route-prior": 0.1, "route-tail-skip": 5},
-    "fast": {"route-prior": 0.1, "route-tail-skip": 3},
 }
 PERFORMANCE_PROFILES: dict[str, dict[str, Any]] = {
-    "balanced": {"parallel": 2, "routing_mode": "balanced", "vram_reserve_mib": 450},
     "exact": {"parallel": 2, "routing_mode": "exact", "vram_reserve_mib": 450},
-    "solo-fast": {"parallel": 1, "routing_mode": "fast", "vram_reserve_mib": 400},
+    "solo": {"parallel": 1, "routing_mode": "exact", "vram_reserve_mib": 400},
+    "balanced": {"parallel": 2, "routing_mode": "balanced", "vram_reserve_mib": 450},
 }
 HOT_FIELDS = frozenset({
     "colab.idle_min",
@@ -82,17 +81,17 @@ def quant_value(text: str) -> str | None:
 
 
 def routing_mode_value(text: str) -> str | None:
-    """Normalizes routing optimization mode (exact, balanced, fast)."""
+    """Normalizes routing mode (exact [default, lossless] or balanced [opt-in lossy])."""
     t = str(text).strip().lower()
-    aliases = {"lossless": "exact", "off": "exact", "default": "balanced", "std": "balanced", "turbo": "fast"}
+    aliases = {"lossless": "exact", "off": "exact", "default": "exact", "std": "exact", "lossy": "balanced"}
     t = aliases.get(t, t)
     return t if t in VALID_ROUTING_MODES else None
 
 
 def profile_value(text: str) -> str | None:
-    """Normalizes performance profile preset names (balanced, exact, solo-fast)."""
+    """Normalizes performance profile preset names (exact, solo, balanced)."""
     t = str(text).strip().lower().replace("_", "-")
-    aliases = {"solo": "solo-fast", "fast-solo": "solo-fast", "fast": "solo-fast", "lossless": "exact"}
+    aliases = {"lossless": "exact", "default": "exact", "solo-fast": "solo", "fast-solo": "solo", "lossy": "balanced"}
     t = aliases.get(t, t)
     return t if t in PERFORMANCE_PROFILES else None
 
@@ -211,7 +210,7 @@ class BasaltConfig:
     vision: str = "dynamic"
     spec: int = 6
     draft_experts: int = 32
-    routing_mode: str = "balanced"
+    routing_mode: str = "exact"
     pool_workers: int = 0
     engram_cache_mib: int = 1024
     conv_cache_mib: int = 32768
@@ -256,7 +255,7 @@ class Config:
         return copy.deepcopy(self)
 
     def apply_profile(self, name: str) -> None:
-        """Applies a named performance profile (balanced, exact, solo-fast) in place."""
+        """Applies a named performance profile (exact, solo, balanced) in place."""
         p = profile_value(name)
         if p is None:
             raise ConfigError(f"unknown performance profile {name!r} (expected {tuple(PERFORMANCE_PROFILES)})")
@@ -266,7 +265,7 @@ class Config:
 
     def describe_engine(self) -> str:
         ref = f"ref={self.basalt.ref} · " if self.basalt.ref else ""
-        rt = f" · route {self.basalt.routing_mode}" if self.basalt.routing_mode != "balanced" else " · route balanced"
+        rt = " · route exact" if self.basalt.routing_mode == "exact" else f" · route {self.basalt.routing_mode} (lossy)"
         return (
             f"{ref}{self.basalt.quant.upper()} · {short_context(self.basalt.max_context)}×{self.basalt.parallel} "
             f"{self.basalt.kv.upper()} KV · vision {self.basalt.vision}{rt}"
@@ -816,7 +815,7 @@ class BootOverrides:
         if self.profile is not None:
             p = profile_value(self.profile)
             if not p:
-                raise ConfigError(f"invalid --profile {self.profile!r} (expected balanced, solo-fast, or exact)")
+                raise ConfigError(f"invalid --profile {self.profile!r} (expected exact, solo, or balanced)")
             want.apply_profile(p)
         if self.basalt_ref is not None:
             want.basalt.ref = self.basalt_ref.strip()
@@ -833,7 +832,7 @@ class BootOverrides:
         if self.routing_mode is not None:
             rt = routing_mode_value(self.routing_mode)
             if not rt:
-                raise ConfigError(f"invalid --routing-mode {self.routing_mode!r} (expected balanced, exact, or fast)")
+                raise ConfigError(f"invalid --routing-mode {self.routing_mode!r} (expected exact or balanced)")
             want.basalt.routing_mode = rt
         if self.parallel is not None:
             want.basalt.parallel = int(self.parallel)

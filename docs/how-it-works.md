@@ -21,7 +21,7 @@ Boot sequence (`~90–95s` with GitHub Actions prebuilt `sm_120` tarball):
 ## 2. Native Basalt v2 Configuration (`basalt_colab/vm/serve.sh`)
 
 - **`slot-full-context: true`**: Each slot receives the full `basalt.max_context` (up to `1,048,576` / 1M tokens) without `llama.cpp`-style `parallel × context` multiplication.
-- **Performance Profiles & Routing Modes**: Default `balanced` (`parallel=2`, `vram-reserve=450 MiB`, `--route-prior 0.1 --route-tail-skip 5`, KLD `+0.0005` within placement noise, +20–37% decode speed & longer speculative windows); optional `solo-fast` (`parallel=1`, `route-tail-skip=3`, `vram-reserve=400 MiB`) and `exact` (100% lossless routing).
+- **Performance Profiles & Routing Modes**: Default `exact` (`parallel=2`, `vram-reserve=450 MiB`, 100% lossless routing aligned with upstream Basalt); `solo` (`parallel=1`, `vram-reserve=400 MiB`, 100% lossless, maximizes VRAM resident experts for single-user workloads); optional opt-in lossy `balanced` (`--route-prior 0.1 --route-tail-skip 5`).
 - **Elastic FP8/FP16 KV**: Default `fp8` uses 920 B/token (`0.24 GiB` idle, `0.97 GiB` at 1M); `fp16` keeps unrounded KV (`3,200 B/token`).
 - **Dynamic Vision**: `vision = "dynamic"` consumes **0 MiB idle VRAM and 0 MiB idle RAM** (identical memory plan to `vision = "off"`).
 - **32 GiB Disk Conversation Cache**: `/content/conv_cache` snapshots evicted KV slots as `.bcs` files and restores them in `<1 ms` (99.8% hit verified across rotated multi-turn sessions).

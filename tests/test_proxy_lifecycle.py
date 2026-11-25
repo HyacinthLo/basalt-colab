@@ -407,7 +407,7 @@ class ProxyLifecycleTests(unittest.TestCase):
         # CLI config get / profile
         self.assertIn("basalt.effort = low", c.cli("config", "get", "effort").stdout)
         self.assertEqual(json.loads(c.req(body={"model": MODEL_ID, "messages": [{"role": "user", "content": "hi"}]}).raw)["effort"], "low")
-        self.assertEqual(c.cli("config", "profile", "solo-fast").returncode, 0)
+        self.assertEqual(c.cli("config", "profile", "solo").returncode, 0)
         self.assertIn("basalt.parallel = 1", c.cli("config", "get", "parallel").stdout)
 
         # /_control/clients returns live config bundles for all 5 clients including DeepSeek Harness
@@ -458,12 +458,12 @@ class ProxyLifecycleTests(unittest.TestCase):
             f.write(b"\x89PNG\r\n\x1a\nfake")
         self.assertEqual(c.cli("ask", "--max", "--image", img, "describe", input_text="one word").stdout.strip(), "ok")
 
-        # Restart G4 in-place via `restart -d --no-notify` -> applies solo-fast (parallel=1) AND syncs serve.lock!
+        # Restart G4 in-place via `restart -d --no-notify` -> applies solo (parallel=1, exact lossless) AND syncs serve.lock!
         r_rst = c.cli("restart", "-d", "--no-notify")
         self.assertEqual(r_rst.returncode, 0, r_rst.stdout + r_rst.stderr)
         boot_env2 = json.loads(read(c.res("boot_check.json")))["env"]
         self.assertEqual(boot_env2["PARALLEL"], "1")
-        self.assertEqual(boot_env2["ROUTING_MODE"], "fast")
+        self.assertEqual(boot_env2["ROUTING_MODE"], "exact")
         # Regression check: subsequent `up -d` recognizes updated serve.lock cold_signature
         r_up2 = c.cli("up", "-d", "--no-notify")
         self.assertEqual(r_up2.returncode, 0, r_up2.stdout + r_up2.stderr)

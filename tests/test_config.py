@@ -243,7 +243,7 @@ class ConfigAndUnitTests(unittest.TestCase):
             os.environ,
             PORT="18081", CTX="1048576", PARALLEL="2", KV_TYPE="fp8", VISION_MODE="dynamic",
             SPEC_MAX="6", DRAFT_EXPERTS="32", VRAM_RESERVE="450", RAM_BUDGET="55", ANSWER_ROOM="0",
-            ROUTING_MODE="balanced", POOL_WORKERS="0", ENGRAM_CACHE_MIB="1024",
+            ROUTING_MODE="exact", POOL_WORKERS="0", ENGRAM_CACHE_MIB="1024",
             MODEL_ALIAS=config.DEFAULT_MODEL_ALIAS, CONV_CACHE_MIB="32768", CONV_CACHE_DIR="/content/conv_cache",
             MODEL_PATH="/mnt/ram/model.basalt", ENGRAM_PATH="/mnt/ram/engram.bin",
             BASALT_SAMPLING_JSON='{"temperature":0.7,"top-p":0.95}',
@@ -258,22 +258,24 @@ class ConfigAndUnitTests(unittest.TestCase):
         self.assertEqual((m0["answer-room"], m0["idle-unload"]), (0, 0))
         self.assertEqual(doc["engine"]["conversation-cache-disk-mib"], 32768)
         self.assertEqual(doc["engine"]["vram-reserve-mib"], 450)
-        self.assertEqual((doc["engine"]["route-prior"], doc["engine"]["route-tail-skip"]), (0.1, 5))
+        self.assertNotIn("route-prior", doc["engine"])
+        self.assertNotIn("route-tail-skip", doc["engine"])
         self.assertNotIn("pool-workers", doc["engine"])
 
-        # Exact routing omits lossy flags; fast routing sets route-tail-skip=3 and explicit pool-workers
-        env_exact = dict(env, ROUTING_MODE="exact", POOL_WORKERS="12")
-        self.assertEqual(subprocess.run([sys.executable, "-c", m.group(1), str(cfg_path)], env=env_exact).returncode, 0)
-        doc_ex = json.loads(cfg_path.read_text(encoding="utf-8"))
-        self.assertNotIn("route-prior", doc_ex["engine"])
-        self.assertNotIn("route-tail-skip", doc_ex["engine"])
-        self.assertEqual(doc_ex["engine"]["pool-workers"], 12)
+        # Opt-in balanced routing sets route-prior=0.1, route-tail-skip=5, and explicit pool-workers
+        env_bal = dict(env, ROUTING_MODE="balanced", POOL_WORKERS="12")
+        self.assertEqual(subprocess.run([sys.executable, "-c", m.group(1), str(cfg_path)], env=env_bal).returncode, 0)
+        doc_bal = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual((doc_bal["engine"]["route-prior"], doc_bal["engine"]["route-tail-skip"]), (0.1, 5))
+        self.assertEqual(doc_bal["engine"]["pool-workers"], 12)
 
-        env_fast = dict(env, ROUTING_MODE="fast", PARALLEL="1", VRAM_RESERVE="400")
-        self.assertEqual(subprocess.run([sys.executable, "-c", m.group(1), str(cfg_path)], env=env_fast).returncode, 0)
-        doc_f = json.loads(cfg_path.read_text(encoding="utf-8"))
-        self.assertEqual((doc_f["models"][0]["parallel"], doc_f["engine"]["vram-reserve-mib"], doc_f["engine"]["route-tail-skip"]),
-                         (1, 400, 3))
+        # Solo lossless keeps parallel=1, vram-reserve=400, and zero lossy routing flags
+        env_solo = dict(env, ROUTING_MODE="exact", PARALLEL="1", VRAM_RESERVE="400")
+        self.assertEqual(subprocess.run([sys.executable, "-c", m.group(1), str(cfg_path)], env=env_solo).returncode, 0)
+        doc_s = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual((doc_s["models"][0]["parallel"], doc_s["engine"]["vram-reserve-mib"]), (1, 400))
+        self.assertNotIn("route-prior", doc_s["engine"])
+        self.assertNotIn("route-tail-skip", doc_s["engine"])
 
         # Synthetic BASALTMF v2 pack + punch_sections + abliterate_basalt
         sys.path.insert(0, str(self.p.vm_dir))
@@ -369,12 +371,19 @@ class ConfigAndUnitTests(unittest.TestCase):
     def test_profiles_and_pfetch_keepalive(self) -> None:
         cfg = config.Config()
         self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib, cfg.basalt.engram_cache_mib),
-                         (2, "balanced", 450, 1024))
+                         (2, "exact", 450, 1024))
+        self.assertIn("route exact", cfg.describe_engine())
         partial = config.parse_toml("[basalt]\nquant = 'ud-iq2_xxs'\n")
         self.assertEqual((partial.basalt.quant, partial.basalt.routing_mode, partial.basalt.vram_reserve_mib, partial.basalt.pool_workers),
-                         ("ud-iq2_xxs", "balanced", 450, 0))
+                         ("ud-iq2_xxs", "exact", 450, 0))
+        cfg.apply_profile("solo")
+        self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib), (1, "exact", 400))
+        # Legacy alias solo-fast maps to lossless solo
+        cfg.apply_profile("balanced")
+        self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib), (2, "balanced", 450))
+        self.assertIn("route balanced (lossy)", cfg.describe_engine())
         cfg.apply_profile("solo-fast")
-        self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib), (1, "fast", 400))
+        self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib), (1, "exact", 400))
         cfg.apply_profile("exact")
         self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib), (2, "exact", 450))
         with self.assertRaises(config.ConfigError):
@@ -628,13 +637,13 @@ class ConfigAndUnitTests(unittest.TestCase):
         ov = config.BootOverrides.from_dict({
             "wait_gpu": True,
             "wait_gpu_min": 45,
-            "profile": "solo-fast",
+            "profile": "solo",
             "quant": "ud-iq2_xxs",
             "uncensor_scale": 1.2,
             "basalt_ref": "main",
         })
         applied = ov.apply_to(cfg, manifest=m)
-        self.assertEqual((applied.basalt.parallel, applied.basalt.routing_mode, applied.basalt.vram_reserve_mib), (1, "fast", 400))
+        self.assertEqual((applied.basalt.parallel, applied.basalt.routing_mode, applied.basalt.vram_reserve_mib), (1, "exact", 400))
         self.assertEqual((applied.basalt.quant, applied.basalt.uncensor_scale, applied.basalt.ref), ("ud-iq2_xxs", 1.2, "main"))
         self.assertEqual(ov.resolve_wait_gpu(cfg), (True, 45.0))
         self.assertEqual(ov.to_dict()["quant"], "ud-iq2_xxs")

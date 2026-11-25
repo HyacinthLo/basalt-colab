@@ -97,8 +97,8 @@ usage: basalt-colab COMMAND [options]
      -d, --detach, --no-watch          return immediately after G4 is ready (skip watch view)
      --quant Q                         ud-iq1_m (default, 100% RAM) | ud-iq2_xxs (-13% KLD) | ud-q2_k_xl | custom
      --pack-url URL                    override .basalt URL (required for ud-q2_k_xl / custom)
-     --profile P                       balanced (default: 2 slots, route balanced) | solo-fast (1 slot, route fast) | exact
-     --routing-mode M                  balanced (default, +20-37% speed) | exact (lossless) | fast
+     --profile P                       exact (default: 2 slots, lossless) | solo (1 slot, lossless) | balanced (opt-in lossy)
+     --routing-mode M                  exact (default, lossless) | balanced (opt-in lossy: route-prior 0.1 + tail-skip 5)
      --parallel N                      concurrent slots (1-4; default 2)
      --uncensor-scale S                refusal-removal multiplier (0.0=off, 1.0=default, 1.15-1.25=stronger)
      --wait-gpu [MIN]                  retry G4 allocation (default 120m; 0 = unlimited; fail-fast on auth/quota errors)
@@ -467,7 +467,7 @@ def interactive_config_wizard(paths: Paths, cfg: Config) -> Config | None:
         new.basalt.pack_url = ""
     new.basalt.max_context = pick("Context/slot", "32K..1M (slot-full-context)", short_context(cfg.basalt.max_context), context_value)
     new.basalt.parallel = int(pick("Parallel", "1-4 concurrent slots", cfg.basalt.parallel, lambda t: int(t) if t.isdigit() and 1 <= int(t) <= 4 else None))
-    new.basalt.routing_mode = pick("Routing", "balanced | fast | exact", cfg.basalt.routing_mode, routing_mode_value)
+    new.basalt.routing_mode = pick("Routing", "exact (lossless) | balanced (lossy)", cfg.basalt.routing_mode, routing_mode_value)
     new.basalt.kv = pick("KV precision", "fp8 (0.97G@1M) or fp16", cfg.basalt.kv, lambda t: t.lower() if t.lower() in ("fp8", "fp16") else None)
     new.basalt.answer_room = pick("Answer room", "auto (anti-trunc) or 0..65536", cfg.basalt.answer_room, answer_room_value)
     new.basalt.effort = pick("Effort", "1-100, low, high, max (live)", cfg.basalt.effort, effort_value)
@@ -705,7 +705,7 @@ def cmd_config(paths: Paths, cfg: Config, args: list[str]) -> None:
         return
     if sub == "profile":
         if len(args) < 2:
-            sys.exit(f"usage: {cli_name()} config profile <balanced|solo-fast|exact>")
+            sys.exit(f"usage: {cli_name()} config profile <exact|solo|balanced>")
         disk_cfg = load_config(paths, apply_env=False)
         try:
             disk_cfg.apply_profile(args[1])
@@ -1130,8 +1130,8 @@ def _add_up_flags(p: argparse.ArgumentParser) -> None:
     p.add_argument("-d", "--detach", "--no-watch", dest="detach", action="store_true", help="return immediately after G4 is ready")
     p.add_argument("--quant", help="ud-iq1_m | ud-iq2_xxs | ud-q2_k_xl | custom")
     p.add_argument("--pack-url", dest="pack_url", help="override .basalt URL (required for ud-q2_k_xl / custom)")
-    p.add_argument("--profile", help="balanced | solo-fast | exact")
-    p.add_argument("--routing-mode", dest="routing_mode", help="balanced | exact | fast")
+    p.add_argument("--profile", help="exact (default) | solo (1 slot, lossless) | balanced (opt-in lossy)")
+    p.add_argument("--routing-mode", dest="routing_mode", help="exact (default, lossless) | balanced (opt-in lossy)")
     p.add_argument("--parallel", type=int, help="concurrent slots (1-4)")
     p.add_argument("--uncensor-scale", dest="uncensor_scale", type=float, help="refusal-removal multiplier (0.0-2.0)")
     p.add_argument(
@@ -1182,8 +1182,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_cfg_set = cfg_sub.add_parser("set", help="update a config value and hot-reload proxy")
     p_cfg_set.add_argument("key", help="config key")
     p_cfg_set.add_argument("value", nargs="+", help="new value")
-    p_cfg_prof = cfg_sub.add_parser("profile", help="apply balanced | solo-fast | exact preset")
-    p_cfg_prof.add_argument("name", help="balanced | solo-fast | exact")
+    p_cfg_prof = cfg_sub.add_parser("profile", help="apply exact | solo | balanced preset")
+    p_cfg_prof.add_argument("name", help="exact | solo | balanced")
 
     p_conn = sub.add_parser("connect", help="generate config for dsh | claude | codex | opencode | openai")
     p_conn.add_argument("target", nargs="?", default=None, help="dsh | claude | codex | opencode | openai")
