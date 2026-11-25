@@ -62,11 +62,13 @@ if [ -n "$PREBUILT_URL" ] && [ -z "${BASALT_REF:-}" ]; then
       mv -f "$ARCHIVE" "$S/bin/basalt"
     fi
     rm -f "$ARCHIVE"
-    if [ -f "$S/bin/basalt" ] && chmod +x "$S/bin/basalt" && "$S/bin/basalt" --help >/dev/null 2>&1; then
+    if [ -f "$S/bin/basalt" ] && chmod +x "$S/bin/basalt" \
+      && "$S/bin/basalt" --help >/dev/null 2>&1 \
+      && grep -a -q "BASALT_ENGRAM_TAIL_FILE" "$S/bin/basalt"; then
       st "basalt prebuilt binary ready"
     else
       rm -f "$S/bin/basalt"
-      st "basalt prebuilt binary unusable, falling back to source build"
+      st "basalt prebuilt binary unusable or missing split-engram patch, falling back to source build"
     fi
   else
     rm -f "$ARCHIVE"
