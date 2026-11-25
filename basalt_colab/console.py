@@ -130,6 +130,9 @@ CONSOLE_HTML = r"""<!doctype html>
       <h2>
         <span>config.toml (Live Hot-Reload)</span>
         <span class="row">
+          <button onclick="applyPreset('balanced')" title="2 slots · route balanced · 450 MiB reserve">Balanced (2-slot)</button>
+          <button onclick="applyPreset('solo-fast')" title="1 slot · route fast · 400 MiB reserve">Solo-Fast (1-slot)</button>
+          <button onclick="applyPreset('exact')" title="2 slots · lossless exact routing">Exact</button>
           <button onclick="loadConfig()">Refresh</button>
           <button class="primary" onclick="saveConfig()">Save &amp; Apply</button>
         </span>
@@ -308,6 +311,27 @@ async function loadConfig() {
   document.getElementById("cfgText").value = d.toml || "";
   document.getElementById("cfgToast").textContent = d.path || "";
   document.getElementById("cfgToast").className = "toast dim";
+}
+
+function _setTomlKey(text, key, val) {
+  const re = new RegExp("^" + key + "\\s*=.*$", "m");
+  if (re.test(text)) return text.replace(re, key + " = " + val);
+  return text.replace(/(\[basalt\]\r?\n)/, "$1" + key + " = " + val + "\n");
+}
+
+async function applyPreset(name) {
+  const presets = {
+    "balanced":  { parallel: 2, routing_mode: '"balanced"', vram_reserve_mib: 450 },
+    "solo-fast": { parallel: 1, routing_mode: '"fast"',     vram_reserve_mib: 400 },
+    "exact":     { parallel: 2, routing_mode: '"exact"',    vram_reserve_mib: 450 },
+  };
+  const p = presets[name];
+  if (!p) return;
+  const ta = document.getElementById("cfgText");
+  let txt = ta.value || "";
+  for (const [k, v] of Object.entries(p)) txt = _setTomlKey(txt, k, v);
+  ta.value = txt;
+  await saveConfig();
 }
 
 async function saveConfig() {

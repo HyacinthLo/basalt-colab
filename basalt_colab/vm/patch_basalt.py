@@ -403,6 +403,223 @@ def main():
         ],
     )
 
+    # 6. PleReader RAM head zero-copy mmap() + fast-path return (BASALT_COLAB_ENGRAM_MMAP):
+    #    When Engram head lives on /mnt/ram/ (or BASALT_ENGRAM_MMAP=1), mmap [0, head_bytes) read-only
+    #    with MAP_SHARED + MADV_RANDOM so ~76-100% of lookups resolve via ~80ns memcpy (0 syscalls,
+    #    0 thread-pool wakeups), and RowCache naturally dedicates 100% of its slots to the SSD tail.
+    patch_file(
+        src,
+        'src/ngram/ple_reader.cpp',
+        'BASALT_COLAB_ENGRAM_MMAP',
+        [
+            (
+                '#include <cstring>',
+                '#include <cstdlib>\n#include <cstring>\n#ifdef __linux__\n#include <fcntl.h>\n#include <sys/mman.h>\n#include <sys/stat.h>\n#include <unistd.h>\n#endif',
+            ),
+            (
+                '''struct PleReader::Impl {
+    DirectFile file;''',
+                '''struct PleReader::Impl {
+    DirectFile file;
+    const uint8_t* mmap_head = nullptr;   // BASALT_COLAB_ENGRAM_MMAP: zero-copy tmpfs Engram head
+    uint64_t mmap_head_bytes = 0;''',
+            ),
+            (
+                '''    if (!impl_->file.open(path, err, 0, /*mapped_elsewhere=*/true)) return false;
+    impl_->row_bytes = row_bytes;''',
+                '''    if (!impl_->file.open(path, err, 0, /*mapped_elsewhere=*/true)) return false;
+#ifdef __linux__
+    {
+        const char* mm_env = std::getenv("BASALT_ENGRAM_MMAP");
+        const bool want_mm = (table_offset == 0) &&
+            ((mm_env && std::strcmp(mm_env, "1") == 0) ||
+             ((!mm_env || std::strcmp(mm_env, "0") != 0) && path.rfind("/mnt/ram/", 0) == 0));
+        if (want_mm) {
+            const int mfd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+            struct stat mst{};
+            if (mfd >= 0 && ::fstat(mfd, &mst) == 0 && mst.st_size > 0) {
+                void* mp = ::mmap(nullptr, (size_t) mst.st_size, PROT_READ, MAP_SHARED, mfd, 0);
+                if (mp != MAP_FAILED) {
+                    impl_->mmap_head = (const uint8_t*) mp;
+                    impl_->mmap_head_bytes = (uint64_t) mst.st_size;
+                    (void) ::madvise(mp, (size_t) mst.st_size, MADV_RANDOM);
+                }
+            }
+            if (mfd >= 0) ::close(mfd);
+        }
+    }
+#endif
+    impl_->row_bytes = row_bytes;''',
+            ),
+            (
+                '''    m.file.close();
+    DirectFile::free_aligned(m.slab);''',
+                '''#ifdef __linux__
+    if (m.mmap_head != nullptr) {
+        (void) ::munmap((void*) m.mmap_head, (size_t) m.mmap_head_bytes);
+        m.mmap_head = nullptr;
+        m.mmap_head_bytes = 0;
+    }
+#endif
+    m.file.close();
+    DirectFile::free_aligned(m.slab);''',
+            ),
+            (
+                '''        if (const uint8_t* hit = m.cache.find(rows[i])) {
+            std::memcpy(dst, hit, rb);
+            ++m.stats.cache_hits;
+            continue;
+        }
+        const uint64_t at = m.table_offset + (uint64_t) rows[i] * rb;''',
+                '''        const uint64_t at = m.table_offset + (uint64_t) rows[i] * rb;
+        if (m.mmap_head != nullptr && at + rb <= m.mmap_head_bytes) {
+            std::memcpy(dst, m.mmap_head + at, rb);
+            ++m.stats.cache_hits;
+            continue;
+        }
+        if (const uint8_t* hit = m.cache.find(rows[i])) {
+            std::memcpy(dst, hit, rb);
+            ++m.stats.cache_hits;
+            continue;
+        }''',
+            ),
+            (
+                '''    // the ticket is known before its reads are planned; it completes once every page it counts is read
+    m.tickets[id].pending = 1;
+    lk.unlock();''',
+                '''    if (miss.empty()) {
+        m.tickets[id].pending = 0;
+        lk.unlock();
+        if (rearm) m.cv_work.notify_one();
+        return Ticket{id};
+    }
+    // the ticket is known before its reads are planned; it completes once every page it counts is read
+    m.tickets[id].pending = 1;
+    lk.unlock();''',
+            ),
+        ],
+    )
+
+    # 7. Configurable Engram RowCache size via BASALT_ENGRAM_CACHE_MIB (BASALT_COLAB_ENGRAM_TAIL_CACHE):
+    #    Combined with Patch #6, 100% of RowCache shields the SSD tail (e.g. 1024 MiB = ~7.4M rows, 113x stock).
+    patch_file(
+        src,
+        'src/models/deepseek41/model.cpp',
+        'BASALT_COLAB_ENGRAM_TAIL_CACHE',
+        [
+            (
+                '#include <cstdio>',
+                '#include <cstdio>\n#include <cstdlib>',
+            ),
+            (
+                '''        const uint64_t engram_off = (engram_env && *engram_env) ? 0ull : e.file_offset;
+        if (!engram_->open(engram_path, engram_off, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;''',
+                '''        const uint64_t engram_off = (engram_env && *engram_env) ? 0ull : e.file_offset;
+        // BASALT_COLAB_ENGRAM_TAIL_CACHE: size RowCache in MiB (0 disables; hybrid tail default 1024 MiB)
+        uint64_t cache_rows = 1ull << 16;
+        if (const char* cm = std::getenv("BASALT_ENGRAM_CACHE_MIB"); cm && *cm) {
+            char* endp = nullptr;
+            const long long mib = std::strtoll(cm, &endp, 10);
+            if (endp != cm && mib >= 0) {
+                if (mib == 0) {
+                    cache_rows = 0;
+                } else {
+                    const uint64_t clamped_mib = std::min<uint64_t>((uint64_t) mib, 4096ull);
+                    const uint64_t rb = std::max<uint32_t>(e.row_bytes, 1u);
+                    cache_rows = std::min<uint64_t>(e.rows, (clamped_mib << 20) / rb) & ~7ull;
+                }
+            }
+        }
+        if (!engram_->open(engram_path, engram_off, e.rows, 64, cache_rows, err, e.row_bytes)) return false;''',
+            ),
+        ],
+    )
+
+    # 8. RAM expert tier MADV_HUGEPAGE + parallel cudaHostRegister (BASALT_COLAB_RAM_HUGEPAGE_PIN):
+    #    Reduces 78 GiB PTE/IOMMU TLB entries by 512x and parallelizes layer pinning during /load.
+    patch_file(
+        src,
+        'src/core/ram_load.cpp',
+        'BASALT_COLAB_RAM_HUGEPAGE_PIN',
+        [
+            (
+                '#include <cstring>',
+                '#include <cstring>\n#ifdef __linux__\n#include <sys/mman.h>\n#endif',
+            ),
+            (
+                '''uint8_t* alloc_ram(uint64_t bytes) {
+    return (uint8_t*) platform::alloc_aligned((size_t) ram_padded(bytes), 2ull << 20);
+}''',
+                '''uint8_t* alloc_ram(uint64_t bytes) {
+    const uint64_t padded = ram_padded(bytes);
+    uint8_t* p = (uint8_t*) platform::alloc_aligned((size_t) padded, 2ull << 20);
+#ifdef __linux__
+    // BASALT_COLAB_RAM_HUGEPAGE_PIN: advise 2 MiB transparent hugepages to cut CPU/IOMMU TLB misses 512x
+    if (p && padded >= (2ull << 20)) (void) ::madvise(p, (size_t) padded, MADV_HUGEPAGE);
+#endif
+    return p;
+}''',
+            ),
+            (
+                '''    std::vector<RamPin> pins(spans.size());
+    uint64_t pinned = 0;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        if (spans[i] == nullptr) continue;
+        const uint64_t padded = ram_padded(bytes[i]);
+        const bool room = !limited || (pinned <= budget && padded <= budget - pinned);
+        if constexpr (platform::kBoundHostRegistration) {
+            // DXGI usage can lag registration. Also charge each span against the initial allowance.
+            const uint64_t remaining = limited ? (budget > pinned ? budget - pinned : 0) : ~uint64_t(0);
+            pins[i] = pin_ram_bounded(spans[i], padded, bytes[i], {}, mapped, nullptr, remaining);
+        } else {
+            pins[i] = pin_ram(spans[i], room ? padded : 0, bytes[i], {}, mapped);
+        }
+        pinned += pins[i].registered_bytes;
+    }
+    return pins;''',
+                '''    std::vector<RamPin> pins(spans.size());
+    if constexpr (!platform::kBoundHostRegistration) {
+        if (!limited && spans.size() >= 4) {
+            int cur_dev = 0;
+            if (cudaGetDevice(&cur_dev) != cudaSuccess) { (void) cudaGetLastError(); cur_dev = 0; }
+            std::atomic<size_t> next{0};
+            const size_t nw = std::min<size_t>(4, spans.size());
+            auto worker = [&] {
+                (void) cudaSetDevice(cur_dev);
+                for (;;) {
+                    const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= spans.size()) break;
+                    if (spans[i] == nullptr) continue;
+                    pins[i] = pin_ram(spans[i], ram_padded(bytes[i]), bytes[i], {}, mapped);
+                }
+            };
+            std::vector<std::thread> threads;
+            threads.reserve(nw > 0 ? nw - 1 : 0);
+            for (size_t w = 1; w < nw; ++w) threads.emplace_back(worker);
+            worker();
+            for (auto& t : threads) t.join();
+            return pins;
+        }
+    }
+    uint64_t pinned = 0;
+    for (size_t i = 0; i < spans.size(); ++i) {
+        if (spans[i] == nullptr) continue;
+        const uint64_t padded = ram_padded(bytes[i]);
+        const bool room = !limited || (pinned <= budget && padded <= budget - pinned);
+        if constexpr (platform::kBoundHostRegistration) {
+            // DXGI usage can lag registration. Also charge each span against the initial allowance.
+            const uint64_t remaining = limited ? (budget > pinned ? budget - pinned : 0) : ~uint64_t(0);
+            pins[i] = pin_ram_bounded(spans[i], padded, bytes[i], {}, mapped, nullptr, remaining);
+        } else {
+            pins[i] = pin_ram(spans[i], room ? padded : 0, bytes[i], {}, mapped);
+        }
+        pinned += pins[i].registered_bytes;
+    }
+    return pins;''',
+            ),
+        ],
+    )
+
 
 if __name__ == '__main__':
     main()

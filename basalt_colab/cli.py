@@ -50,7 +50,9 @@ from basalt_colab.config import (
     dump_toml,
     effort_value,
     load_config,
+    profile_value,
     quant_value,
+    routing_mode_value,
     save_config,
     short_context,
     validate_config,
@@ -64,9 +66,12 @@ from basalt_colab.usage import UsageLedger
 USAGE = f"""basalt-colab {__version__} — DeepSeek-V4.1-Flash on Google Colab G4 via Basalt v0.5.7
 
 usage: basalt-colab COMMAND [options]
-  up [opts]                            start G4 (~2-3 min), print endpoints & live status
+  up [opts]                            start G4 (~1.5-2 min), print endpoints & live status
      --quant Q                         ud-iq1_m (default, 100% RAM) | ud-iq2_xxs (-13% KLD) | ud-q2_k_xl | custom
      --pack-url URL                    override .basalt URL (required for ud-q2_k_xl / custom)
+     --profile P                       balanced (default: 2 slots, route balanced) | solo-fast (1 slot, route fast) | exact
+     --routing-mode M                  balanced (default, KLD +0.0005, +20-37% speed) | exact (lossless) | fast
+     --parallel N                      concurrent slots (1-4; default 2, use 1 for lowest solo latency)
      --uncensor-scale S                refusal-removal strength multiplier (0.0=off, 1.0=default, 1.15-1.25=stronger)
      --wait-gpu                        retry G4 allocation up to 30 min with backoff
      --basalt-ref REF                  build an upstream Basalt tag/branch/SHA from source
@@ -86,6 +91,7 @@ usage: basalt-colab COMMAND [options]
   serve [--detached]                   run the local proxy in the foreground (Ctrl+C stops the GPU too)
 
 env: BASALT_COLAB_HOME, BASALT_COLAB_PORT, BASALT_COLAB_BIND, BASALT_COLAB_QUANT, BASALT_COLAB_PACK_URL,
+     BASALT_COLAB_PROFILE (balanced|solo-fast|exact), BASALT_COLAB_ROUTING_MODE (balanced|exact|fast),
      BASALT_COLAB_UNCENSOR, BASALT_COLAB_UNCENSOR_SCALE, BASALT_COLAB_IDLE_MIN, BASALT_COLAB_MAX_HOURS,
      BASALT_COLAB_WAIT_GPU, BASALT_COLAB_REF, BASALT_COLAB_MAX_CONTEXT (32K..1M), BASALT_COLAB_PARALLEL (1-4),
      BASALT_COLAB_KV (fp8|fp16), BASALT_COLAB_EFFORT, BASALT_COLAB_STRICT_MODEL, HF_TOKEN, BASALT_COLAB_YES=1"""
@@ -500,8 +506,17 @@ def cmd_up(
     quant: str | None = None,
     pack_url: str | None = None,
     uncensor_scale: float | None = None,
+    profile: str | None = None,
+    routing_mode: str | None = None,
+    parallel: int | None = None,
 ) -> None:
     want_cfg = cfg.clone()
+    if profile is not None:
+        p = profile_value(profile)
+        if not p:
+            sys.exit(f"invalid --profile {profile!r} (expected balanced, solo-fast, or exact)")
+        want_cfg.apply_profile(p)
+        profile = p
     if basalt_ref is not None:
         want_cfg.basalt.ref = basalt_ref
     if quant is not None:
@@ -514,6 +529,13 @@ def cmd_up(
     if uncensor_scale is not None:
         want_cfg.basalt.uncensor_scale = uncensor_scale
         want_cfg.basalt.uncensor = uncensor_scale > 0.0
+    if routing_mode is not None:
+        rt = routing_mode_value(routing_mode)
+        if not rt:
+            sys.exit(f"invalid --routing-mode {routing_mode!r} (expected balanced, exact, or fast)")
+        want_cfg.basalt.routing_mode = rt
+    if parallel is not None:
+        want_cfg.basalt.parallel = parallel
     try:
         validate_config(want_cfg)
         want_cfg.boot_vars(manifest=manifest)
@@ -535,12 +557,18 @@ def cmd_up(
         up_opts["wait_gpu"] = True
     if basalt_ref is not None:
         up_opts["basalt_ref"] = basalt_ref
+    if profile is not None:
+        up_opts["profile"] = profile
     if quant is not None:
         up_opts["quant"] = want_cfg.basalt.quant
     if pack_url is not None:
         up_opts["pack_url"] = want_cfg.basalt.pack_url
     if uncensor_scale is not None:
         up_opts["uncensor_scale"] = want_cfg.basalt.uncensor_scale
+    if routing_mode is not None:
+        up_opts["routing_mode"] = want_cfg.basalt.routing_mode
+    if parallel is not None:
+        up_opts["parallel"] = want_cfg.basalt.parallel
     conn, r = control_call(paths, want_cfg, held["port"], "/_control/up", up_opts, 120)
     kind, rest = follow(r, paint("Starting a Colab G4 GPU", "bold") + paint(" · ~2-3 minutes (faster with prebuilt binary)", "dim"))
     conn.close()
@@ -974,6 +1002,11 @@ def main(argv: list[str] | None = None) -> None:
                 parsed_scale = float(raw_scale) if raw_scale is not None else None
             except ValueError:
                 sys.exit(f"invalid --uncensor-scale {raw_scale!r} (expected float 0.0-2.0)")
+            raw_par = _extract_flag_val(args[1:], "--parallel")
+            try:
+                parsed_par = int(raw_par) if raw_par is not None else None
+            except ValueError:
+                sys.exit(f"invalid --parallel {raw_par!r} (expected integer 1-4)")
             cmd_up(
                 paths,
                 cfg,
@@ -983,6 +1016,9 @@ def main(argv: list[str] | None = None) -> None:
                 quant=_extract_flag_val(args[1:], "--quant"),
                 pack_url=_extract_flag_val(args[1:], "--pack-url"),
                 uncensor_scale=parsed_scale,
+                profile=_extract_flag_val(args[1:], "--profile"),
+                routing_mode=_extract_flag_val(args[1:], "--routing-mode"),
+                parallel=parsed_par,
             )
         elif cmd == "down":
             cmd_down(paths, cfg, manifest, everything="--all" in args[1:])

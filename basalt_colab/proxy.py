@@ -614,6 +614,9 @@ class Handler(BaseHTTPRequestHandler):
                     quant=opts.get("quant"),
                     pack_url=opts.get("pack_url"),
                     uncensor_scale=opts.get("uncensor_scale"),
+                    profile=opts.get("profile"),
+                    routing_mode=opts.get("routing_mode"),
+                    parallel=opts.get("parallel"),
                 )
                 if not err:
                     mgr.leave(served=0)

@@ -51,6 +51,17 @@ DEFAULT_QUANT = "ud-iq1_m"
 DEFAULT_MODEL_ALIAS = QUANT_DEFAULT_MODEL_ALIAS[DEFAULT_QUANT]
 VALID_QUANTS = ("ud-iq1_m", "ud-iq2_xxs", "ud-q2_k_xl", "custom")
 VALID_DRAFT_EXPERTS = (0, 32, 64, 96, 128)
+VALID_ROUTING_MODES = ("exact", "balanced", "fast")
+ROUTING_MODE_FLAGS: dict[str, dict[str, Any]] = {
+    "exact": {},
+    "balanced": {"route-prior": 0.1, "route-tail-skip": 5},
+    "fast": {"route-prior": 0.1, "route-tail-skip": 3},
+}
+PERFORMANCE_PROFILES: dict[str, dict[str, Any]] = {
+    "balanced": {"parallel": 2, "routing_mode": "balanced", "vram_reserve_mib": 450},
+    "exact": {"parallel": 2, "routing_mode": "exact", "vram_reserve_mib": 450},
+    "solo-fast": {"parallel": 1, "routing_mode": "fast", "vram_reserve_mib": 400},
+}
 HOT_FIELDS = frozenset({
     "colab.idle_min",
     "colab.max_hours",
@@ -68,6 +79,22 @@ class ConfigError(ValueError):
 def quant_value(text: str) -> str | None:
     """Normalizes quantization preset names (ud-iq1_m, ud-iq2_xxs, ud-q2_k_xl, custom)."""
     return QUANT_ALIASES.get(str(text).strip().lower())
+
+
+def routing_mode_value(text: str) -> str | None:
+    """Normalizes routing optimization mode (exact, balanced, fast)."""
+    t = str(text).strip().lower()
+    aliases = {"lossless": "exact", "off": "exact", "default": "balanced", "std": "balanced", "turbo": "fast"}
+    t = aliases.get(t, t)
+    return t if t in VALID_ROUTING_MODES else None
+
+
+def profile_value(text: str) -> str | None:
+    """Normalizes performance profile preset names (balanced, exact, solo-fast)."""
+    t = str(text).strip().lower().replace("_", "-")
+    aliases = {"solo": "solo-fast", "fast-solo": "solo-fast", "fast": "solo-fast", "lossless": "exact"}
+    t = aliases.get(t, t)
+    return t if t in PERFORMANCE_PROFILES else None
 
 
 def context_value(text: str | int) -> int | None:
@@ -169,8 +196,11 @@ class BasaltConfig:
     vision: str = "dynamic"
     spec: int = 6
     draft_experts: int = 32
+    routing_mode: str = "balanced"
+    pool_workers: int = 0
+    engram_cache_mib: int = 1024
     conv_cache_mib: int = 32768
-    vram_reserve_mib: int = 700
+    vram_reserve_mib: int = 450
     resident_budget_gib: int = 0
     uncensor: bool = True
     uncensor_scale: float = 1.0
@@ -209,11 +239,21 @@ class Config:
     def clone(self) -> Config:
         return copy.deepcopy(self)
 
+    def apply_profile(self, name: str) -> None:
+        """Applies a named performance profile (balanced, exact, solo-fast) in place."""
+        p = profile_value(name)
+        if p is None:
+            raise ConfigError(f"unknown performance profile {name!r} (expected {tuple(PERFORMANCE_PROFILES)})")
+        for k, v in PERFORMANCE_PROFILES[p].items():
+            setattr(self.basalt, k, v)
+        validate_config(self)
+
     def describe_engine(self) -> str:
         ref = f"ref={self.basalt.ref} · " if self.basalt.ref else ""
+        rt = f" · route {self.basalt.routing_mode}" if self.basalt.routing_mode != "balanced" else " · route balanced"
         return (
             f"{ref}{self.basalt.quant.upper()} · {short_context(self.basalt.max_context)}×{self.basalt.parallel} "
-            f"{self.basalt.kv.upper()} KV · vision {self.basalt.vision}"
+            f"{self.basalt.kv.upper()} KV · vision {self.basalt.vision}{rt}"
         )
 
     def describe_uncensor(self) -> str:
@@ -247,6 +287,9 @@ class Config:
             "vision": b.vision,
             "spec": b.spec,
             "draft_experts": b.draft_experts,
+            "routing_mode": b.routing_mode,
+            "pool_workers": b.pool_workers,
+            "engram_cache_mib": b.engram_cache_mib,
             "conv_cache_mib": b.conv_cache_mib,
             "vram_reserve_mib": b.vram_reserve_mib,
             "resident_budget_gib": b.resident_budget_gib,
@@ -274,6 +317,9 @@ class Config:
             "VISION_MODE": b.vision,
             "SPEC_MAX": str(b.spec),
             "DRAFT_EXPERTS": str(b.draft_experts),
+            "ROUTING_MODE": b.routing_mode,
+            "POOL_WORKERS": str(b.pool_workers),
+            "ENGRAM_CACHE_MIB": str(b.engram_cache_mib),
             "CONV_CACHE_MIB": str(b.conv_cache_mib),
             "VRAM_RESERVE": str(b.vram_reserve_mib),
             "RAM_BUDGET": str(b.resident_budget_gib),
@@ -343,6 +389,10 @@ class Config:
         ctx_parsed = context_value(ctx_in)
         if ctx_parsed is None:
             raise ConfigError(f"basalt.max_context must be 4096..1048576 (or 32K..1M), got {ctx_in!r}")
+        rt_in = b_raw.get("routing_mode", BasaltConfig.routing_mode)
+        rt_parsed = routing_mode_value(rt_in)
+        if rt_parsed is None:
+            raise ConfigError(f"basalt.routing_mode must be one of {VALID_ROUTING_MODES}, got {rt_in!r}")
         basalt = BasaltConfig(
             quant=q_parsed,
             pack_url=str(b_raw.get("pack_url", BasaltConfig.pack_url)).strip(),
@@ -354,6 +404,9 @@ class Config:
             vision=str(b_raw.get("vision", BasaltConfig.vision)).strip().lower(),
             spec=int(b_raw.get("spec", BasaltConfig.spec)),
             draft_experts=int(b_raw.get("draft_experts", BasaltConfig.draft_experts)),
+            routing_mode=rt_parsed,
+            pool_workers=int(b_raw.get("pool_workers", BasaltConfig.pool_workers)),
+            engram_cache_mib=int(b_raw.get("engram_cache_mib", BasaltConfig.engram_cache_mib)),
             conv_cache_mib=int(b_raw.get("conv_cache_mib", BasaltConfig.conv_cache_mib)),
             vram_reserve_mib=int(b_raw.get("vram_reserve_mib", BasaltConfig.vram_reserve_mib)),
             resident_budget_gib=int(b_raw.get("resident_budget_gib", BasaltConfig.resident_budget_gib)),
@@ -405,6 +458,12 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("basalt.spec must be 0..8")
     if b.draft_experts not in VALID_DRAFT_EXPERTS:
         raise ConfigError(f"basalt.draft_experts must be one of {VALID_DRAFT_EXPERTS}, got {b.draft_experts!r}")
+    if b.routing_mode not in VALID_ROUTING_MODES:
+        raise ConfigError(f"basalt.routing_mode must be one of {VALID_ROUTING_MODES}, got {b.routing_mode!r}")
+    if not (0 <= b.pool_workers <= 128):
+        raise ConfigError("basalt.pool_workers must be 0 (auto) or 1..128")
+    if not (0 <= b.engram_cache_mib <= 4096):
+        raise ConfigError("basalt.engram_cache_mib must be 0..4096")
     if not (0 <= b.conv_cache_mib <= 131072):
         raise ConfigError("basalt.conv_cache_mib must be 0..131072")
     if not (256 <= b.vram_reserve_mib <= 16384):
@@ -423,6 +482,8 @@ def apply_env_overrides(cfg: Config) -> Config:
     """Applies BASALT_COLAB_* environment variable overrides on top of config.toml."""
     c = cfg.clone()
     env = os.environ
+    if env.get("BASALT_COLAB_PROFILE"):
+        c.apply_profile(env["BASALT_COLAB_PROFILE"])
     if env.get("BASALT_COLAB_SESSION"):
         c.colab.session = env["BASALT_COLAB_SESSION"].strip()
     if env.get("BASALT_COLAB_IDLE_MIN"):
@@ -463,6 +524,17 @@ def apply_env_overrides(cfg: Config) -> Config:
         c.basalt.kv = env["BASALT_COLAB_KV"].strip().lower()
     if env.get("BASALT_COLAB_VISION"):
         c.basalt.vision = env["BASALT_COLAB_VISION"].strip().lower()
+    if env.get("BASALT_COLAB_ROUTING_MODE"):
+        rt = routing_mode_value(env["BASALT_COLAB_ROUTING_MODE"])
+        if rt is None:
+            raise ConfigError(f"invalid BASALT_COLAB_ROUTING_MODE: {env['BASALT_COLAB_ROUTING_MODE']!r}")
+        c.basalt.routing_mode = rt
+    if env.get("BASALT_COLAB_POOL_WORKERS"):
+        c.basalt.pool_workers = int(env["BASALT_COLAB_POOL_WORKERS"])
+    if env.get("BASALT_COLAB_ENGRAM_CACHE_MIB"):
+        c.basalt.engram_cache_mib = int(env["BASALT_COLAB_ENGRAM_CACHE_MIB"])
+    if env.get("BASALT_COLAB_VRAM_RESERVE"):
+        c.basalt.vram_reserve_mib = int(env["BASALT_COLAB_VRAM_RESERVE"])
     if env.get("BASALT_COLAB_UNCENSOR"):
         c.basalt.uncensor = _parse_bool(env["BASALT_COLAB_UNCENSOR"])
     if env.get("BASALT_COLAB_UNCENSOR_SCALE"):
@@ -521,6 +593,9 @@ def dump_toml(cfg: Config) -> str:
         f"vision = {_toml_val(b.vision)}",
         f"spec = {_toml_val(b.spec)}",
         f"draft_experts = {_toml_val(b.draft_experts)}",
+        f"routing_mode = {_toml_val(b.routing_mode)}",
+        f"pool_workers = {_toml_val(b.pool_workers)}",
+        f"engram_cache_mib = {_toml_val(b.engram_cache_mib)}",
         f"conv_cache_mib = {_toml_val(b.conv_cache_mib)}",
         f"vram_reserve_mib = {_toml_val(b.vram_reserve_mib)}",
         f"resident_budget_gib = {_toml_val(b.resident_budget_gib)}",

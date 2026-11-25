@@ -209,7 +209,8 @@ class ConfigAndUnitTests(unittest.TestCase):
         env = dict(
             os.environ,
             PORT="18081", CTX="1048576", PARALLEL="2", KV_TYPE="fp8", VISION_MODE="dynamic",
-            SPEC_MAX="6", DRAFT_EXPERTS="32", VRAM_RESERVE="700", RAM_BUDGET="55", ANSWER_ROOM="0",
+            SPEC_MAX="6", DRAFT_EXPERTS="32", VRAM_RESERVE="450", RAM_BUDGET="55", ANSWER_ROOM="0",
+            ROUTING_MODE="balanced", POOL_WORKERS="0", ENGRAM_CACHE_MIB="1024",
             MODEL_ALIAS=config.DEFAULT_MODEL_ALIAS, CONV_CACHE_MIB="32768", CONV_CACHE_DIR="/content/conv_cache",
             MODEL_PATH="/mnt/ram/model.basalt", ENGRAM_PATH="/mnt/ram/engram.bin",
             BASALT_SAMPLING_JSON='{"temperature":0.7,"top-p":0.95}',
@@ -223,6 +224,23 @@ class ConfigAndUnitTests(unittest.TestCase):
                          (1048576, True, "fp8", "dynamic", 0.7, 0.95))
         self.assertEqual((m0["answer-room"], m0["idle-unload"]), (0, 0))
         self.assertEqual(doc["engine"]["conversation-cache-disk-mib"], 32768)
+        self.assertEqual(doc["engine"]["vram-reserve-mib"], 450)
+        self.assertEqual((doc["engine"]["route-prior"], doc["engine"]["route-tail-skip"]), (0.1, 5))
+        self.assertNotIn("pool-workers", doc["engine"])
+
+        # Exact routing omits lossy flags; fast routing sets route-tail-skip=3 and explicit pool-workers
+        env_exact = dict(env, ROUTING_MODE="exact", POOL_WORKERS="12")
+        self.assertEqual(subprocess.run([sys.executable, "-c", m.group(1), str(cfg_path)], env=env_exact).returncode, 0)
+        doc_ex = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertNotIn("route-prior", doc_ex["engine"])
+        self.assertNotIn("route-tail-skip", doc_ex["engine"])
+        self.assertEqual(doc_ex["engine"]["pool-workers"], 12)
+
+        env_fast = dict(env, ROUTING_MODE="fast", PARALLEL="1", VRAM_RESERVE="400")
+        self.assertEqual(subprocess.run([sys.executable, "-c", m.group(1), str(cfg_path)], env=env_fast).returncode, 0)
+        doc_f = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual((doc_f["models"][0]["parallel"], doc_f["engine"]["vram-reserve-mib"], doc_f["engine"]["route-tail-skip"]),
+                         (1, 400, 3))
 
         # Synthetic BASALTMF v2 pack + punch_sections + abliterate_basalt
         sys.path.insert(0, str(self.p.vm_dir))
@@ -314,6 +332,80 @@ class ConfigAndUnitTests(unittest.TestCase):
                               ("blk.1.ffn_down_shexp.weight", 131072 + 4096, 0.9)])
         finally:
             sys.path.remove(str(self.p.vm_dir))
+
+    def test_profiles_and_pfetch_keepalive(self) -> None:
+        cfg = config.Config()
+        self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib, cfg.basalt.engram_cache_mib),
+                         (2, "balanced", 450, 1024))
+        cfg.apply_profile("solo-fast")
+        self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib), (1, "fast", 400))
+        cfg.apply_profile("exact")
+        self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib), (2, "exact", 450))
+        with self.assertRaises(config.ConfigError):
+            cfg.apply_profile("unknown")
+
+        # Live local HTTP Range server test for zero-fork Keep-Alive pfetch.py (with retry on transient 503)
+        import hashlib
+        import http.server
+        import threading
+
+        payload = bytes((i * 37 + 11) & 0xFF for i in range(3 * 1024 * 1024 + 12345))
+        injected_503 = [True]
+
+        class RangeHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_GET(self):
+                if injected_503[0]:
+                    injected_503[0] = False
+                    self.send_response(503)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                rng = self.headers.get("Range", "")
+                m = re.match(r"bytes=(\d+)-(\d+)", rng)
+                if not m:
+                    self.send_response(400)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                s, e = int(m.group(1)), int(m.group(2))
+                chunk = payload[s:e + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {s}-{e}/{len(payload)}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.end_headers()
+                self.wfile.write(chunk)
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RangeHandler)
+        port = srv.server_address[1]
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        try:
+            dest = self.tmp / "fetched.bin"
+            jobs_file = self.tmp / "jobs.json"
+            log_file = self.tmp / "pfetch.log"
+            jobs = [
+                {"url": f"http://127.0.0.1:{port}/f", "dest": str(dest), "dest_size": len(payload),
+                 "src_off": 0, "dest_off": 0, "size": 1024 * 1024},
+                {"url": f"http://127.0.0.1:{port}/f", "dest": str(dest), "dest_size": len(payload),
+                 "src_off": 1024 * 1024, "dest_off": 1024 * 1024, "size": len(payload) - 1024 * 1024},
+            ]
+            jobs_file.write_text(json.dumps(jobs), encoding="utf-8")
+            r = subprocess.run(
+                [sys.executable, str(self.p.vm_dir / "pfetch.py"), str(jobs_file),
+                 "--workers", "4", "--chunk-mb", "1", "--min-avail-mib", "1", "--tag", "unit", "--log", str(log_file)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr + log_file.read_text(encoding="utf-8"))
+            self.assertEqual(hashlib.sha256(dest.read_bytes()).hexdigest(), hashlib.sha256(payload).hexdigest())
+            self.assertIn("DONE", log_file.read_text(encoding="utf-8"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":

@@ -238,6 +238,9 @@ class Manager:
         self._override_quant: str | None = None
         self._override_pack_url: str | None = None
         self._override_uncensor_scale: float | None = None
+        self._override_profile: str | None = None
+        self._override_routing_mode: str | None = None
+        self._override_parallel: int | None = None
 
     def ready(self) -> bool:
         return self.state == "ready" and self.tunnel_ok
@@ -281,6 +284,9 @@ class Manager:
         quant: str | None = None,
         pack_url: str | None = None,
         uncensor_scale: float | None = None,
+        profile: str | None = None,
+        routing_mode: str | None = None,
+        parallel: int | None = None,
     ) -> str | None:
         t0 = time.time()
         tick, mine = t0 + every, None
@@ -309,6 +315,9 @@ class Manager:
                         self._override_quant = quant
                         self._override_pack_url = pack_url
                         self._override_uncensor_scale = uncensor_scale
+                        self._override_profile = profile
+                        self._override_routing_mode = routing_mode
+                        self._override_parallel = parallel
                         self._begin(True, explicit=explicit)
                     if self.state == "starting":
                         mine = self.attempt
@@ -479,6 +488,11 @@ class Manager:
     def _launch(self) -> dict[str, Any]:
         cfg = self.cfg
         session = cfg.colab.session
+        if self._override_profile is not None:
+            try:
+                cfg.apply_profile(self._override_profile)
+            except ConfigError as e:
+                raise StartError(str(e))
         if self._override_quant is not None:
             from basalt_colab.config import quant_value
             q = quant_value(self._override_quant)
@@ -490,6 +504,14 @@ class Manager:
         if self._override_uncensor_scale is not None:
             cfg.basalt.uncensor_scale = float(self._override_uncensor_scale)
             cfg.basalt.uncensor = cfg.basalt.uncensor_scale > 0.0
+        if self._override_routing_mode is not None:
+            from basalt_colab.config import routing_mode_value
+            rt = routing_mode_value(self._override_routing_mode)
+            if not rt:
+                raise StartError(f"invalid --routing-mode value: {self._override_routing_mode!r}")
+            cfg.basalt.routing_mode = rt
+        if self._override_parallel is not None:
+            cfg.basalt.parallel = int(self._override_parallel)
         if self._override_ref is not None:
             cfg.basalt.ref = self._override_ref.strip()
         try:

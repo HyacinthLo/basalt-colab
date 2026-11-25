@@ -11,20 +11,21 @@ Before downloading any weights, `basalt_colab/vm/basalt_jobs.py --plan` reads on
 3. **`ssd+hybrid` (experimental self-hosted `UD-Q2_K_XL`, ~205 GiB backbone + 103.0 GiB Engram)**: Probes `FALLOC_FL_PUNCH_HOLE` on `/content` first, stages backbone on `/content/model.basalt`, punches ~200 GiB free during `POST /load`, then streams ~36 GiB Engram head into `/mnt/ram/engram.bin` + ~67 GiB tail into `/content/engram_tail.bin` concurrently.
 4. **Fail-fast guard**: Any pack whose backbone exceeds `VRAM + RAM` zero-SSD-expert capacity (e.g. `NVFP4`, ~294 GiB backbone) is rejected in 1 second before spending CU.
 
-Boot sequence (`~139s` source build on `UD-IQ1_M`; `~95s` with GitHub Actions prebuilt `sm_120` tarball):
-1. **Parallel**: 64-worker download of the sparse backbone, 43 KB rank-2 `abliteration-edit.npz` fetch (`~1s`), `vm/build.sh` (fetches prebuilt `basalt` + `abliterate` tarball with SHA-256 verification, or falls back to source compilation / `--basalt-ref`), and (in `ram+hybrid`) background SSD download of the ~25 GiB Engram tail.
+Boot sequence (`~70–95s` with GitHub Actions prebuilt `sm_120` tarball):
+1. **Parallel**: Zero-fork Keep-Alive `pfetch.py` (`urllib3`/`http.client` + `os.pwrite()`) streams the sparse backbone, 43 KB rank-2 `abliteration-edit.npz` (`~1s`), `vm/build.sh` (fetches prebuilt `basalt` + `abliterate` tarball and installs any missing Python deps into `/mnt/ram/pydeps` to avoid `/content` `loop0` write contention), and (in `ram+hybrid`) background SSD download of the ~25 GiB Engram tail.
 2. **In-place Abliteration (`~1.5–3s`)**: `abliterate_basalt.py --scale $UNCENSOR_SCALE` + standalone OpenMP `abliterate.c` applies mrfakename's 43 KB rank-2 edit directly across all 62/62 target `Q8_0`/`Q5_K`/`Q6_K` tensors via stochastic rounding (0% decode slowdown).
-3. **Load & Punch-on-Read (`~17s`)**: `POST /load` moves hot experts to VRAM (~87–91 GiB) and resident complement to pinned host RAM. Patch #3 (`BASALT_PUNCH_FILE`) calls `fallocate(FALLOC_FL_PUNCH_HOLE)` as chunks load, and `basalt_jobs.py --punch-sections dspark/gguf dense` reclaims another 8 GiB — shrinking the backbone file down to **~1.6 GiB**.
-4. **Engram Stream**: Streams the RAM Engram (`103 GiB` in `ram+ram`, `~78 GiB` in `ram+hybrid`) into `/mnt/ram/engram.bin` at ~2.5–3.4 GB/s and joins the background SSD tail (usually already finished).
+3. **Load, Punch-on-Read & Early Engram Overlap (`~10–15s`)**: `POST /load` moves hot experts to VRAM and resident complement to 2 MiB `MADV_HUGEPAGE` pinned RAM (parallel `cudaHostRegister`). Patch #3 (`BASALT_PUNCH_FILE`) reclaims `/mnt/ram/model.basalt` as waves load; once `cuda0` punch drops backbone blocks `≤ 95 GiB` with `MemAvailable ≥ 25 GiB`, an atomic claim gate launches `engram_head` streaming early with `--min-avail-mib 6144` real-time RAM backpressure.
+4. **Engram Stream**: Finishes RAM Engram (`103 GiB` in `ram+ram`, `~78 GiB` in `ram+hybrid`) and joins the background SSD tail (already finished).
 5. **Warmup & Gate (`~1s`)**: Verifies generation, opens `gate.py` on `:18080`, and arms the VM-side hard-cap backstop (`MAX_HOURS * 3600 + 300s`).
 
 ## 2. Native Basalt v2 Configuration (`basalt_colab/vm/serve.sh`)
 
 - **`slot-full-context: true`**: Each slot receives the full `basalt.max_context` (up to `1,048,576` / 1M tokens) without `llama.cpp`-style `parallel × context` multiplication.
+- **Performance Profiles & Routing Modes**: Default `balanced` (`parallel=2`, `vram-reserve=450 MiB`, `--route-prior 0.1 --route-tail-skip 5`, KLD `+0.0005` within placement noise, +20–37% decode speed & longer speculative windows); optional `solo-fast` (`parallel=1`, `route-tail-skip=3`, `vram-reserve=400 MiB`) and `exact` (100% lossless routing).
 - **Elastic FP8/FP16 KV**: Default `fp8` uses 920 B/token (`0.24 GiB` idle, `0.97 GiB` at 1M); `fp16` keeps unrounded KV (`3,200 B/token`).
 - **Dynamic Vision**: `vision = "dynamic"` consumes **0 MiB idle VRAM and 0 MiB idle RAM** (identical memory plan to `vision = "off"`).
 - **32 GiB Disk Conversation Cache**: `/content/conv_cache` snapshots evicted KV slots as `.bcs` files and restores them in `<1 ms` (99.8% hit verified across rotated multi-turn sessions).
-- **5 Minimal Patches (`patch_basalt.py`)**: `BASALT_COLAB_ENGRAM_ENV`, `BASALT_COLAB_TMPFS_FALLBACK`, `BASALT_COLAB_ENGRAM_SPLIT`, `BASALT_COLAB_PUNCH_ON_READ`, and `BASALT_COLAB_PUNCH_GUARD`.
+- **8 Safe Patches (`patch_basalt.py`)**: `BASALT_COLAB_ENGRAM_ENV`, `BASALT_COLAB_TMPFS_FALLBACK`, `BASALT_COLAB_ENGRAM_SPLIT`, `BASALT_COLAB_PUNCH_ON_READ`, `BASALT_COLAB_PUNCH_GUARD`, `BASALT_COLAB_ENGRAM_MMAP` (zero-copy `mmap()` RAM head), `BASALT_COLAB_ENGRAM_TAIL_CACHE` (`1024 MiB` tail-only `RowCache`), and `BASALT_COLAB_RAM_HUGEPAGE_PIN` (`MADV_HUGEPAGE` + parallel `cudaHostRegister`).
 
 ## 3. Enhanced Local Gateway & 6-Layer Cost Protection
 

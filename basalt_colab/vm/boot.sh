@@ -15,7 +15,8 @@ set -uo pipefail
 export PORT=18081 UNCENSOR=${UNCENSOR:-1} UNCENSOR_SCALE=${UNCENSOR_SCALE:-1.0} WORKERS=${WORKERS:-64}
 export PARALLEL=${PARALLEL:-2} KV_TYPE=${KV_TYPE:-fp8} VISION_MODE=${VISION_MODE:-dynamic}
 export SPEC_MAX=${SPEC_MAX:-6} DRAFT_EXPERTS=${DRAFT_EXPERTS:-32}
-export VRAM_RESERVE=${VRAM_RESERVE:-700} RAM_BUDGET=${RAM_BUDGET:-0}
+export VRAM_RESERVE=${VRAM_RESERVE:-450} RAM_BUDGET=${RAM_BUDGET:-0}
+export ROUTING_MODE=${ROUTING_MODE:-balanced} POOL_WORKERS=${POOL_WORKERS:-0} ENGRAM_CACHE_MIB=${ENGRAM_CACHE_MIB:-1024}
 export CONV_CACHE_MIB=${CONV_CACHE_MIB:-32768}
 export MODEL_QUANT=${MODEL_QUANT:-ud-iq1_m}
 export MODEL_ALIAS=${MODEL_ALIAS:-DeepSeek-V4.1-Flash-1017-UD-IQ1_M}
@@ -23,7 +24,7 @@ export MODEL_URL=${MODEL_URL:-}
 [ -s /content/secrets/hf_hdr ] && export HF_HDR=/content/secrets/hf_hdr
 R=/content/res; V=/content/vm; D=/content/basalt
 mkdir -p $R /mnt/ram /content/patch $D
-rm -f $R/READY
+rm -rf $R/READY $R/load_done $R/engram_claim
 
 T0=$(date +%s)
 st() { echo "$(( $(date +%s) - T0 ))s $(date +%T) $*" >> $R/timeline.txt; }
@@ -54,7 +55,7 @@ if [ -z "$MODEL_URL" ]; then
   exit 1
 fi
 
-st "boot start engine=basalt quant=$MODEL_QUANT model=$MODEL_ALIAS ref=${BASALT_REF:-pinned} ctx=$CTX parallel=$PARALLEL kv=$KV_TYPE vision=$VISION_MODE uncensored=$UNCENSOR scale=$UNCENSOR_SCALE"
+st "boot start engine=basalt quant=$MODEL_QUANT model=$MODEL_ALIAS ref=${BASALT_REF:-pinned} ctx=$CTX parallel=$PARALLEL kv=$KV_TYPE vision=$VISION_MODE route=$ROUTING_MODE vram_res=$VRAM_RESERVE uncensored=$UNCENSOR scale=$UNCENSOR_SCALE"
 
 RAM_GIB=$(awk '/MemTotal/ {printf "%.1f", $2/1048576}' /proc/meminfo)
 TMPFS_GIB=$(awk '/MemTotal/ {print int($2/1048576) - 6}' /proc/meminfo)
@@ -154,25 +155,54 @@ for k in $(seq 1 120); do
   sleep 0.5
 done
 
-# Eager weight load (with punch-on-read reclaiming backbone storage before RAM Engram download)
+# RAM OOM guard + atomic punch-gated early engram_head overlap (triggers only once /load punches cuda0 & MemAvailable >= 25 GiB)
+if [[ "$ENGRAM_PATH" == /mnt/ram/* ]]; then
+  ( for k in $(seq 1 600); do [ -f $R/READY ] && exit 0; a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+      [ "$a" -lt 1200 ] && { for p in $(pgrep -f "[p]fetch.py"); do kill $p; done; st "GUARD: ${a} MiB RAM available, engram fetch stopped FAILED"; exit 0; }; sleep 2; done ) &
+fi
+
+PID_ENG_OVERLAP=""
+if [[ "$ENGRAM_PATH" == /mnt/ram/* ]] && [[ "$STAGE_MODE" == "ram+ram" || "$STAGE_MODE" == "ram+hybrid" ]]; then
+  (
+    while [ ! -f $R/load_done ] && [ ! -f $R/READY ]; do
+      MODEL_USED_GIB=$(du -BG "$MODEL_PATH" 2>/dev/null | awk '{print int($1)}')
+      AVAIL_GIB=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo)
+      if [ "${MODEL_USED_GIB:-999}" -le 95 ] && [ "${AVAIL_GIB:-0}" -ge 25 ]; then
+        if mkdir $R/engram_claim 2>/dev/null; then
+          st "engram overlap started (model=${MODEL_USED_GIB}G avail=${AVAIL_GIB}G)"
+          python3 $V/pfetch.py $R/j_basalt_eng.json --workers $WORKERS --chunk-mb 64 --min-avail-mib 6144 --tag basalt-eng --log $R/fetch.log \
+            && st "engram done ($ENGRAM_PATH)" || st "engram FAILED"
+        fi
+        exit 0
+      fi
+      sleep 0.5
+    done
+  ) &
+  PID_ENG_OVERLAP=$!
+fi
+
+# Eager weight load (with punch-on-read reclaiming backbone storage while RAM Engram can overlap safely)
 curl -sf --max-time 900 -X POST -H "$(hdr)" -H "Content-Type: application/json" -d '{}' \
-  http://127.0.0.1:$PORT/load > $R/load.json 2>&1 && st "weights loaded" || { [ -n "$PID_TAIL" ] && kill $PID_TAIL 2>/dev/null || true; st "weights load FAILED ($(tail -5 $R/server.log 2>/dev/null | tr '\n' ' '))"; exit 1; }
+  http://127.0.0.1:$PORT/load > $R/load.json 2>&1 && st "weights loaded" || {
+    touch $R/load_done
+    [ -n "$PID_ENG_OVERLAP" ] && kill $PID_ENG_OVERLAP 2>/dev/null || true
+    [ -n "$PID_TAIL" ] && kill $PID_TAIL 2>/dev/null || true
+    pkill -f "[p]fetch.py" 2>/dev/null || true
+    st "weights load FAILED ($(tail -5 $R/server.log 2>/dev/null | tr '\n' ' '))"; exit 1;
+  }
+touch $R/load_done
 
 VRAM=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
 if [ "${VRAM:-0}" -lt 60000 ]; then
+  [ -n "$PID_ENG_OVERLAP" ] && kill $PID_ENG_OVERLAP 2>/dev/null || true
   [ -n "$PID_TAIL" ] && kill $PID_TAIL 2>/dev/null || true
+  pkill -f "[p]fetch.py" 2>/dev/null || true
   st "GUARD: VRAM ${VRAM} MiB after /load FAILED"; exit 1
 fi
 if [ -n "${BASALT_PUNCH_FILE:-}" ]; then
   python3 $V/basalt_jobs.py --backbone-dest "$MODEL_PATH" --punch-sections dspark/gguf dense > $R/punch.txt 2>&1 || true
 fi
 st "pin: VRAM ${VRAM} MiB, model $(du -sh "$MODEL_PATH" | awk '{print $1}'), mode=$STAGE_MODE"
-
-# Stream RAM Engram (full in ram+ram, head in ram+hybrid/ssd+hybrid) and/or sequential SSD tail
-if [[ "$ENGRAM_PATH" == /mnt/ram/* ]]; then
-  ( for k in $(seq 1 600); do [ -f $R/READY ] && exit 0; a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
-      [ "$a" -lt 1200 ] && { for p in $(pgrep -f "[p]fetch.py"); do kill $p; done; st "GUARD: ${a} MiB RAM available, engram fetch stopped FAILED"; exit 0; }; sleep 2; done ) &
-fi
 
 # In ssd+hybrid (where PARALLEL_TAIL=0), start SSD tail & RAM head concurrently now that /content backbone is punched!
 if [ "${PARALLEL_TAIL:-0}" = 0 ] && [ -n "${ENGRAM_TAIL_PATH:-}" ] && [ -s "$R/j_basalt_eng_tail.json" ]; then
@@ -181,12 +211,19 @@ if [ "${PARALLEL_TAIL:-0}" = 0 ] && [ -n "${ENGRAM_TAIL_PATH:-}" ] && [ -s "$R/j
   PID_TAIL=$!
 fi
 
-# Stream primary Engram file unless it was already started in background (ram+ssd with PARALLEL_TAIL=1)
+# Stream primary Engram file unless already claimed by early overlap or background ram+ssd tail
 if [ "$STAGE_MODE" != "ram+ssd" ] || [ "${PARALLEL_TAIL:-0}" = 0 ]; then
-  ENG_WORKERS=$WORKERS
-  [[ "$ENGRAM_PATH" == /content/* ]] && ENG_WORKERS=$SSD_WORKERS
-  python3 $V/pfetch.py $R/j_basalt_eng.json --workers $ENG_WORKERS --chunk-mb 64 --tag basalt-eng --log $R/fetch.log \
-    && st "engram done ($ENGRAM_PATH)" || { [ -n "$PID_TAIL" ] && kill $PID_TAIL 2>/dev/null || true; st "engram FAILED"; exit 1; }
+  if mkdir $R/engram_claim 2>/dev/null; then
+    [ -n "$PID_ENG_OVERLAP" ] && wait $PID_ENG_OVERLAP 2>/dev/null || true
+    ENG_WORKERS=$WORKERS
+    ENG_BP=0
+    [[ "$ENGRAM_PATH" == /content/* ]] && ENG_WORKERS=$SSD_WORKERS
+    [[ "$ENGRAM_PATH" == /mnt/ram/* ]] && ENG_BP=2048
+    python3 $V/pfetch.py $R/j_basalt_eng.json --workers $ENG_WORKERS --chunk-mb 64 --min-avail-mib $ENG_BP --tag basalt-eng --log $R/fetch.log \
+      && st "engram done ($ENGRAM_PATH)" || { [ -n "$PID_TAIL" ] && kill $PID_TAIL 2>/dev/null || true; st "engram FAILED"; exit 1; }
+  else
+    [ -n "$PID_ENG_OVERLAP" ] && wait $PID_ENG_OVERLAP
+  fi
 fi
 
 if [ -n "$PID_TAIL" ]; then

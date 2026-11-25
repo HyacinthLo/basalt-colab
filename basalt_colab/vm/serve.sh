@@ -14,8 +14,11 @@ export KV_TYPE=${KV_TYPE:-fp8}
 export VISION_MODE=${VISION_MODE:-dynamic}
 export SPEC_MAX=${SPEC_MAX:-6}
 export DRAFT_EXPERTS=${DRAFT_EXPERTS:-32}
-export VRAM_RESERVE=${VRAM_RESERVE:-700}
+export VRAM_RESERVE=${VRAM_RESERVE:-450}
 export RAM_BUDGET=${RAM_BUDGET:-55}
+export ROUTING_MODE=${ROUTING_MODE:-balanced}
+export POOL_WORKERS=${POOL_WORKERS:-0}
+export ENGRAM_CACHE_MIB=${ENGRAM_CACHE_MIB:-1024}
 export ANSWER_ROOM=${ANSWER_ROOM:-0}
 export MODEL_PATH=${MODEL_PATH:-/mnt/ram/model.basalt}
 export ENGRAM_PATH=${ENGRAM_PATH:-/mnt/ram/engram.bin}
@@ -53,6 +56,15 @@ engine = {
 }
 if int(os.environ["RAM_BUDGET"]) > 0:
     engine["resident-budget-gib"] = int(os.environ["RAM_BUDGET"])
+if int(os.environ["POOL_WORKERS"]) > 0:
+    engine["pool-workers"] = int(os.environ["POOL_WORKERS"])
+rt = os.environ.get("ROUTING_MODE", "balanced").strip().lower()
+if rt == "balanced":
+    engine["route-prior"] = 0.1
+    engine["route-tail-skip"] = 5
+elif rt == "fast":
+    engine["route-prior"] = 0.1
+    engine["route-tail-skip"] = 3
 if int(os.environ["CONV_CACHE_MIB"]) > 0:
     engine["conversation-cache-disk-mib"] = int(os.environ["CONV_CACHE_MIB"])
     engine["conversation-cache-dir"] = os.environ["CONV_CACHE_DIR"]
@@ -74,8 +86,17 @@ if [ -d /mnt/ram/pydeps ]; then
   export PYTHONPATH="/mnt/ram/pydeps${PYTHONPATH:+:$PYTHONPATH}"
 fi
 export BASALT_ENGRAM_FILE="$ENGRAM_PATH"
+if [[ "$ENGRAM_PATH" == /mnt/ram/* ]]; then
+  export BASALT_ENGRAM_MMAP=1
+fi
 if [ -n "${ENGRAM_TAIL_PATH:-}" ]; then
   export BASALT_ENGRAM_TAIL_FILE="$ENGRAM_TAIL_PATH"
+  export BASALT_ENGRAM_CACHE_MIB="$ENGRAM_CACHE_MIB"
+elif [[ "$ENGRAM_PATH" == /mnt/ram/* ]]; then
+  # Pure RAM Engram uses zero-copy mmap() directly; disable redundant RowCache
+  export BASALT_ENGRAM_CACHE_MIB=0
+else
+  export BASALT_ENGRAM_CACHE_MIB="$ENGRAM_CACHE_MIB"
 fi
 if [ -n "${BASALT_PUNCH_FILE:-}" ]; then
   export BASALT_PUNCH_FILE

@@ -87,7 +87,7 @@ Starting a Colab G4 GPU · ~2-3 minutes (faster with prebuilt binary)
 
 | Command | Description |
 | --- | --- |
-| `basalt-colab up [--quant Q] [--pack-url URL] [--uncensor-scale S] [--wait-gpu] [--basalt-ref REF]` | Start G4 (`--quant ud-iq1_m\|ud-iq2_xxs\|ud-q2_k_xl\|custom`; `--uncensor-scale` adjusts mrfakename strength; `--wait-gpu` retries up to 30 min; `--basalt-ref` builds an upstream Basalt tag/branch/SHA) |
+| `basalt-colab up [--quant Q] [--profile P] [--routing-mode M] [--parallel N] [--pack-url URL] [--uncensor-scale S] [--wait-gpu] [--basalt-ref REF]` | Start G4 (`--quant ud-iq1_m\|ud-iq2_xxs\|ud-q2_k_xl\|custom`; `--profile balanced\|solo-fast\|exact`; `--routing-mode balanced\|exact\|fast`; `--parallel 1..4`; `--uncensor-scale` adjusts mrfakename strength; `--wait-gpu` retries up to 30 min; `--basalt-ref` builds an upstream Basalt tag/branch/SHA) |
 | `basalt-colab down [--all]` | Stop G4, wipe VM secrets, record session in `usage.jsonl`, stop detached proxy |
 | `basalt-colab console [--no-open]` | Ensure local proxy is up (without waking G4) and open `/_console` |
 | `basalt-colab status` | Snapshot of Console/Web UI URLs, live Basalt telemetry, CU billing ledger, and Colab balance |
