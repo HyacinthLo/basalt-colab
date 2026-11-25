@@ -70,6 +70,9 @@ cfg = {
 open(sys.argv[1], "w").write(json.dumps(cfg, indent=2) + "\n")
 EOF
 
+if [ -d /mnt/ram/pydeps ]; then
+  export PYTHONPATH="/mnt/ram/pydeps${PYTHONPATH:+:$PYTHONPATH}"
+fi
 export BASALT_ENGRAM_FILE="$ENGRAM_PATH"
 if [ -n "${ENGRAM_TAIL_PATH:-}" ]; then
   export BASALT_ENGRAM_TAIL_FILE="$ENGRAM_TAIL_PATH"
