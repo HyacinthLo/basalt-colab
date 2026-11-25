@@ -119,7 +119,7 @@ Stored at `~/.config/basalt-colab/config.toml` (`%APPDATA%\basalt-colab\config.t
 ```toml
 [colab]
 session = "basalt-ds41"
-idle_min = 10            # hot-reloadable live
+idle_min = 30            # hot-reloadable live
 max_hours = 6            # hot-reloadable live
 min_balance = 5
 wait_gpu = false         # hot-reloadable live

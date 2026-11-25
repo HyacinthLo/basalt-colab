@@ -33,7 +33,7 @@ Boot sequence (`~90–95s` with GitHub Actions prebuilt `sm_120` tarball):
 - **6-Layer Cost Safety**:
   1. `0.5s` `MSG_PEEK` client-disconnect cancellation (aborts active GPU Prefill/Decode AND unwakes cold-start waiters).
   2. Orphan cold-start auto-cancel (`orphan_boot_s`, default `30s`).
-  3. Idle auto-stop (`idle_min`, default `10 min`, hot-reloadable live).
+  3. Idle auto-stop (`idle_min`, default `30 min`, hot-reloadable live).
   4. Proxy hard cap (`max_hours`, default `6 h`, hot-reloadable live).
   5. Detached local `_watchdog` process (survives proxy SIGKILL).
   6. VM-side hard-cap timer in `boot.sh` (kills Basalt and wipes `/content/secrets` if local machine sleeps).

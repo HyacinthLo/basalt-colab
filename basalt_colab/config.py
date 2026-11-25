@@ -154,7 +154,7 @@ def _parse_bool(val: Any) -> bool:
 @dataclass(slots=True)
 class ColabConfig:
     session: str = "basalt-ds41"
-    idle_min: float = 10.0
+    idle_min: float = 30.0
     max_hours: float = 6.0
     min_balance: float = 5.0
     wait_gpu: bool = False

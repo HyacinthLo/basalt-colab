@@ -439,10 +439,11 @@ class ConfigAndUnitTests(unittest.TestCase):
         from basalt_colab import clients
         from basalt_colab.cli import _parse_wait_gpu_args, parse_ask_options
 
-        # Default answer_room is 'auto' (matching Basalt upstream); quant remains ud-iq1_m; wait_gpu_min defaults to 120m
+        # Default answer_room is 'auto' (matching Basalt upstream); quant remains ud-iq1_m; idle_min=30m; wait_gpu_min=120m
         cfg = config.Config()
         self.assertEqual(cfg.basalt.quant, "ud-iq1_m")
         self.assertEqual(cfg.basalt.answer_room, "auto")
+        self.assertEqual(cfg.colab.idle_min, 30.0)
         self.assertEqual(cfg.colab.wait_gpu_min, 120.0)
         self.assertEqual(cfg.boot_vars(manifest=manifest.load_manifest(self.p.vm_dir))["ANSWER_ROOM"], "auto")
 
