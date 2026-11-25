@@ -243,9 +243,21 @@ class ConfigAndUnitTests(unittest.TestCase):
             for i, (name, soff, sbytes) in enumerate(sections):
                 struct.pack_into("<64sQQ", hdr, 64 + i * 128, name.encode(), soff, sbytes)
             fb, parsed = bj.parse_header(bytes(hdr))
-            bb_jobs, eng_jobs = bj.build_jobs("https://example.test/m.basalt", fb, parsed, "/mnt/ram/model.basalt", "/mnt/ram/engram.bin")
-            self.assertEqual(len(eng_jobs), 1)
+            bb_jobs, eng_jobs, tail_jobs = bj.build_jobs("https://example.test/m.basalt", fb, parsed, "/mnt/ram/model.basalt", "/mnt/ram/engram.bin")
+            self.assertEqual((len(eng_jobs), len(tail_jobs)), (1, 0))
             self.assertEqual(sum(j["size"] for j in bb_jobs), 65536 + 4096 + 1048576 + 262144 + 65536 + 4194304)
+
+            # Split Engram build_jobs produces contiguous head + tail summing to total engram
+            _, head_j, split_tail_j = bj.build_jobs(
+                "https://example.test/m.basalt", fb, parsed,
+                "/mnt/ram/model.basalt", "/mnt/ram/engram.bin",
+                engram_tail_dest="/content/engram_tail.bin", engram_head_bytes=12582912,
+            )
+            self.assertEqual((len(head_j), len(split_tail_j)), (1, 1))
+            self.assertEqual(head_j[0]["src_off"], 8388608)
+            self.assertEqual(head_j[0]["size"], 12582912)
+            self.assertEqual(split_tail_j[0]["src_off"], 8388608 + 12582912)
+            self.assertEqual(head_j[0]["size"] + split_tail_j[0]["size"], 16777216)
 
             if sys.platform.startswith("linux"):
                 pf = self.tmp / "punch.basalt"
@@ -257,25 +269,29 @@ class ConfigAndUnitTests(unittest.TestCase):
                 ok_p, before_b, after_b, rc_p, _ = bj.test_punch_support(str(self.tmp))
                 self.assertTrue(ok_p, f"punch probe failed: before={before_b} after={after_b} rc={rc_p}")
 
-            # 3-mode storage planner across real Colab G4 specs (96 GiB VRAM, 176 GiB RAM, 220 GiB disk)
+            # Storage planner across real Colab G4 specs (95.6 GiB VRAM, 176.9 GiB RAM, 236 GiB disk)
             GIB = 1024 ** 3
-            p_iq1 = bj.plan_storage(int(139.1 * GIB), int(110.6 * GIB), ram_total_gib=176.0, disk_free_gib=220.0, vram_gib=96.0)
-            self.assertEqual((p_iq1["stage_mode"], p_iq1["model_path"], p_iq1["engram_path"]),
-                             ("ram+ram", "/mnt/ram/model.basalt", "/mnt/ram/engram.bin"))
-            self.assertEqual(p_iq1["ram_budget"], 57)
+            p_iq1 = bj.plan_storage(int(139.1 * GIB), int(103.0 * GIB), ram_total_gib=176.9, disk_free_gib=236.0, vram_gib=95.6)
+            self.assertEqual((p_iq1["stage_mode"], p_iq1["model_path"], p_iq1["engram_path"], p_iq1["engram_tail_path"]),
+                             ("ram+ram", "/mnt/ram/model.basalt", "/mnt/ram/engram.bin", ""))
+            self.assertEqual(p_iq1["engram_tail_bytes"], 0)
 
-            p_iq2 = bj.plan_storage(int(154.8 * GIB), int(110.6 * GIB), ram_total_gib=176.0, disk_free_gib=220.0, vram_gib=96.0)
-            self.assertEqual((p_iq2["stage_mode"], p_iq2["model_path"], p_iq2["engram_path"]),
-                             ("ram+ssd", "/mnt/ram/model.basalt", "/content/engram.bin"))
-            self.assertGreaterEqual(p_iq2["ram_budget"], 80)
+            p_iq2 = bj.plan_storage(int(162.85 * GIB), int(103.0 * GIB), ram_total_gib=176.9, disk_free_gib=236.0, vram_gib=95.6)
+            self.assertEqual((p_iq2["stage_mode"], p_iq2["model_path"], p_iq2["engram_path"], p_iq2["engram_tail_path"], p_iq2["parallel_tail"]),
+                             ("ram+hybrid", "/mnt/ram/model.basalt", "/mnt/ram/engram.bin", "/content/engram_tail.bin", True))
+            self.assertEqual(p_iq2["engram_head_bytes"] % 4096, 0)
+            self.assertGreaterEqual(p_iq2["engram_head_bytes"], int(75 * GIB))
+            self.assertLessEqual(p_iq2["engram_tail_bytes"], int(28 * GIB))
+            self.assertEqual(p_iq2["engram_head_bytes"] + p_iq2["engram_tail_bytes"], int(103.0 * GIB))
 
-            p_q2xl = bj.plan_storage(int(201.0 * GIB), int(110.6 * GIB), ram_total_gib=176.0, disk_free_gib=220.0, vram_gib=96.0)
-            self.assertEqual((p_q2xl["stage_mode"], p_q2xl["model_path"], p_q2xl["engram_path"]),
-                             ("ssd+ssd", "/content/model.basalt", "/content/engram.bin"))
-            self.assertGreaterEqual(p_q2xl["ram_budget"], 120)
+            p_q2xl = bj.plan_storage(int(205.0 * GIB), int(103.0 * GIB), ram_total_gib=176.9, disk_free_gib=236.0, vram_gib=95.6)
+            self.assertEqual((p_q2xl["stage_mode"], p_q2xl["model_path"], p_q2xl["engram_path"], p_q2xl["engram_tail_path"]),
+                             ("ssd+hybrid", "/content/model.basalt", "/mnt/ram/engram.bin", "/content/engram_tail.bin"))
+            self.assertGreaterEqual(p_q2xl["engram_head_bytes"], int(30 * GIB))
+            self.assertEqual(p_q2xl["engram_head_bytes"] + p_q2xl["engram_tail_bytes"], int(103.0 * GIB))
 
             with self.assertRaises(RuntimeError):
-                bj.plan_storage(int(294.2 * GIB), int(104.4 * GIB), ram_total_gib=176.0, disk_free_gib=220.0, vram_gib=96.0)
+                bj.plan_storage(int(294.2 * GIB), int(104.4 * GIB), ram_total_gib=176.9, disk_free_gib=236.0, vram_gib=95.6)
 
             dim = 4
             def npy(shape, fortran, vals):

@@ -99,6 +99,77 @@ def main():
         ],
     )
 
+    # 2b. DirectFile split Engram tail support (BASALT_COLAB_ENGRAM_SPLIT):
+    # Allows serving the Engram table across two page-aligned files:
+    #   [0, split_bytes)         -> BASALT_ENGRAM_FILE (e.g. /mnt/ram/engram.bin on tmpfs)
+    #   [split_bytes, total)     -> BASALT_ENGRAM_TAIL_FILE (e.g. /content/engram_tail.bin)
+    patch_file(
+        src,
+        'src/platform/direct_file.cpp',
+        'BASALT_COLAB_ENGRAM_SPLIT',
+        [
+            (
+                '''struct DirectFile::Impl {
+    int fd = -1;
+    uint64_t size = 0;''',
+                '''struct DirectFile::Impl {
+    int fd = -1;
+    int fd2 = -1; // BASALT_COLAB_ENGRAM_SPLIT: optional tail file for hybrid RAM+SSD Engram
+    uint64_t split_bytes = 0;
+    uint64_t size = 0;''',
+            ),
+            (
+                '''            const ssize_t got = pread(fd, p.buffer, p.length, (off_t) p.offset);''',
+                '''            const bool in_tail = (fd2 >= 0 && p.offset >= split_bytes);
+            const ssize_t got = pread(in_tail ? fd2 : fd, p.buffer, p.length,
+                                      (off_t) (in_tail ? p.offset - split_bytes : p.offset));''',
+            ),
+            (
+                '''    if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
+    return finish_open(path, err, workers);''',
+                '''    if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
+    const char* eng_head = std::getenv("BASALT_ENGRAM_FILE");
+    const char* eng_tail = std::getenv("BASALT_ENGRAM_TAIL_FILE");
+    if (eng_head && *eng_head && eng_tail && *eng_tail && path == eng_head) {
+        impl_->fd2 = ::open(eng_tail, O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (impl_->fd2 < 0 && errno == EINVAL) {
+            impl_->fd2 = ::open(eng_tail, O_RDONLY | O_CLOEXEC);
+        }
+        if (impl_->fd2 < 0) {
+            err = "DirectFile: cannot open split tail " + std::string(eng_tail);
+            close();
+            return false;
+        }
+    }
+    return finish_open(path, err, workers);''',
+            ),
+            (
+                '''    if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
+    impl_->size = (uint64_t) st.st_size;''',
+                '''    if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
+    impl_->size = (uint64_t) st.st_size;
+    if (impl_->fd2 >= 0) {
+        struct stat st2{};
+        if (fstat(impl_->fd2, &st2) != 0) { err = "DirectFile: cannot size split tail"; close(); return false; }
+        if (impl_->size % alignment() != 0) { err = "DirectFile: split head size must be page-aligned"; close(); return false; }
+        impl_->split_bytes = impl_->size;
+        impl_->size += (uint64_t) st2.st_size;
+    }''',
+            ),
+            (
+                '''    if (impl_->fd >= 0) ::close(impl_->fd);
+    impl_->fd = -1;
+    impl_->size = 0;''',
+                '''    if (impl_->fd >= 0) ::close(impl_->fd);
+    if (impl_->fd2 >= 0) ::close(impl_->fd2);
+    impl_->fd = -1;
+    impl_->fd2 = -1;
+    impl_->split_bytes = 0;
+    impl_->size = 0;''',
+            ),
+        ],
+    )
+
     # 3a. ExpertTier: credit punchable tmpfs backbone bytes into avail when BASALT_PUNCH_FILE is active
     patch_file(
         src,

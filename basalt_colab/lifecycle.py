@@ -49,6 +49,7 @@ UPSTREAM_TIMEOUT = 3600
 STEPS = (
     ("plan", r"storage plan mode=", "storage layout planned"),
     ("patch", r"abliteration edit fetched", "abliteration edit downloaded (43 KB)"),
+    ("engram_tail", r"engram tail done", "Engram SSD tail downloaded (parallel)"),
     ("model", r"backbone fetched \([^)]+\)", "model backbone downloaded"),
     ("build", r"basalt built", "Basalt built / ready"),
     ("abliterate", r"abliteration applied", "abliteration baked into weights (62/62)"),

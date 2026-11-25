@@ -71,6 +71,9 @@ open(sys.argv[1], "w").write(json.dumps(cfg, indent=2) + "\n")
 EOF
 
 export BASALT_ENGRAM_FILE="$ENGRAM_PATH"
+if [ -n "${ENGRAM_TAIL_PATH:-}" ]; then
+  export BASALT_ENGRAM_TAIL_FILE="$ENGRAM_TAIL_PATH"
+fi
 if [ -n "${BASALT_PUNCH_FILE:-}" ]; then
   export BASALT_PUNCH_FILE
 fi
