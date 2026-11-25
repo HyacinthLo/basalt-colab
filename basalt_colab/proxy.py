@@ -24,6 +24,7 @@ from basalt_colab.colab import (
     release_lock,
     session_alive,
     take_lock,
+    update_lock,
     vmx,
 )
 from basalt_colab.clients import ClientEndpoint, all_client_bundles, opencode_config_dict
@@ -45,7 +46,7 @@ HOP = {
 def write_opencode_config(paths: Paths, cfg: Config, port: int | None = None) -> None:
     key = read_api_key(paths) if paths.key_file.exists() else ""
     ep = ClientEndpoint.from_config(cfg, key, port=port or cfg.proxy.port, paths=paths)
-    doc = opencode_config_dict(ep, inline_key=False)
+    doc = opencode_config_dict(ep, key_mode="file")
     paths.ensure_dirs()
     paths.opencode_file.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
 
@@ -496,6 +497,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ConfigError("expected 'toml' or 'config' in request body")
                 save_config(new_cfg, paths)
                 hot, cold = mgr.reload_config(new_cfg, prev_cfg=prev_disk)
+                update_lock(paths, {"cold_signature": mgr.cfg.cold_signature(), "engine_summary": mgr.cfg.describe_engine()})
                 try:
                     write_opencode_config(paths, mgr.cfg, self.server.server_port)
                 except OSError:
@@ -543,6 +545,7 @@ class Handler(BaseHTTPRequestHandler):
                         merged["proxy"]["strict_model"] = payload["strict_model"]
                     new_cfg = Config.from_dict(merged)
                 hot, cold = mgr.reload_config(new_cfg)
+                update_lock(paths, {"cold_signature": mgr.cfg.cold_signature(), "engine_summary": mgr.cfg.describe_engine()})
                 try:
                     write_opencode_config(paths, mgr.cfg, self.server.server_port)
                 except OSError:
@@ -585,6 +588,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     fresh_cfg = load_config(paths, apply_env=True)
                     mgr.reload_config(fresh_cfg)
+                    update_lock(paths, {"cold_signature": mgr.cfg.cold_signature(), "engine_summary": mgr.cfg.describe_engine()})
                     write_opencode_config(paths, mgr.cfg, self.server.server_port)
                 except (OSError, ConfigError) as e:
                     say(f"FAILED config reload error: {e}")
@@ -626,6 +630,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not err:
                     mgr.leave(served=0)
                     emit_steps()
+                    update_lock(paths, {"cold_signature": mgr.cfg.cold_signature(), "engine_summary": mgr.cfg.describe_engine()})
                     try:
                         write_opencode_config(paths, mgr.cfg, self.server.server_port)
                     except OSError:

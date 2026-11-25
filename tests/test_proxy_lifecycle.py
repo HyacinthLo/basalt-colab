@@ -341,10 +341,13 @@ class ProxyLifecycleTests(unittest.TestCase):
 
     def test_04_console_config_hot_reload_usage_ledger_and_cli(self) -> None:
         c = Case(self)
-        # doctor & config show/path work before starting
+        # doctor & config show/path work before starting; ask refuses to silently wake G4 when proxy is off
         self.assertEqual(c.cli("doctor").returncode, 0)
         self.assertIn("max_context = 262144", c.cli("config", "show").stdout)
         self.assertIn("config.toml", c.cli("config", "path").stdout)
+        r_ask_off = c.cli("ask", "hello")
+        self.assertNotEqual(r_ask_off.returncode, 0)
+        self.assertEqual(c.calls("new"), [])
 
         # Start detached proxy + G4 with --basalt-ref override and -d (no watch)
         r_up = c.cli("up", "-d", "--no-notify", "--basalt-ref", "main")
@@ -387,24 +390,27 @@ class ProxyLifecycleTests(unittest.TestCase):
         logs_res = json.loads(c.req(method="GET", path="/_control/logs?vm=0").raw)
         self.assertIn("serve:", logs_res["local"])
 
-        # Pure config-generation commands (connect, dsh, claude, codex, opencode, env, console --no-open, ask --image + stdin)
-        r_dsh = c.cli("dsh", "--raw")
+        # Pure config-generation commands (connect, env, console --no-open, ask --image + stdin)
+        r_dsh = c.cli("connect", "dsh", "--raw")
         self.assertEqual(r_dsh.returncode, 0, r_dsh.stderr)
         self.assertIn("apiKeyEnv: BASALT_API_KEY", r_dsh.stdout)
         self.assertIn(f"baseURL: http://127.0.0.1:{c.port}/v1", r_dsh.stdout)
         self.assertIn(f"id: {MODEL_ID}", r_dsh.stdout)
+        self.assertNotIn("medium", r_dsh.stdout)
 
-        r_claude = c.cli("claude", "--raw")
+        r_claude = c.cli("connect", "claude", "--raw")
         self.assertEqual(r_claude.returncode, 0, r_claude.stderr)
         self.assertEqual(json.loads(r_claude.stdout)["env"]["ANTHROPIC_MODEL"], MODEL_ID)
 
-        r_codex = c.cli("codex", "--raw")
+        r_codex = c.cli("connect", "codex", "--raw")
         self.assertEqual(r_codex.returncode, 0, r_codex.stderr)
         self.assertIn(f'base_url = "http://127.0.0.1:{c.port}/v1"', r_codex.stdout)
 
-        r_oc = c.cli("opencode", "--raw")
+        r_oc = c.cli("connect", "opencode", "--raw")
         self.assertEqual(r_oc.returncode, 0, r_oc.stderr)
-        self.assertEqual(json.loads(r_oc.stdout)["model"], f"basalt/{MODEL_ID}")
+        oc_doc = json.loads(r_oc.stdout)
+        self.assertEqual(oc_doc["model"], f"basalt/{MODEL_ID}")
+        self.assertEqual(oc_doc["provider"]["basalt"]["options"]["apiKey"], "{env:OPENAI_API_KEY}")
 
         r_connect = c.cli("connect")
         self.assertEqual(r_connect.returncode, 0)
@@ -421,15 +427,18 @@ class ProxyLifecycleTests(unittest.TestCase):
             f.write(b"\x89PNG\r\n\x1a\nfake")
         self.assertEqual(c.cli("ask", "--max", "--image", img, "describe", input_text="one word").stdout.strip(), "ok")
 
-        # Restart G4 in-place via `restart -d --no-notify` -> applies solo-fast (parallel=1)
+        # Restart G4 in-place via `restart -d --no-notify` -> applies solo-fast (parallel=1) AND syncs serve.lock!
         r_rst = c.cli("restart", "-d", "--no-notify")
         self.assertEqual(r_rst.returncode, 0, r_rst.stdout + r_rst.stderr)
         boot_env2 = json.loads(read(c.res("boot_check.json")))["env"]
         self.assertEqual(boot_env2["PARALLEL"], "1")
         self.assertEqual(boot_env2["ROUTING_MODE"], "fast")
+        # Regression check: subsequent `up -d` recognizes updated serve.lock cold_signature
+        r_up2 = c.cli("up", "-d", "--no-notify")
+        self.assertEqual(r_up2.returncode, 0, r_up2.stdout + r_up2.stderr)
 
         # Stop G4 -> verify usage.jsonl ledger recorded both sessions!
-        r_down = c.cli("stop")
+        r_down = c.cli("down")
         self.assertEqual(r_down.returncode, 0, r_down.stdout + r_down.stderr)
         c.wait(lambda: not procs_with(c.dir, "--detached"), 10)
         c.assert_all_stopped(self)

@@ -158,7 +158,7 @@ class ColabConfig:
     max_hours: float = 6.0
     min_balance: float = 5.0
     wait_gpu: bool = False
-    wait_gpu_min: float = 0.0
+    wait_gpu_min: float = 120.0
     orphan_boot_s: float = 30.0
 
 
@@ -702,56 +702,16 @@ def diff_hot_cold(old: Config, new: Config) -> tuple[list[str], list[str]]:
     return hot, cold
 
 
-_SHORT_KEY_MAP = {
-    "session": "colab.session",
-    "idle_min": "colab.idle_min",
-    "idle": "colab.idle_min",
-    "max_hours": "colab.max_hours",
-    "min_balance": "colab.min_balance",
-    "wait_gpu": "colab.wait_gpu",
-    "wait_gpu_min": "colab.wait_gpu_min",
-    "orphan_boot_s": "colab.orphan_boot_s",
-    "bind": "proxy.bind",
-    "port": "proxy.port",
-    "strict_model": "proxy.strict_model",
-    "quant": "basalt.quant",
-    "pack_url": "basalt.pack_url",
-    "ref": "basalt.ref",
-    "model_alias": "basalt.model_alias",
-    "max_context": "basalt.max_context",
-    "context": "basalt.max_context",
-    "parallel": "basalt.parallel",
-    "kv": "basalt.kv",
-    "vision": "basalt.vision",
-    "spec": "basalt.spec",
-    "draft_experts": "basalt.draft_experts",
-    "routing_mode": "basalt.routing_mode",
-    "routing": "basalt.routing_mode",
-    "pool_workers": "basalt.pool_workers",
-    "engram_cache_mib": "basalt.engram_cache_mib",
-    "conv_cache_mib": "basalt.conv_cache_mib",
-    "vram_reserve_mib": "basalt.vram_reserve_mib",
-    "resident_budget_gib": "basalt.resident_budget_gib",
-    "answer_room": "basalt.answer_room",
-    "uncensor": "basalt.uncensor",
-    "uncensor_scale": "basalt.uncensor_scale",
-    "effort": "basalt.effort",
-    "workers": "basalt.workers",
-    "temperature": "basalt.sampling.temperature",
-    "top_p": "basalt.sampling.top_p",
-    "top_k": "basalt.sampling.top_k",
-    "min_p": "basalt.sampling.min_p",
-    "presence_penalty": "basalt.sampling.presence_penalty",
-}
-
-
 def resolve_config_key(key: str) -> str:
+    """Resolves a full dotted key (e.g. basalt.effort) or unique leaf field name (e.g. effort)."""
     k = key.strip().lower().replace("-", "_")
-    k = _SHORT_KEY_MAP.get(k, k)
     flat = _flatten(Config().to_dict())
-    if k not in flat:
-        raise ConfigError(f"unknown config key {key!r} (valid keys: {', '.join(sorted(flat))})")
-    return k
+    if k in flat:
+        return k
+    matches = [full for full in flat if full.rsplit(".", 1)[-1] == k]
+    if len(matches) == 1:
+        return matches[0]
+    raise ConfigError(f"unknown config key {key!r} (valid keys: {', '.join(sorted(flat))})")
 
 
 def get_config_value(cfg: Config, key: str) -> tuple[str, Any]:

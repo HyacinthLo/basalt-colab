@@ -79,22 +79,20 @@ class ClientEndpoint:
 
 
 def dsh_effort_default(effort: str) -> str:
-    """Maps Basalt reasoning effort (low|high|max|1-100) to DeepSeek Harness picker levels."""
+    """Maps Basalt effort (low|high|max|1-100) to DeepSeek-V4.1's native levels: off, low (=50), high (=75), max (=100)."""
     e = str(effort).strip().lower()
-    if e in ("low", "medium", "high", "max"):
+    if e in ("low", "high", "max"):
         return e
-    if e == "none":
+    if e in ("none", "off"):
         return "off"
     if e.isdigit():
         n = int(e)
-        if n <= 30:
-            return "low"
         if n <= 60:
-            return "medium"
+            return "low"
         if n <= 85:
             return "high"
         return "max"
-    return "high"
+    return "low"
 
 
 def env_vars(ep: ClientEndpoint) -> tuple[tuple[str, str], ...]:
@@ -122,13 +120,17 @@ def format_env_lines(pairs: tuple[tuple[str, str], ...], *, powershell: bool = F
     return "\n".join(lines)
 
 
-def opencode_config_dict(ep: ClientEndpoint, *, inline_key: bool = False) -> dict[str, Any]:
+def opencode_config_dict(ep: ClientEndpoint, *, key_mode: str = "env") -> dict[str, Any]:
+    """Builds opencode.json dict. key_mode='file' references state/api_key; 'env' uses {env:OPENAI_API_KEY} (safe to share/commit)."""
     image = (
         {"attachment": True, "modalities": {"input": ["text", "image"], "output": ["text"]}}
         if ep.vision_enabled
         else {}
     )
-    api_key_val = ep.api_key if (inline_key or not ep.key_file) else "{file:%s}" % ep.key_file.replace("\\", "/")
+    if key_mode == "file" and ep.key_file:
+        api_key_val = "{file:%s}" % ep.key_file.replace("\\", "/")
+    else:
+        api_key_val = "{env:OPENAI_API_KEY}"
     models = {
         ep.model: dict(
             {
@@ -189,7 +191,6 @@ def dsh_patch_yaml(ep: ClientEndpoint) -> str:
         "            reasoningEfforts:",
         "              off: none",
         "              low: low",
-        "              medium: medium",
         "              high: high",
         "              max: max",
     ]
@@ -249,14 +250,14 @@ def client_bundle(ep: ClientEndpoint, client: str) -> dict[str, Any]:
         return {
             "id": "dsh",
             "label": "DeepSeek Harness",
-            "subtitle": "OpenAI-compatible `llm-pi-ai` provider with reasoning effort levels & Dynamic Vision",
+            "subtitle": "OpenAI-compatible `llm-pi-ai` provider with DeepSeek-V4.1 efforts (off/low/high/max) & Dynamic Vision",
             "file_hint": "~/.dsh/profiles/web/cordis.patch.yml (or $DSH_HOME/profiles/<profile>/cordis.patch.yml)",
             "snippet_lang": "yaml",
             "snippet": dsh_patch_yaml(ep),
             "env_sh": format_env_lines(env_pairs, powershell=False),
             "env_ps": format_env_lines(env_pairs, powershell=True),
             "run_hint": f"BASALT_API_KEY={shlex.quote(ep.api_key)} npx @deepseek-ai/dsh web",
-            "notes": "Tip: put BASALT_API_KEY=... in ~/.dsh/.env so dsh picks it up automatically; reload happens on the next request without restarting dsh.",
+            "notes": "Tip: put BASALT_API_KEY=... in ~/.dsh/.env so dsh picks it up automatically; dsh reloads cordis.patch.yml on the next request.",
         }
 
     if c == "claude":
@@ -301,22 +302,19 @@ def client_bundle(ep: ClientEndpoint, client: str) -> dict[str, Any]:
         }
 
     if c == "opencode":
-        doc = opencode_config_dict(ep, inline_key=True)
-        env_pairs = (
-            ("OPENAI_BASE_URL", ep.openai_base_url),
-            ("OPENAI_API_KEY", ep.api_key),
-        )
+        doc = opencode_config_dict(ep, key_mode="env")
+        env_pairs = (("OPENAI_API_KEY", ep.api_key),)
         return {
             "id": "opencode",
             "label": "OpenCode",
             "subtitle": "OpenAI-compatible provider with interleaved reasoning_content & vision",
-            "file_hint": "~/.config/opencode/opencode.json (or project opencode.json)",
+            "file_hint": "~/.config/opencode/opencode.json (uses {env:OPENAI_API_KEY}, safe for git)",
             "snippet_lang": "json",
             "snippet": json.dumps(doc, indent=2) + "\n",
             "env_sh": format_env_lines(env_pairs, powershell=False),
             "env_ps": format_env_lines(env_pairs, powershell=True),
-            "run_hint": "opencode",
-            "notes": "Use `basalt-colab connect opencode --write` to update basalt-colab's managed opencode.json directly.",
+            "run_hint": 'eval "$(basalt-colab env)" && opencode',
+            "notes": "Or run `basalt-colab connect opencode --write` to update the managed file and launch with OPENCODE_CONFIG=...",
         }
 
     # Generic OpenAI / Cursor / Cherry Studio

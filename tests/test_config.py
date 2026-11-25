@@ -414,20 +414,22 @@ class ConfigAndUnitTests(unittest.TestCase):
         from basalt_colab import clients
         from basalt_colab.cli import _parse_wait_gpu_args, parse_ask_options
 
-        # Default answer_room is 'auto' (matching Basalt upstream); quant remains ud-iq1_m
+        # Default answer_room is 'auto' (matching Basalt upstream); quant remains ud-iq1_m; wait_gpu_min defaults to 120m
         cfg = config.Config()
         self.assertEqual(cfg.basalt.quant, "ud-iq1_m")
         self.assertEqual(cfg.basalt.answer_room, "auto")
-        self.assertEqual(cfg.colab.wait_gpu_min, 0.0)
+        self.assertEqual(cfg.colab.wait_gpu_min, 120.0)
         self.assertEqual(cfg.boot_vars(manifest=manifest.load_manifest(self.p.vm_dir))["ANSWER_ROOM"], "auto")
 
-        # config get/set with short & dotted keys
+        # config get/set with auto-reflected leaf names & dotted keys
         k, v = config.get_config_value(cfg, "answer_room")
         self.assertEqual((k, v), ("basalt.answer_room", "auto"))
         cfg2, k2, v2 = config.set_config_value(cfg, "answer_room", "2048")
         self.assertEqual((k2, v2), ("basalt.answer_room", "2048"))
         cfg3, k3, v3 = config.set_config_value(cfg2, "wait_gpu_min", "45")
         self.assertEqual((k3, v3), ("colab.wait_gpu_min", 45.0))
+        cfg4, k4, v4 = config.set_config_value(cfg3, "temperature", "0.7")
+        self.assertEqual((k4, v4), ("basalt.sampling.temperature", 0.7))
         hot, cold = config.diff_hot_cold(cfg2, cfg3)
         self.assertEqual((hot, cold), (["colab.wait_gpu_min"], []))
         with self.assertRaises(config.ConfigError):
@@ -440,7 +442,7 @@ class ConfigAndUnitTests(unittest.TestCase):
         self.assertEqual(_parse_wait_gpu_args(["--wait-gpu"]), (True, None))
         self.assertEqual(_parse_wait_gpu_args(["--wait-gpu", "--detach"]), (True, None))
         self.assertEqual(_parse_wait_gpu_args(["--wait-gpu", "60"]), (True, 60.0))
-        self.assertEqual(_parse_wait_gpu_args(["--wait-gpu=90"]), (True, 90.0))
+        self.assertEqual(_parse_wait_gpu_args(["--wait-gpu=0"]), (True, 0.0))
 
         # parse_ask_options extended flags
         opts = parse_ask_options(["--no-think", "--hide-think", "--max-tokens", "512", "--system", "be brief", "hi"])
@@ -465,6 +467,9 @@ class ConfigAndUnitTests(unittest.TestCase):
         self.assertIn("supportsDeveloperRole: false", dsh_b["snippet"])
         self.assertIn("maxTokensField: max_tokens", dsh_b["snippet"])
         self.assertIn("off: none", dsh_b["snippet"])
+        self.assertIn("reasoning: low", dsh_b["snippet"])
+        # Regression check: Basalt DeepSeek-V4.1 rejects 'medium'
+        self.assertNotIn("medium", dsh_b["snippet"])
         self.assertIn("input: [text, image]", dsh_b["snippet"])
         self.assertIn("id: DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS", dsh_b["snippet"])
 
@@ -474,13 +479,15 @@ class ConfigAndUnitTests(unittest.TestCase):
         self.assertIn("input: [text]", clients.dsh_patch_yaml(ep_nv))
         self.assertNotIn("image", clients.dsh_patch_yaml(ep_nv))
 
-        # Claude, Codex, OpenCode snippets
+        # Claude, Codex, OpenCode snippets (OpenCode snippet must NOT embed plaintext key)
         self.assertIn("ANTHROPIC_BASE_URL", clients.client_bundle(ep, "claude")["snippet"])
         self.assertIn('wire_api = "responses"', clients.client_bundle(ep, "codex")["snippet"])
         oc = json.loads(clients.client_bundle(ep, "opencode")["snippet"])
         self.assertEqual(oc["model"], "basalt/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS")
-        self.assertEqual(clients.dsh_effort_default("50"), "medium")
+        self.assertEqual(oc["provider"]["basalt"]["options"]["apiKey"], "{env:OPENAI_API_KEY}")
+        self.assertEqual(clients.dsh_effort_default("50"), "low")
         self.assertEqual(clients.dsh_effort_default("high"), "high")
+        self.assertEqual(clients.dsh_effort_default("95"), "max")
         self.assertEqual(clients.dsh_effort_default("20"), "low")
 
 

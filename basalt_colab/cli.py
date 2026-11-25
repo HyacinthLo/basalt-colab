@@ -72,7 +72,6 @@ from basalt_colab.config import (
 )
 from basalt_colab.lifecycle import UPSTREAM_TIMEOUT, mmss, run_watchdog, stop_cloud
 from basalt_colab.manifest import Manifest, load_manifest
-from basalt_colab.notify import notify
 from basalt_colab.paths import IS_WIN, Paths, get_paths, migrate_legacy_state
 from basalt_colab.proxy import serve, write_opencode_config
 from basalt_colab.usage import UsageLedger
@@ -80,44 +79,39 @@ from basalt_colab.usage import UsageLedger
 USAGE = f"""basalt-colab {__version__} — DeepSeek-V4.1-Flash on Google Colab G4 via Basalt v0.5.7
 
 usage: basalt-colab COMMAND [options]
-  up | start [opts]                    start G4 (~1.5-2 min), print endpoints & live status
-     -d, --detach, --no-watch          return immediately after G4 is ready (skip live watch view)
+  up [opts]                            start G4 (~1.5-2 min), print endpoints & live status
+     -d, --detach, --no-watch          return immediately after G4 is ready (skip watch view)
      --quant Q                         ud-iq1_m (default, 100% RAM) | ud-iq2_xxs (-13% KLD) | ud-q2_k_xl | custom
      --pack-url URL                    override .basalt URL (required for ud-q2_k_xl / custom)
      --profile P                       balanced (default: 2 slots, route balanced) | solo-fast (1 slot, route fast) | exact
-     --routing-mode M                  balanced (default, KLD +0.0005, +20-37% speed) | exact (lossless) | fast
-     --parallel N                      concurrent slots (1-4; default 2, use 1 for lowest solo latency)
-     --uncensor-scale S                refusal-removal strength multiplier (0.0=off, 1.0=default, 1.15-1.25=stronger)
-     --wait-gpu [MIN]                  retry G4 allocation until ready (0/omitted = unlimited, or cap at MIN minutes)
-     --no-notify                       disable terminal bell and OS desktop notification on ready/failure
+     --routing-mode M                  balanced (default, +20-37% speed) | exact (lossless) | fast
+     --parallel N                      concurrent slots (1-4; default 2)
+     --uncensor-scale S                refusal-removal multiplier (0.0=off, 1.0=default, 1.15-1.25=stronger)
+     --wait-gpu [MIN]                  retry G4 allocation (default 120m; 0 = unlimited; fail-fast on auth/quota errors)
+     --no-notify                       disable terminal bell on ready/failure
      --basalt-ref REF                  build an upstream Basalt tag/branch/SHA from source
   restart [up opts]                    stop current G4, reload saved config.toml, and boot fresh (keeps proxy)
-  down | stop [--all]                  stop G4, wipe VM secrets, record CU ledger, stop detached proxy
+  down [--all]                         stop G4, wipe VM secrets, record CU ledger, stop detached proxy
   status                               Control Console & Web UI URLs, Basalt telemetry, billing ledger, Colab balance
   watch                                live terminal status bar (tok/s, VRAM hit %, idle countdown, CU cost)
-  console [--no-open]                  ensure local proxy is running and open the Unified Control Console (/_console)
-  config [subcmd]                      inspect or edit config.toml (hot-reloads live!)
-     show | path | wizard              show TOML, print path, or run interactive wizard
-     get <key>                         print value (e.g. quant, effort, idle_min, basalt.answer_room)
-     set <key> <value>                 update key, save config.toml, and hot-reload running proxy
-     profile <name>                    apply balanced | solo-fast | exact and save
-  connect [CLIENT] [opts]              generate ready-to-paste config for dsh | claude | codex | opencode | openai
-     --raw | --json | --sh | --powershell | --write (for opencode)
-  dsh | claude | codex | opencode      shortcuts for `basalt-colab connect <client>` (pure config generation)
-  env [--sh|--powershell|--json]       print live env exports (OPENAI_*, ANTHROPIC_*, BASALT_API_KEY)
-  ask [opts] TEXT                      stream an answer (--effort VAL, --max, --no-think, --hide-think, --max-tokens N, --system S, --image PATH)
-  chat [opts]                          interactive multi-turn terminal chat REPL (/effort, /clear, /image, /system, /exit)
-  logs [-f|--follow] [--local|--vm]    local proxy log plus VM boot timeline, Basalt server & engine logs
+  console [--no-open]                  ensure local proxy is running and open the Control Console (/_console)
+  config [show|path|wizard|get|set|profile]
+                                       inspect or update config.toml (hot-reloads live!)
+  connect [CLIENT] [opts]              generate config for dsh | claude | codex | opencode | openai
+                                       (--raw | --json | --sh | --powershell | --write)
+  env [--sh|--powershell|--json]       print live-synced OPENAI_*, ANTHROPIC_*, BASALT_API_KEY exports
+  ask [opts] TEXT                      one-shot stream (--effort VAL, --max, --no-think, --hide-think, --max-tokens N, --image PATH)
+  logs [-f|--follow] [--local|--vm]    local proxy log (-f live tail) plus VM boot timeline, Basalt server & engine logs
   doctor                               diagnose Python, OpenSSH, Colab CLI, OAuth balance, config.toml, VM payload & port
   setup                                install Colab CLI, complete Google OAuth, create keys & migrate legacy state/
   serve [--detached]                   run the local proxy in the foreground (Ctrl+C stops the GPU too)
 
 env: BASALT_COLAB_HOME, BASALT_COLAB_PORT, BASALT_COLAB_BIND, BASALT_COLAB_QUANT, BASALT_COLAB_PACK_URL,
-     BASALT_COLAB_PROFILE (balanced|solo-fast|exact), BASALT_COLAB_ROUTING_MODE (balanced|exact|fast),
-     BASALT_COLAB_ANSWER_ROOM (auto|0..65536), BASALT_COLAB_UNCENSOR, BASALT_COLAB_UNCENSOR_SCALE,
-     BASALT_COLAB_IDLE_MIN, BASALT_COLAB_MAX_HOURS, BASALT_COLAB_WAIT_GPU, BASALT_COLAB_WAIT_GPU_MIN,
-     BASALT_COLAB_NO_NOTIFY, BASALT_COLAB_REF, BASALT_COLAB_MAX_CONTEXT (32K..1M), BASALT_COLAB_PARALLEL (1-4),
-     BASALT_COLAB_KV (fp8|fp16), BASALT_COLAB_EFFORT, BASALT_COLAB_STRICT_MODEL, HF_TOKEN, BASALT_COLAB_YES=1"""
+     BASALT_COLAB_PROFILE, BASALT_COLAB_ROUTING_MODE, BASALT_COLAB_ANSWER_ROOM (auto|0..65536),
+     BASALT_COLAB_UNCENSOR, BASALT_COLAB_UNCENSOR_SCALE, BASALT_COLAB_IDLE_MIN, BASALT_COLAB_MAX_HOURS,
+     BASALT_COLAB_WAIT_GPU, BASALT_COLAB_WAIT_GPU_MIN, BASALT_COLAB_NO_NOTIFY, BASALT_COLAB_REF,
+     BASALT_COLAB_MAX_CONTEXT (32K..1M), BASALT_COLAB_PARALLEL (1-4), BASALT_COLAB_KV (fp8|fp16),
+     BASALT_COLAB_EFFORT, BASALT_COLAB_STRICT_MODEL, HF_TOKEN, BASALT_COLAB_YES=1"""
 
 TTY, COLOR = [False], [False]
 
@@ -137,6 +131,16 @@ def init_console() -> None:
         except (AttributeError, OSError):
             return
     COLOR[0] = True
+
+
+def ring_bell(enabled: bool = True) -> None:
+    if not enabled or not TTY[0] or os.environ.get("BASALT_COLAB_NO_NOTIFY") in ("1", "true", "yes"):
+        return
+    try:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
+    except OSError:
+        pass
 
 
 def paint(text: str, *styles: str) -> str:
@@ -388,7 +392,7 @@ def endpoint_info(paths: Paths, cfg: Config, manifest: Manifest, port: int, bal:
         print(f"  {name:<10} {paint(value, 'bold')}")
     print()
     for name, value in (
-        ("Try it", f'{me_cmd} ask "Hello!"   /   {me_cmd} chat'),
+        ("Try it", f'{me_cmd} ask "Hello!"'),
         ("Console", f"{me_cmd} console"),
         ("Agents", f"{me_cmd} connect [dsh|claude|codex|opencode|openai]"),
         ("Shell env", f'eval "$({me_cmd} env)"'),
@@ -687,14 +691,14 @@ def cmd_up(
     conn.close()
     if kind != "READY":
         err_msg = rest or "the local endpoint closed the connection"
-        notify("basalt-colab: G4 Start Failed", err_msg[:140], enabled=do_notify)
+        ring_bell(do_notify)
         print(paint("Start failed: " + err_msg, "red"))
         sys.exit(f"Details: {cli_name()} logs")
     secs = int(rest or 0)
     ready_line = f"{glyph('●', '*')} The GPU is already running" if secs < 2 else f"\n{glyph('✓', '+')} Ready after {mmss(secs)}"
     print(paint(ready_line, "bold", "green"))
     if secs >= 2:
-        notify("basalt-colab: G4 Ready", f"{want_cfg.basalt.effective_model_alias} ready after {mmss(secs)}", enabled=do_notify)
+        ring_bell(do_notify)
     endpoint_info(paths, want_cfg, manifest, held["port"], bal)
     if not detach:
         watch_loop(paths, want_cfg, held["port"])
@@ -984,28 +988,42 @@ def read_piped_stdin(has_prompt: bool) -> str:
     return sys.stdin.read().strip()
 
 
-def stream_chat_turn(
-    paths: Paths,
-    cfg: Config,
-    port: int,
-    model: str,
-    messages: list[dict[str, Any]],
-    *,
-    effort: str | None = None,
-    max_tokens: int | None = None,
-    hide_think: bool = False,
-) -> tuple[str, str]:
-    """Streams one chat completion turn, returning (assistant_content, reasoning_content)."""
+def cmd_ask(paths: Paths, cfg: Config, words: list[str]) -> None:
+    held = serve_running(paths)
+    if not held:
+        sys.exit(f"The endpoint is not running. Start it first: {cli_name()} up")
+    port = int(held["port"])
+    live_st = fetch_live_status(paths, cfg, port)
+    model = str((live_st or {}).get("model") or cfg.basalt.effective_model_alias)
+    opts = parse_ask_options(words)
+    prompt = opts["prompt"]
+    images = opts["images"]
+    piped = read_piped_stdin(bool(prompt or images))
+    if piped and prompt:
+        prompt = piped + "\n\n" + prompt
+    elif piped:
+        prompt = piped
+    elif not prompt:
+        prompt = "Describe this image." if images else "Hello!"
+    content: Any = (
+        [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": encode_image_url(p)}} for p in images]
+        if images
+        else prompt
+    )
+    messages: list[dict[str, Any]] = []
+    if opts["system"]:
+        messages.append({"role": "system", "content": opts["system"]})
+    messages.append({"role": "user", "content": content})
     body: dict[str, Any] = {
         "model": model,
         "stream": True,
         "stream_options": {"include_usage": True},
         "messages": messages,
     }
-    if effort:
-        body["reasoning_effort"] = effort
-    if max_tokens is not None:
-        body["max_tokens"] = max_tokens
+    if opts["effort"]:
+        body["reasoning_effort"] = opts["effort"]
+    if opts["max_tokens"] is not None:
+        body["max_tokens"] = opts["max_tokens"]
 
     t_req = time.time()
     conn, r = http_call(
@@ -1023,9 +1041,8 @@ def stream_chat_turn(
         sys.exit(f"HTTP {r.status}: {err_body}")
 
     live, part, timings, usage_obj, t_first = Live(), None, None, None, None
-    out_text: list[str] = []
-    think_text: list[str] = []
-    show_think = TTY[0] and not hide_think
+    got_answer, got_think = False, False
+    show_think = TTY[0] and not opts["hide_think"]
 
     for raw in r:
         line = raw.decode("utf-8", "replace").strip()
@@ -1050,11 +1067,11 @@ def stream_chat_turn(
                 if t_first is None:
                     t_first = time.time()
                 if kind == "think":
-                    think_text.append(text)
+                    got_think = True
                     if not show_think:
                         continue
                 else:
-                    out_text.append(text)
+                    got_answer = True
                 live.clear()
                 if kind == "think" and part is None:
                     sys.stdout.write(paint(f"{glyph('╭─', '---')} thinking\n", "dim"))
@@ -1069,9 +1086,7 @@ def stream_chat_turn(
     if part == "think" and show_think:
         sys.stdout.write(paint(f"\n{glyph('╰─', '---')}", "dim"))
     print()
-    answer = "".join(out_text)
-    reasoning = "".join(think_text)
-    if not answer and reasoning and TTY[0]:
+    if not got_answer and got_think and TTY[0]:
         print(paint("  (thinking finished without final answer — try a larger --max-tokens or --no-think)", "yellow"))
     if TTY[0]:
         if timings and timings.get("predicted_n"):
@@ -1081,152 +1096,6 @@ def stream_chat_turn(
             dec_s = max(0.001, t_end - t_first)
             ttft = max(0.0, t_first - t_req)
             print(paint(f"  {model}: {n} tokens · TTFT {ttft:.2f}s · {n / dec_s:.1f} tok/s", "dim"))
-    return answer, reasoning
-
-
-def _ensure_proxy_for_chat(paths: Paths, cfg: Config) -> tuple[int, str]:
-    if not paths.key_file.exists():
-        sys.exit(f"missing {paths.key_file}; run: {cli_name()} setup")
-    held = ensure_detached_proxy(paths)
-    port = int(held["port"])
-    live = fetch_live_status(paths, cfg, port)
-    model = str((live or {}).get("model") or cfg.basalt.effective_model_alias)
-    return port, model
-
-
-def cmd_ask(paths: Paths, cfg: Config, words: list[str]) -> None:
-    opts = parse_ask_options(words)
-    port, model = _ensure_proxy_for_chat(paths, cfg)
-    prompt = opts["prompt"]
-    images = opts["images"]
-    piped = read_piped_stdin(bool(prompt or images))
-    if piped and prompt:
-        prompt = piped + "\n\n" + prompt
-    elif piped:
-        prompt = piped
-    elif not prompt:
-        prompt = "Describe this image." if images else "Hello!"
-    content: Any = (
-        [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": encode_image_url(p)}} for p in images]
-        if images
-        else prompt
-    )
-    messages: list[dict[str, Any]] = []
-    if opts["system"]:
-        messages.append({"role": "system", "content": opts["system"]})
-    messages.append({"role": "user", "content": content})
-    stream_chat_turn(
-        paths,
-        cfg,
-        port,
-        model,
-        messages,
-        effort=opts["effort"],
-        max_tokens=opts["max_tokens"],
-        hide_think=opts["hide_think"],
-    )
-
-
-def cmd_chat(paths: Paths, cfg: Config, words: list[str]) -> None:
-    opts = parse_ask_options(words)
-    port, model = _ensure_proxy_for_chat(paths, cfg)
-    effort: str | None = opts["effort"]
-    max_tokens: int | None = opts["max_tokens"]
-    hide_think: bool = opts["hide_think"]
-    system_prompt: str | None = opts["system"]
-    pending_images: list[str] = list(opts["images"])
-    history: list[dict[str, Any]] = []
-
-    print(paint(f"basalt-colab chat · {model}", "bold") + paint("  (/help for commands, Ctrl+D or /exit to quit)", "dim"))
-    while True:
-        try:
-            user_text = input(f"\n{paint('you ›', 'cyan', 'bold')} ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if not user_text:
-            continue
-        if user_text.startswith("/"):
-            parts = user_text.split(None, 1)
-            cmd = parts[0].lower()
-            arg = parts[1].strip() if len(parts) > 1 else ""
-            if cmd in ("/exit", "/quit", "/q"):
-                return
-            if cmd == "/help":
-                print("  /clear            reset conversation history")
-                print("  /effort <val>     set effort (low | 50 | high | max | none | default)")
-                print("  /think            toggle hiding thinking tokens")
-                print("  /system <text>    set or clear system prompt")
-                print("  /image <path>     attach image to the next message")
-                print("  /history          show turn count")
-                print("  /exit             quit chat")
-                continue
-            if cmd == "/clear":
-                history.clear()
-                pending_images.clear()
-                print(paint("  Conversation cleared.", "dim"))
-                continue
-            if cmd == "/think":
-                hide_think = not hide_think
-                print(paint(f"  Thinking display: {'hidden' if hide_think else 'visible'}", "dim"))
-                continue
-            if cmd == "/effort":
-                if not arg or arg in ("default", "reset"):
-                    effort = None
-                    print(paint("  Effort reset to server default.", "dim"))
-                elif arg.lower() in ("none", "off"):
-                    effort = "none"
-                    print(paint("  Thinking disabled (effort=none).", "dim"))
-                else:
-                    parsed = effort_value(arg)
-                    if not parsed:
-                        print(paint("  Invalid effort (use 1-100, low, high, max, none).", "red"))
-                    else:
-                        effort = parsed
-                        print(paint(f"  Effort set to {effort}.", "dim"))
-                continue
-            if cmd == "/system":
-                system_prompt = arg or None
-                print(paint("  System prompt updated." if system_prompt else "  System prompt cleared.", "dim"))
-                continue
-            if cmd == "/image":
-                if not arg or not os.path.isfile(arg):
-                    print(paint(f"  Image not found: {arg or '(empty)'}", "red"))
-                else:
-                    pending_images.append(arg)
-                    print(paint(f"  Attached {arg} (will send with next message).", "dim"))
-                continue
-            if cmd == "/history":
-                print(paint(f"  {len(history) // 2} turns in context.", "dim"))
-                continue
-            print(paint(f"  Unknown command {cmd!r}. Type /help.", "red"))
-            continue
-
-        content: Any = (
-            [{"type": "text", "text": user_text}] + [{"type": "image_url", "image_url": {"url": encode_image_url(p)}} for p in pending_images]
-            if pending_images
-            else user_text
-        )
-        pending_images.clear()
-        msgs: list[dict[str, Any]] = []
-        if system_prompt:
-            msgs.append({"role": "system", "content": system_prompt})
-        msgs.extend(history)
-        msgs.append({"role": "user", "content": content})
-        print()
-        answer, _ = stream_chat_turn(
-            paths,
-            cfg,
-            port,
-            model,
-            msgs,
-            effort=effort,
-            max_tokens=max_tokens,
-            hide_think=hide_think,
-        )
-        history.append({"role": "user", "content": content})
-        if answer:
-            history.append({"role": "assistant", "content": answer})
 
 
 def client_env_vars(paths: Paths, cfg: Config, port: int) -> tuple[tuple[str, str], ...]:
@@ -1270,7 +1139,7 @@ def cmd_connect(paths: Paths, cfg: Config, target: str | None, args: list[str]) 
             print(f"  {paint(glyph('✓', '+'), 'green')} Wrote {paths.opencode_file}")
             print(f"  Run: {paint(f'OPENCODE_CONFIG={shlex.quote(str(paths.opencode_file))} opencode', 'cyan')}")
             return
-        sys.exit(f"--write is currently supported for opencode; for {cid}, copy or pipe `{me_cmd} connect {cid} --raw` into {bundle['file_hint']}")
+        sys.exit(f"--write is supported for opencode; for {cid}, copy or pipe `{me_cmd} connect {cid} --raw` into {bundle['file_hint']}")
 
     if as_json:
         print(json.dumps(bundle, indent=2))
@@ -1372,8 +1241,7 @@ def main(argv: list[str] | None = None) -> None:
         run_watchdog(paths, args[1], float(args[2]), float(args[3]), float(args[4]), float(args[5]))
         return
     if cmd in ("help", "-h", "--help") or (
-        cmd not in ("ask", "chat")
-        and any(a in ("-h", "--help") for a in args[1:])
+        cmd != "ask" and any(a in ("-h", "--help") for a in args[1:])
     ):
         print(USAGE)
         return
@@ -1392,7 +1260,7 @@ def main(argv: list[str] | None = None) -> None:
             serve(paths, cfg, manifest, detached="--detached" in args[1:])
         elif cmd == "setup":
             cmd_setup(paths, cfg, manifest)
-        elif cmd in ("up", "start", "restart"):
+        elif cmd in ("up", "restart"):
             sub_args = args[1:]
             raw_scale = _extract_flag_val(sub_args, "--uncensor-scale")
             try:
@@ -1424,7 +1292,7 @@ def main(argv: list[str] | None = None) -> None:
                 do_notify=do_notify,
                 restart=(cmd == "restart"),
             )
-        elif cmd in ("down", "stop"):
+        elif cmd == "down":
             cmd_down(paths, cfg, manifest, everything="--all" in args[1:])
         elif cmd == "status":
             cmd_status(paths, cfg)
@@ -1438,14 +1306,10 @@ def main(argv: list[str] | None = None) -> None:
             cmd_logs(paths, cfg, args[1:])
         elif cmd == "ask":
             cmd_ask(paths, cfg, args[1:])
-        elif cmd == "chat":
-            cmd_chat(paths, cfg, args[1:])
         elif cmd == "connect":
             rest = [a for a in args[1:] if not a.startswith("-")]
             flags = [a for a in args[1:] if a.startswith("-")]
             cmd_connect(paths, cfg, rest[0] if rest else None, flags)
-        elif cmd in ("dsh", "harness", "claude", "codex", "opencode"):
-            cmd_connect(paths, cfg, cmd, args[1:])
         elif cmd == "env":
             cmd_env(paths, cfg, args[1:])
         elif cmd == "doctor":
@@ -1454,6 +1318,6 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(USAGE)
     except KeyboardInterrupt:
         print()
-        if cmd in ("up", "start", "restart") and serve_running(paths):
+        if cmd in ("up", "restart") and serve_running(paths):
             print(f"Interrupted. The GPU may keep starting in the background. Stop it with: {cli_name()} down")
         sys.exit(130)

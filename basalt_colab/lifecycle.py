@@ -572,6 +572,10 @@ class Manager:
             max_attempts = 3
         delay_scale = min(1.0, poll_interval() / 15.0)
         out = ""
+        permanent_err_re = re.compile(
+            r"not logged in|oauth|unauthenticated|unauthorized|401|403|forbidden|insufficient.*compute|no compute units|unknown flag|invalid argument",
+            re.I,
+        )
         attempt = 0
         while True:
             rc, out = colab_run(["new", "-s", session, "--gpu", "G4"], 300)
@@ -581,9 +585,10 @@ class Manager:
             attempt += 1
             self.logger.log(f"allocation attempt {attempt} failed: {out.strip()[-300:]}")
             self._check_stop()
+            is_permanent = bool(permanent_err_re.search(out))
             hit_attempts = max_attempts is not None and attempt >= max_attempts
             hit_deadline = deadline is not None and time.time() >= deadline
-            if hit_attempts or hit_deadline:
+            if is_permanent or hit_attempts or hit_deadline:
                 brief = " ".join(re.sub(r"[╭╮╰╯─│]+", " ", out).split())[-200:]
                 raise StartError("no G4 GPU from Colab (none free, or plan has no compute units): " + brief)
             wait_s = min(60.0, 10.0 * (2 ** min(attempt - 1, 3))) * max(0.02, delay_scale)

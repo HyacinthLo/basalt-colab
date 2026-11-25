@@ -313,6 +313,20 @@ def take_lock(paths: Paths, info: dict[str, Any]) -> dict[str, Any] | None:
     return read_lock(paths) or {"pid": None, "busy": True}
 
 
+def update_lock(paths: Paths, updates: dict[str, Any]) -> None:
+    """Atomically updates metadata in serve.lock when owned by the current process."""
+    held = read_lock(paths)
+    if not held or held.get("pid") != os.getpid():
+        return
+    held.update(updates)
+    tmp = paths.lock_file.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(held), encoding="utf-8")
+        os.replace(tmp, paths.lock_file)
+    except OSError:
+        remove_file(tmp)
+
+
 def release_lock(paths: Paths) -> None:
     held = read_lock(paths)
     if held and held.get("pid") == os.getpid():
