@@ -109,7 +109,7 @@ Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
 | --- | --- | --- | --- | --- |
 | **`ud-iq1_m`** *(default)* | 260 GB | **`ram+ram`** (100% RAM+VRAM) | KLD `0.2779` · Top-1 `83.88%` | Fastest (`150–190+ tok/s`), zero SSD I/O |
 | **`ud-iq2_xxs`** | 285 GB | **`ram+hybrid`** (Experts 100% RAM+VRAM; **~78 GiB Engram in RAM** + **~25 GiB parallel SSD tail**) | KLD `0.2408` (**-13.4%**) · Top-1 `85.15%` | Official pack on `jesdga`, ~0 extra SSD write wait |
-| **`ud-q2_k_xl`** *(experimental)* | ~335 GB | **`ssd+hybrid`** (`/content` punch-on-read backbone + ~36 GiB RAM Engram + ~67 GiB SSD tail) | Highest 2-bit tier | Build & upload with [`scripts/build_q2k_xl_pack.py`](scripts/build_q2k_xl_pack.py) |
+| **`ud-q2_k_xl`** *(planned)* | ~343 GB | **`ssd+hybrid`** (planned **`wave+hybrid`** two-wave loader, see [`docs/q2k-xl-acceleration.md`](docs/q2k-xl-acceleration.md)) | KLD `0.1501` (**-46%**) · Top-1 `88.42%` | Pending Basalt `>=v0.5.8` (PR `#481`) + HF pack (`scripts/build_q2k_xl_pack.py`) |
 | `NVFP4` *(unsupported)* | 428 GB | **Rejected fail-fast** | — | Backbone (`~294 GiB`) > G4 VRAM+RAM (`~272 GiB`); Basalt requires ≥320 GB RAM |
 
 ## Declarative Configuration (`config.toml`)

@@ -28,11 +28,11 @@
     "ud-q2_k_xl": {
       "url": "",
       "model_alias": "DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL",
-      "size_gb": 335,
-      "kld": null,
-      "top1": null,
-      "estimated_speed_tok_s": 105.0,
-      "description": "2-bit XL (experimental) · requires self-hosted pack_url built with scripts/build_q2k_xl_pack.py"
+      "size_gb": 343,
+      "kld": 0.1501,
+      "top1": 88.42,
+      "estimated_speed_tok_s": 116.5,
+      "description": "2-bit XL (pending Basalt >=v0.5.8 + HF pack; -46% KLD vs IQ1_M; see docs/q2k-xl-acceleration.md)"
     }
   },
   "abliteration_url": "https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated/resolve/4433164758a8045b1b915b7644cce97b9a0e274c/abliteration-edit.npz",
