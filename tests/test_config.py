@@ -209,7 +209,7 @@ class ConfigAndUnitTests(unittest.TestCase):
         for f in files:
             dst = vm_crlf / f
             dst.parent.mkdir(parents=True, exist_ok=True)
-            dst.write_bytes((self.p.vm_dir / f).read_bytes().replace(b"\n", b"\r\n"))
+            dst.write_bytes((self.p.vm_dir / f).read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
         p_crlf = paths.Paths(self.p.config_dir, self.p.state_dir, vm_crlf)
         out = self.tmp / "b.tgz"
         colab.build_bundle(p_crlf, out)
@@ -372,6 +372,10 @@ class ConfigAndUnitTests(unittest.TestCase):
         self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib), (2, "exact", 450))
         with self.assertRaises(config.ConfigError):
             cfg.apply_profile("unknown")
+
+        # pfetch.py runs on the remote Ubuntu Colab VM and uses GNU dd (oflag=seek_bytes)
+        if not sys.platform.startswith("linux"):
+            return
 
         # Live local HTTP Range server test for zero-fork Keep-Alive pfetch.py (with retry on transient 503)
         import hashlib
