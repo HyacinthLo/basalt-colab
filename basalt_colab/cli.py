@@ -185,11 +185,27 @@ def follow(resp: http.client.HTTPResponse, header: str | None = None) -> tuple[s
     return "", ""
 
 
+def pick_colab_installer(uv: str | None, pipx: str | None, py_ver: tuple[int, int] | None = None) -> str:
+    """Choose uv or pipx for installing google-colab-cli (which requires Python >= 3.12)."""
+    ver = (sys.version_info.major, sys.version_info.minor) if py_ver is None else py_ver
+    if uv:
+        return "uv"
+    # pipx reuses the host Python, which fails on Python 3.11; uv auto-provisions Python 3.12+.
+    if ver < (3, 12):
+        return "uv"
+    return "pipx" if pipx else "uv"
+
+
 def install_colab(manifest: Manifest) -> bool:
-    home_bin = os.path.join(os.path.expanduser("~"), ".local", "bin")
-    uv = shutil.which("uv") or next((p for p in (os.path.join(home_bin, "uv.exe" if IS_WIN else "uv"),) if os.path.exists(p)), None)
+    home = os.path.expanduser("~")
+    uv_name = "uv.exe" if IS_WIN else "uv"
+    uv_candidates = (
+        os.path.join(home, ".local", "bin", uv_name),
+        os.path.join(home, ".cargo", "bin", uv_name),
+    )
+    uv = shutil.which("uv") or next((p for p in uv_candidates if os.path.exists(p)), None)
     pipx = shutil.which("pipx")
-    tool = "uv" if uv or not pipx else "pipx"
+    tool = pick_colab_installer(uv, pipx)
     print("Google's Colab CLI is not installed yet. basalt-colab uses it to start and stop the G4 GPU.", flush=True)
     if not confirm(f"Install {manifest.colab_cli} with {tool}{' (installs uv first)' if tool == 'uv' and not uv else ''}?"):
         return False
@@ -204,7 +220,7 @@ def install_colab(manifest: Manifest) -> bool:
         if rc != 0:
             print("failed:\n" + out[-2000:], flush=True)
             return False
-        uv = shutil.which("uv") or os.path.join(home_bin, "uv.exe" if IS_WIN else "uv")
+        uv = shutil.which("uv") or next((p for p in uv_candidates if os.path.exists(p)), uv_candidates[0])
     assert uv or pipx
     rc, out = run_cmd([uv, "tool", "install", manifest.colab_cli] if tool == "uv" and uv else [pipx or "pipx", "install", manifest.colab_cli], 900)
     print("done." if rc == 0 else "failed:\n" + out[-2000:], flush=True)

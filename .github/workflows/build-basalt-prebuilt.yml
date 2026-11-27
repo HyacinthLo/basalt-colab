@@ -13,13 +13,66 @@ on:
       - "basalt_colab/vm/manifest.json"
       - "basalt_colab/vm/patch_basalt.py"
       - "basalt_colab/vm/abliterate.c"
-      - ".github/workflows/build-basalt-prebuilt.yml"
 
 permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.decide.outputs.should_build }}
+    steps:
+      - name: Checkout (shallow history for diff)
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Decide whether prebuilt binaries need rebuilding
+        id: decide
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os, subprocess
+
+          event = os.environ.get("EVENT_NAME", "")
+          if event == "workflow_dispatch":
+              print("should_build=true")
+              raise SystemExit(0)
+
+          before = os.environ.get("BEFORE_SHA", "")
+          after = os.environ.get("AFTER_SHA", "HEAD")
+          if not before or set(before) == {"0"}:
+              print("should_build=true")
+              raise SystemExit(0)
+
+          # Ensure base commit is reachable (falls back to HEAD~1 if needed)
+          r = subprocess.run(["git", "cat-file", "-e", f"{before}^{{commit}}"], capture_output=True)
+          base = before if r.returncode == 0 else "HEAD~1"
+          changed = set(
+              subprocess.check_output(["git", "diff", "--name-only", base, after], text=True).splitlines()
+          )
+          if "basalt_colab/vm/patch_basalt.py" in changed or "basalt_colab/vm/abliterate.c" in changed:
+              print("should_build=true")
+              raise SystemExit(0)
+          if "basalt_colab/vm/manifest.json" in changed:
+              old_raw = subprocess.check_output(["git", "show", f"{base}:basalt_colab/vm/manifest.json"], text=True)
+              old_m = json.loads(old_raw)
+              new_m = json.load(open("basalt_colab/vm/manifest.json"))
+              keys = ("basalt_repo", "basalt_tag", "basalt_commit")
+              if any(old_m.get(k) != new_m.get(k) for k in keys):
+                  print("should_build=true")
+                  raise SystemExit(0)
+          print("should_build=false")
+          EOF
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+
   build-sm120:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-24.04
     container:
       image: nvidia/cuda:13.0.0-devel-ubuntu24.04
@@ -71,7 +124,7 @@ jobs:
         id: pkg
         run: |
           NAME="basalt-${{ steps.meta.outputs.tag }}-deepseek41-sm120-linux-x64.tar.gz"
-          tar -czf "/tmp/$NAME" -C /tmp/dist bin/basalt abliterate
+          tar --sort=name --mtime='UTC 2020-01-01' --owner=0 --group=0 --numeric-owner -cf - -C /tmp/dist bin/basalt abliterate | gzip -n > "/tmp/$NAME"
           SHA=$(sha256sum "/tmp/$NAME" | awk '{print $1}')
           echo "$SHA  $NAME" > "/tmp/$NAME.sha256"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
