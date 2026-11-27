@@ -57,7 +57,9 @@ def main():
     name = rest[rest.index('-s') + 1] if '-s' in rest else None
     pos = [x for i, x in enumerate(rest) if not x.startswith('-') and (i == 0 or rest[i - 1] not in ('-s', '-i', '--timeout', '--gpu'))]
     s = sessions()
-    if cmd == 'usage':
+    if cmd == 'version':
+        print('Version: %s' % os.environ.get('FAKE_COLAB_VERSION', '0.8.0'))
+    elif cmd == 'usage':
         if os.environ.get('FAKE_USAGE_FAIL'):
             print('[colab] Warning: failed to fetch compute-unit info: 401', file=sys.stderr)
             return 1

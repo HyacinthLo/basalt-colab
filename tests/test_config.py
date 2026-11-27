@@ -666,6 +666,121 @@ class ConfigAndUnitTests(unittest.TestCase):
         self.assertEqual(set(meta["profiles"].keys()), set(config.PERFORMANCE_PROFILES.keys()))
         self.assertEqual(meta["hot_fields"], sorted(config.HOT_FIELDS))
 
+    def test_colab_cli_supported_list_and_doctor_version_check(self) -> None:
+        import importlib.util
+        import stat
+        from io import StringIO
+        from unittest import mock
+
+        from basalt_colab import cli
+
+        m = manifest.load_manifest(self.p.vm_dir)
+        pinned = m.colab_cli_pinned_version()
+        self.assertEqual(pinned, "0.8.0")
+        self.assertIn(pinned, m.colab_cli_supported)
+        self.assertTrue(m.is_colab_cli_supported("0.7.5"))
+        self.assertTrue(m.is_colab_cli_supported("0.7.6"))
+        self.assertTrue(m.is_colab_cli_supported("0.8.0"))
+        self.assertFalse(m.is_colab_cli_supported("0.9.0"))
+        self.assertFalse(m.is_colab_cli_supported(None))
+
+        self.assertEqual(colab.parse_colab_version("Version: 0.7.5\n"), "0.7.5")
+        self.assertEqual(colab.parse_colab_version("Version: 0.8.0"), "0.8.0")
+        self.assertEqual(colab.parse_colab_version("1.0.0rc1"), "1.0.0rc1")
+        self.assertIsNone(colab.parse_colab_version("no version here"))
+
+        # Prepare minimal credentials so doctor checks pass aside from what we test
+        self.p.ensure_dirs()
+        self.p.key_file.write_text("sk-test\n", encoding="utf-8")
+        self.p.ssh_key.write_text("KEY\n", encoding="utf-8")
+        cfg = config.Config()
+        cfg.proxy.port = 0
+
+        def run_doctor(detected: str | None, man: manifest.Manifest) -> str:
+            buf = StringIO()
+            with (
+                mock.patch.object(cli.shutil, "which", return_value="/usr/bin/ssh"),
+                mock.patch.object(cli, "colab_present", return_value=True),
+                mock.patch.object(cli, "colab_cmd", return_value=["/usr/bin/colab", "--auth", "oauth2"]),
+                mock.patch.object(cli, "colab_version", return_value=detected),
+                mock.patch.object(cli, "colab_usage", return_value=(100.0, 0.0)),
+                mock.patch.object(cli, "serve_running", return_value={"port": 18080, "pid": 123}),
+                mock.patch("sys.stdout", buf),
+            ):
+                cli.cmd_doctor(self.p, cfg, man)
+            return buf.getvalue()
+
+        out_ok = run_doctor(pinned, m)
+        self.assertIn(f"(v{pinned}, verified)", out_ok)
+
+        out_older = run_doctor("0.7.5", m)
+        self.assertIn(f"(v0.7.5, supported; latest verified: v{pinned})", out_older)
+
+        out_unverified = run_doctor("0.9.0", m)
+        self.assertIn("v0.9.0, unverified", out_unverified)
+        self.assertIn(f"uv tool install --force {m.colab_cli}", out_unverified)
+
+        # colab_env() injects Linux headless keyring shim unless user overrides PYTHON_KEYRING_BACKEND
+        with mock.patch.object(colab.sys, "platform", "linux"), mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PYTHON_KEYRING_BACKEND", None)
+            os.environ.pop("BASALT_COLAB_KEYRING_FILE", None)
+            env_auto = colab.colab_env()
+            self.assertEqual(env_auto["PYTHON_KEYRING_BACKEND"], "basalt_colab_keyring.FallbackFileKeyring")
+            self.assertIn(str(colab.KEYRING_SHIM_DIR), env_auto["PYTHONPATH"].split(os.pathsep))
+            self.assertTrue(env_auto["BASALT_COLAB_KEYRING_FILE"].endswith("colab_keyring.json"))
+
+            env_custom = colab.colab_env({"PYTHON_KEYRING_BACKEND": "custom.Backend"})
+            self.assertEqual(env_custom["PYTHON_KEYRING_BACKEND"], "custom.Backend")
+
+        # FallbackFileKeyring: 0600 file store + native delegation + error fallback
+        shim_file = colab.KEYRING_SHIM_DIR / "basalt_colab_keyring.py"
+        spec = importlib.util.spec_from_file_location("basalt_colab_keyring_test", shim_file)
+        assert spec is not None and spec.loader is not None
+        kr_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(kr_mod)
+        kr = kr_mod.FallbackFileKeyring()
+
+        store_file = self.tmp / "kr_store" / "colab_keyring.json"
+        with mock.patch.dict(os.environ, {"BASALT_COLAB_KEYRING_FILE": str(store_file)}, clear=False):
+            os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
+            self.assertIsNone(kr.get_password("google-colab-cli", "oauth_token"))
+            kr.set_password("google-colab-cli", "oauth_token", '{"token":"abc"}')
+            self.assertEqual(kr.get_password("google-colab-cli", "oauth_token"), '{"token":"abc"}')
+            if not paths.IS_WIN:
+                self.assertEqual(stat.S_IMODE(store_file.stat().st_mode), 0o600)
+            kr.delete_password("google-colab-cli", "oauth_token")
+            self.assertIsNone(kr.get_password("google-colab-cli", "oauth_token"))
+
+            # When a native backend works, it is preferred over the file store
+            native_mem: dict[tuple[str, str], str] = {}
+
+            class WorkingNative:
+                def get_password(self, s: str, u: str) -> str | None:
+                    return native_mem.get((s, u))
+
+                def set_password(self, s: str, u: str, p: str) -> None:
+                    native_mem[(s, u)] = p
+
+                def delete_password(self, s: str, u: str) -> None:
+                    native_mem.pop((s, u), None)
+
+            with mock.patch.object(kr_mod, "_native_backends", return_value=[WorkingNative()]):
+                kr.set_password("google-colab-cli", "oauth_token", "native-tok")
+                self.assertEqual(kr.get_password("google-colab-cli", "oauth_token"), "native-tok")
+                self.assertEqual(native_mem[("google-colab-cli", "oauth_token")], "native-tok")
+
+            # When a native backend raises, seamlessly falls back to file store
+            class BrokenNative:
+                def get_password(self, s: str, u: str) -> str | None:
+                    raise RuntimeError("locked")
+
+                def set_password(self, s: str, u: str, p: str) -> None:
+                    raise RuntimeError("locked")
+
+            with mock.patch.object(kr_mod, "_native_backends", return_value=[BrokenNative()]):
+                kr.set_password("google-colab-cli", "oauth_token", "fallback-tok")
+                self.assertEqual(kr.get_password("google-colab-cli", "oauth_token"), "fallback-tok")
+
 
 if __name__ == "__main__":
     unittest.main()

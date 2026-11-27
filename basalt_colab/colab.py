@@ -18,17 +18,40 @@ import time
 from pathlib import Path
 from typing import Any
 
-from basalt_colab.paths import IS_WIN, Paths
+from basalt_colab.paths import IS_WIN, PACKAGE_DIR, Paths, get_paths
 
 NO_WINDOW, DETACHED, NEW_GROUP, BREAKAWAY = 0x08000000, 0x00000008, 0x00000200, 0x01000000
 CHILD_FLAGS = NO_WINDOW if IS_WIN else 0
 VM_PORT = 18080
+KEYRING_SHIM_DIR = PACKAGE_DIR / "keyring_shim"
 
 
 def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     if extra:
         env.update(extra)
+    return env
+
+
+def colab_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Environment for Colab CLI / SSH ProxyCommand subprocesses.
+
+    On Linux, injects a zero-dependency FallbackFileKeyring shim when the user
+    has not configured PYTHON_KEYRING_BACKEND, so google-colab-cli >= 0.7.6
+    uses native GNOME Keyring / KWallet when available and falls back to an
+    owner-only (0600) file store on headless Linux / WSL2 / Docker / SSH / Termux.
+    """
+    env = child_env(extra)
+    if sys.platform == "linux" and not env.get("PYTHON_KEYRING_BACKEND") and KEYRING_SHIM_DIR.is_dir():
+        shim = str(KEYRING_SHIM_DIR)
+        existing_pp = env.get("PYTHONPATH", "")
+        parts = [p for p in existing_pp.split(os.pathsep) if p] if existing_pp else []
+        if shim not in parts:
+            parts.insert(0, shim)
+        env["PYTHONPATH"] = os.pathsep.join(parts)
+        env["PYTHON_KEYRING_BACKEND"] = "basalt_colab_keyring.FallbackFileKeyring"
+        if not env.get("BASALT_COLAB_KEYRING_FILE"):
+            env["BASALT_COLAB_KEYRING_FILE"] = str(get_paths().state_dir / "colab_keyring.json")
     return env
 
 
@@ -88,14 +111,19 @@ def kill_tree(pid: int, hard: bool = False) -> None:
             pass
 
 
-def run_cmd(cmd: list[str], timeout: float, input_text: str | None = None) -> tuple[int, str]:
+def run_cmd(
+    cmd: list[str],
+    timeout: float,
+    input_text: str | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     try:
         p = subprocess.Popen(
             cmd,
             stdin=subprocess.DEVNULL if input_text is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            env=child_env(),
+            env=child_env() if env is None else env,
             creationflags=CHILD_FLAGS,
             start_new_session=not IS_WIN,
         )
@@ -114,7 +142,7 @@ def run_cmd(cmd: list[str], timeout: float, input_text: str | None = None) -> tu
 
 
 def colab_run(args: list[str], timeout: float = 120, input_text: str | None = None) -> tuple[int, str]:
-    return run_cmd(colab_cmd() + args, timeout, input_text)
+    return run_cmd(colab_cmd() + args, timeout, input_text, env=colab_env())
 
 
 def vmx(session: str, cmd: str, timeout: int = 100) -> tuple[int, str]:
@@ -124,6 +152,16 @@ def vmx(session: str, cmd: str, timeout: int = 100) -> tuple[int, str]:
         f"print(r.stdout[-20000:] + r.stderr[-4000:])\n"
     )
     return colab_run(["exec", "-s", session, "--timeout", str(timeout + 20)], timeout + 40, code)
+
+
+def parse_colab_version(text: str) -> str | None:
+    m = re.search(r"(?:Version:\s*)?(\d+\.\d+\.\d+(?:[a-zA-Z0-9._+-]*)?)", text)
+    return m.group(1) if m else None
+
+
+def colab_version() -> str | None:
+    rc, out = colab_run(["version"], 20)
+    return parse_colab_version(out) if rc == 0 else None
 
 
 def colab_usage() -> tuple[float | None, float | None]:

@@ -34,10 +34,11 @@ from basalt_colab.clients import (
 from basalt_colab.colab import (
     Logger,
     alive,
-    child_env,
     colab_cmd,
+    colab_env,
     colab_present,
     colab_usage,
+    colab_version,
     find_tool,
     http_call,
     kill_tree,
@@ -212,7 +213,7 @@ def install_colab(manifest: Manifest) -> bool:
 
 def colab_login() -> None:
     hide = (b"Current balance", b"Usage rate", b"Active assignments")
-    p = subprocess.Popen(colab_cmd() + ["usage"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=child_env({"PYTHONUNBUFFERED": "1"}))
+    p = subprocess.Popen(colab_cmd() + ["usage"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=colab_env({"PYTHONUNBUFFERED": "1"}))
     assert p.stdout is not None
     buf = b""
     while True:
@@ -1063,12 +1064,33 @@ def cmd_doctor(paths: Paths, cfg: Config, manifest: Manifest) -> None:
         mark = paint(glyph("✓", "+"), "green") if ok else paint(glyph("✗", "!"), "red")
         print(f"  {mark}  {label:<18} {detail}")
 
+    def warn(label: str, detail: str) -> None:
+        mark = paint("!", "yellow")
+        print(f"  {mark}  {label:<18} {detail}")
+
     print(paint(f"basalt-colab {__version__} doctor", "bold") + "\n")
     check("Python", sys.version_info >= (3, 11), f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
     ssh_ok = all(shutil.which(t) or os.path.exists(find_tool(t)) for t in ("ssh", "ssh-keygen"))
     check("OpenSSH", ssh_ok, "ssh + ssh-keygen found" if ssh_ok else "missing ssh or ssh-keygen")
     c_ok = colab_present()
-    check("Colab CLI", c_ok, colab_cmd()[0] if c_ok else f"not installed (run {cli_name()} setup)")
+    if not c_ok:
+        check("Colab CLI", False, f"not installed (run {cli_name()} setup -> installs {manifest.colab_cli})")
+    else:
+        c_ver = colab_version()
+        pinned = manifest.colab_cli_pinned_version()
+        if c_ver is None:
+            check("Colab CLI", True, f"{colab_cmd()[0]} (version unknown)")
+        elif manifest.is_colab_cli_supported(c_ver):
+            if pinned and c_ver != pinned:
+                check("Colab CLI", True, f"{colab_cmd()[0]} (v{c_ver}, supported; latest verified: v{pinned})")
+            else:
+                check("Colab CLI", True, f"{colab_cmd()[0]} (v{c_ver}, verified)")
+        else:
+            supported_str = ", ".join(f"v{v}" for v in manifest.colab_cli_supported) or manifest.colab_cli
+            warn(
+                "Colab CLI",
+                f"{colab_cmd()[0]} (v{c_ver}, unverified; supported: {supported_str}; switch: uv tool install --force {manifest.colab_cli})",
+            )
     if c_ok:
         bal, _ = colab_usage()
         check("Colab OAuth", bal is not None, f"balance {bal:.1f} CU" if bal is not None else f"not logged in (run {cli_name()} setup)")

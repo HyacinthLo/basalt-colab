@@ -18,8 +18,8 @@ from basalt_colab.colab import (
     alive,
     boot_cmd,
     build_bundle,
-    child_env,
     cleanup_local,
+    colab_env,
     colab_run,
     colab_usage,
     http_call,
@@ -674,7 +674,7 @@ class Manager:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
-                    env=child_env(),
+                    env=colab_env(),
                     creationflags=CHILD_FLAGS,
                     start_new_session=not IS_WIN,
                 )

@@ -24,7 +24,7 @@ basalt-colab = "basalt_colab.cli:main"
 include = ["basalt_colab*"]
 
 [tool.setuptools.package-data]
-basalt_colab = ["vm/*", "web/*"]
+basalt_colab = ["vm/*", "web/*", "keyring_shim/*"]
 
 [tool.ruff]
 target-version = "py311"
