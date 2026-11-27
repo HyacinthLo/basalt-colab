@@ -371,7 +371,7 @@ class ConfigAndUnitTests(unittest.TestCase):
     def test_profiles_and_pfetch_keepalive(self) -> None:
         cfg = config.Config()
         self.assertEqual((cfg.basalt.parallel, cfg.basalt.routing_mode, cfg.basalt.vram_reserve_mib, cfg.basalt.engram_cache_mib),
-                         (2, "exact", 450, 1024))
+                         (2, "exact", 450, 4096))
         self.assertIn("route exact", cfg.describe_engine())
         partial = config.parse_toml("[basalt]\nquant = 'ud-iq2_xxs'\n")
         self.assertEqual((partial.basalt.quant, partial.basalt.routing_mode, partial.basalt.vram_reserve_mib, partial.basalt.pool_workers),
@@ -795,6 +795,151 @@ class ConfigAndUnitTests(unittest.TestCase):
         build_sh = (self.p.vm_dir / "build.sh").read_text(encoding="utf-8")
         self.assertIn('"$S/requirements.txt" "$MISSING_REQ"', build_sh)
         self.assertIn('-r "$MISSING_REQ"', build_sh)
+        self.assertIn('grep -a -q "BASALT_ENGRAM_LAZY_OPEN"', build_sh)
+        self.assertIn('grep -a -q "BASALT_ENGRAM_INFLIGHT"', build_sh)
+
+    def test_stage0_and_multiwindow_engram_planner(self) -> None:
+        sys.path.insert(0, str(self.p.vm_dir))
+        try:
+            bj = importlib.import_module("basalt_jobs")
+            GIB = bj.GIB
+
+            def make_meta(row_bytes: int) -> tuple[dict, int]:
+                # Exact DeepSeek-V4.1-Flash 48-head shape: 2 layers x 3 orders (2/3/4-gram) x 8 heads (~16M rows/head)
+                per_head = 16_000_476
+                offsets = [i * per_head for i in range(48)]
+                vocabs = [per_head] * 48
+                total_rows = 48 * per_head
+                total_bytes = total_rows * row_bytes
+                meta = {
+                    "engram": {
+                        "rows": total_rows,
+                        "row_bytes": row_bytes,
+                        "bytes": total_bytes,
+                        "ple.layers": [1, 14],
+                        "ple.ngram_size": 4,
+                        "ple.heads_per_ngram": 8,
+                        "ple.head_offsets": offsets,
+                        "ple.head_vocab_sizes": vocabs,
+                    }
+                }
+                return meta, total_bytes
+
+            # 1) UD-IQ2_XXS (IQ4_NL 144 B/row, ~103.0 GiB):
+            meta_iq2, eng_iq2 = make_meta(144)
+            info_iq2 = bj.extract_engram_subtables(meta_iq2, eng_iq2)
+            self.assertIsNotNone(info_iq2)
+            self.assertEqual(len(info_iq2["subtables"]), 6)
+
+            # With 91.5 GiB available (86.5 GiB budget after 5 GiB reserve):
+            # 2 RAM windows cover 100% Layer 1 + 100% Layer 14 3/4-gram; only Layer 14 2-gram (~17.2 GiB) stays on SSD.
+            p_xxs_hi = bj.plan_engram_windows(eng_iq2, avail_ram_gib=91.5, engram_info=info_iq2, reserve_gib=5.0)
+            self.assertEqual(len(p_xxs_hi["ram_windows"]), 2)
+            w0, w1 = p_xxs_hi["ram_windows"]
+            self.assertEqual(w0[0], 0)
+            self.assertEqual(w1[1], eng_iq2)
+            self.assertEqual(p_xxs_hi["cache_skip_rows"], [])  # both 4-grams 100% in RAM
+            self.assertEqual(len(p_xxs_hi["ssd_ranges"]), 1)
+            s_lo, s_hi = p_xxs_hi["ssd_ranges"][0]
+            # +4096 B boundary overlap at BOTH interior window edges!
+            self.assertEqual(s_lo, w0[1] - 4096)
+            self.assertEqual(s_hi, w1[0] + 4096)
+            self.assertLess(p_xxs_hi["ssd_bytes"], int(18.0 * GIB))
+
+            # With 88.0 GiB available (83.0 GiB budget): still 2 RAM windows (partial contiguous extension into L14 3-gram)
+            p_xxs_mid = bj.plan_engram_windows(eng_iq2, avail_ram_gib=88.0, engram_info=info_iq2, reserve_gib=5.0)
+            self.assertEqual(len(p_xxs_mid["ram_windows"]), 2)
+            self.assertLessEqual(p_xxs_mid["ram_bytes"], int(83.0 * GIB))
+            self.assertGreaterEqual(p_xxs_mid["ram_bytes"], int(82.5 * GIB))
+            self.assertEqual(p_xxs_mid["cache_skip_rows"], [])
+
+            # 2) UD-Q2_K_XL (Q5_K 176 B/row, ~125.9 GiB):
+            # With 54.0 GiB available: 1 RAM window covers 100% Layer 1 3/4-gram (~42 GiB), keeping ~12 GiB headroom,
+            # 2 sparse SSD ranges with +4096 B interior overlap, and Layer 14 4-gram added to cache_skip_rows.
+            meta_q2, eng_q2 = make_meta(176)
+            info_q2 = bj.extract_engram_subtables(meta_q2, eng_q2)
+            self.assertIsNotNone(info_q2)
+            p_q2 = bj.plan_engram_windows(eng_q2, avail_ram_gib=54.0, engram_info=info_q2, reserve_gib=5.0)
+            self.assertEqual(len(p_q2["ram_windows"]), 1)
+            q_lo, q_hi = p_q2["ram_windows"][0]
+            l1_3g = next(s for s in info_q2["subtables"] if s["layer"] == 1 and s["ngram"] == 3)
+            l1_4g = next(s for s in info_q2["subtables"] if s["layer"] == 1 and s["ngram"] == 4)
+            l14_4g = next(s for s in info_q2["subtables"] if s["layer"] == 14 and s["ngram"] == 4)
+            self.assertLessEqual(q_lo, l1_3g["byte_lo"])
+            self.assertGreaterEqual(q_hi, l1_4g["byte_hi"])
+            self.assertLess(p_q2["ram_bytes"], int(43.0 * GIB))  # did not eat dynamic headroom into 2-gram
+            self.assertEqual(len(p_q2["ssd_ranges"]), 2)
+            self.assertEqual(p_q2["ssd_ranges"][0], (0, q_lo + 4096))
+            self.assertEqual(p_q2["ssd_ranges"][1], (q_hi - 4096, eng_q2))
+            self.assertEqual(p_q2["cache_skip_rows"], [(l14_4g["row_lo"], l14_4g["row_hi"])])
+
+            # 3) 100%-RAM fit and missing-meta fallback
+            p_full = bj.plan_engram_windows(eng_iq2, avail_ram_gib=112.0, engram_info=info_iq2, reserve_gib=5.0)
+            self.assertEqual(p_full["ram_windows"], [(0, eng_iq2)])
+            self.assertEqual(p_full["ssd_ranges"], [])
+            self.assertEqual(p_full["cache_skip_rows"], [])
+
+            p_fallback = bj.plan_engram_windows(eng_iq2, avail_ram_gib=60.0, engram_info=None, reserve_gib=5.0)
+            self.assertEqual(len(p_fallback["ram_windows"]), 1)
+            self.assertEqual(p_fallback["ram_windows"][0][0], 0)
+            self.assertEqual(p_fallback["ssd_ranges"][0][0], p_fallback["ram_windows"][0][1] - 4096)
+
+            # 4) finalize_engram_layout & --finalize-engram CLI: generous RAM (0 delta) vs tight RAM (exact delta)
+            plan_doc = {
+                "url": "https://example.test/iq2.basalt",
+                "eng_offset": 100 * GIB,
+                "eng_bytes": eng_iq2,
+                "engram_info": info_iq2,
+                "initial_ssd_ranges": [list(r) for r in p_xxs_mid["ssd_ranges"]],
+            }
+            fin_ok = bj.finalize_engram_layout(plan_doc, mem_avail_gib=91.5, ram_dir="/mnt/ram", ssd_file="/content/engram_tail.bin")
+            self.assertEqual(fin_ok["ssd_extra_jobs"], [])
+            self.assertEqual(len(fin_ok["ram_jobs"]), 2)
+            self.assertIn("ssd /content/engram_tail.bin\n", fin_ok["layout_text"])
+            self.assertIn("ram /mnt/ram/engram_0.bin 0 ", fin_ok["layout_text"])
+
+            fin_tight = bj.finalize_engram_layout(plan_doc, mem_avail_gib=74.0, ram_dir="/mnt/ram", ssd_file="/content/engram_tail.bin")
+            self.assertGreater(len(fin_tight["ssd_extra_jobs"]), 0)
+            # Initial SSD ranges + extra delta must cover 100% of final_ssd_ranges!
+            covered = bj._merge_ranges([tuple(r) for r in plan_doc["initial_ssd_ranges"]] + fin_tight["ssd_extra_ranges"])
+            self.assertEqual(bj.subtract_ranges(fin_tight["plan"]["ssd_ranges"], covered), [])
+
+            plan_path = self.tmp / "engram_plan.json"
+            layout_out = self.tmp / "engram_layout.txt"
+            ram_jobs_out = self.tmp / "ram_jobs.json"
+            extra_jobs_out = self.tmp / "extra_jobs.json"
+            plan_path.write_text(json.dumps(plan_doc), encoding="utf-8")
+            r_fin = subprocess.run(
+                [
+                    sys.executable, str(self.p.vm_dir / "basalt_jobs.py"), "--finalize-engram",
+                    "--plan-json", str(plan_path), "--mem-avail-gib", "54.0",
+                    "--ram-dir", "/mnt/ram", "--ssd-file", "/mnt/nvme/basalt_scratch/engram_tail.bin",
+                    "--layout-out", str(layout_out), "--ram-jobs-out", str(ram_jobs_out),
+                    "--ssd-extra-jobs-out", str(extra_jobs_out),
+                ],
+                capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(r_fin.returncode, 0, r_fin.stderr)
+            self.assertIn("ssd /mnt/nvme/basalt_scratch/engram_tail.bin", layout_out.read_text(encoding="utf-8"))
+            self.assertIn("cache_skip ", layout_out.read_text(encoding="utf-8"))
+
+            # 5) Stage 0 custom --ssd-dir in plan_storage + shell script contracts
+            p_nvme = bj.plan_storage(
+                int(162.85 * GIB), int(103.0 * GIB),
+                ram_total_gib=176.9, disk_free_gib=300.0, vram_gib=95.6,
+                ssd_dir="/mnt/nvme/basalt_scratch",
+            )
+            self.assertEqual(p_nvme["engram_tail_path"], "/mnt/nvme/basalt_scratch/engram_tail.bin")
+
+            boot_sh = (self.p.vm_dir / "boot.sh").read_text(encoding="utf-8")
+            serve_sh = (self.p.vm_dir / "serve.sh").read_text(encoding="utf-8")
+            self.assertIn("stage0: selected fast local scratch", boot_sh)
+            self.assertIn("--finalize-engram", boot_sh)
+            self.assertIn("BASALT_ENGRAM_LAZY_OPEN=1", boot_sh)
+            self.assertIn("BASALT_ENGRAM_LAYOUT", serve_sh)
+            self.assertIn("BASALT_ENGRAM_INFLIGHT", serve_sh)
+        finally:
+            sys.path.remove(str(self.p.vm_dir))
 
 
 if __name__ == "__main__":

@@ -403,10 +403,15 @@ def main():
         ],
     )
 
-    # 6. PleReader RAM head zero-copy mmap() + fast-path return (BASALT_COLAB_ENGRAM_MMAP):
-    #    When Engram head lives on /mnt/ram/ (or BASALT_ENGRAM_MMAP=1), mmap [0, head_bytes) read-only
-    #    with MAP_SHARED + MADV_RANDOM so ~76-100% of lookups resolve via ~80ns memcpy (0 syscalls,
-    #    0 thread-pool wakeups), and RowCache naturally dedicates 100% of its slots to the SSD tail.
+    # 6. PleReader RAM zero-copy mmap(), multi-window RAM+sparse-SSD layout, lazy open, and RowCache skip filter
+    #    (BASALT_COLAB_ENGRAM_MMAP):
+    #    - Legacy eager mode: when Engram head lives on /mnt/ram/ (or BASALT_ENGRAM_MMAP=1), mmap [0, head_bytes)
+    #      read-only with MAP_SHARED + MADV_RANDOM so lookups resolve via ~80ns memcpy (0 syscalls).
+    #    - Lazy layout mode (BASALT_ENGRAM_LAZY_OPEN=1 + BASALT_ENGRAM_LAYOUT=/mnt/ram/engram_layout.txt):
+    #      open() allocates RowCache immediately (before expert_tier.cpp sizes RAM experts) and defers DirectFile
+    #      + mmap() until first issue() after POST /load, when boot.sh knows exact /proc/meminfo MemAvailable.
+    #      Supports arbitrary 64 MiB-aligned RAM windows (`ram <path> <lo> <hi>`) backed by a logical full-size
+    #      sparse SSD file (`ssd <path>`) and unified RowCache::insert() admission skip ranges (`cache_skip <lo> <hi>`).
     patch_file(
         src,
         'src/ngram/ple_reader.cpp',
@@ -414,55 +419,210 @@ def main():
         [
             (
                 '#include <cstring>',
-                '#include <cstdlib>\n#include <cstring>\n#ifdef __linux__\n#include <fcntl.h>\n#include <sys/mman.h>\n#include <sys/stat.h>\n#include <unistd.h>\n#endif',
+                '#include <cstdlib>\n#include <cstring>\n#include <fstream>\n#include <sstream>\n#ifdef __linux__\n#include <fcntl.h>\n#include <sys/mman.h>\n#include <sys/stat.h>\n#include <unistd.h>\n#endif',
+            ),
+            (
+                '''    std::vector<uint8_t> next;      // per-set replacement pointer
+    uint64_t used = 0;''',
+                '''    std::vector<uint8_t> next;      // per-set replacement pointer
+    uint64_t used = 0;
+    std::vector<std::pair<uint32_t, uint32_t>> skip_ranges; // BASALT_COLAB_ENGRAM_MMAP: skip cold 4-gram admission''',
+            ),
+            (
+                '''    void insert(uint32_t row, const uint8_t* bytes) {
+        if (sets == 0 || find(row) != nullptr) return;''',
+                '''    void insert(uint32_t row, const uint8_t* bytes) {
+        if (sets == 0) return;
+        for (const auto& r : skip_ranges) {
+            if (row >= r.first && row < r.second) return;
+        }
+        if (find(row) != nullptr) return;''',
             ),
             (
                 '''struct PleReader::Impl {
     DirectFile file;''',
                 '''struct PleReader::Impl {
+    struct RamWindow {
+        const uint8_t* ptr = nullptr;
+        uint64_t lo = 0;
+        uint64_t hi = 0;
+        uint64_t len = 0;
+    };
     DirectFile file;
-    const uint8_t* mmap_head = nullptr;   // BASALT_COLAB_ENGRAM_MMAP: zero-copy tmpfs Engram head
-    uint64_t mmap_head_bytes = 0;''',
+    const uint8_t* mmap_head = nullptr;   // BASALT_COLAB_ENGRAM_MMAP: legacy prefix tmpfs Engram head
+    uint64_t mmap_head_bytes = 0;
+    std::vector<RamWindow> ram_windows;   // multi-window RAM mmap regions [lo, hi)
+    bool lazy_pending = false;            // BASALT_ENGRAM_LAZY_OPEN: defer file/mmap until first issue()
+    std::string open_path;
+    std::string layout_path;
+
+    void unmap_windows() {
+#ifdef __linux__
+        if (mmap_head != nullptr) {
+            (void) ::munmap((void*) mmap_head, (size_t) mmap_head_bytes);
+            mmap_head = nullptr;
+            mmap_head_bytes = 0;
+        }
+        for (const auto& w : ram_windows) {
+            if (w.ptr != nullptr && w.len > 0) (void) ::munmap((void*) w.ptr, (size_t) w.len);
+        }
+#endif
+        ram_windows.clear();
+    }
+
+    bool ensure_opened(std::string& err) {
+        if (!lazy_pending) return true;
+        unmap_windows();
+        cache.skip_ranges.clear();
+        std::string ssd_path;
+        struct PendingRam { std::string path; uint64_t lo; uint64_t hi; };
+        std::vector<PendingRam> pending_ram;
+        if (!layout_path.empty()) {
+            std::ifstream in(layout_path);
+            if (!in.is_open()) {
+                err = "PleReader: cannot open BASALT_ENGRAM_LAYOUT " + layout_path;
+                return false;
+            }
+            std::string line;
+            while (std::getline(in, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream iss(line);
+                std::string kind;
+                if (!(iss >> kind)) continue;
+                if (kind == "ssd") {
+                    iss >> ssd_path;
+                } else if (kind == "ram") {
+                    PendingRam pr{};
+                    if (iss >> pr.path >> pr.lo >> pr.hi && pr.hi > pr.lo) pending_ram.push_back(std::move(pr));
+                } else if (kind == "cache_skip") {
+                    uint32_t rlo = 0, rhi = 0;
+                    if (iss >> rlo >> rhi && rhi > rlo) cache.skip_ranges.emplace_back(rlo, rhi);
+                }
+            }
+        }
+        const std::string backing = !layout_path.empty() ? ssd_path : open_path;
+        if (!backing.empty()) {
+            if (!file.open(backing, err, 0, /*mapped_elsewhere=*/true)) return false;
+            if (table_offset + n_rows * (uint64_t) row_bytes > file.size()) {
+                err = "PleReader: the table extends past the end of " + backing;
+                file.close();
+                return false;
+            }
+        }
+#ifdef __linux__
+        for (const auto& pr : pending_ram) {
+            const uint64_t want = pr.hi - pr.lo;
+            const int mfd = ::open(pr.path.c_str(), O_RDONLY | O_CLOEXEC);
+            struct stat mst{};
+            if (mfd < 0 || ::fstat(mfd, &mst) != 0 || (uint64_t) mst.st_size < want) {
+                if (mfd >= 0) ::close(mfd);
+                unmap_windows();
+                file.close();
+                err = "PleReader: cannot map RAM window " + pr.path;
+                return false;
+            }
+            void* mp = ::mmap(nullptr, (size_t) want, PROT_READ, MAP_SHARED, mfd, 0);
+            ::close(mfd);
+            if (mp == MAP_FAILED) {
+                unmap_windows();
+                file.close();
+                err = "PleReader: mmap failed for " + pr.path;
+                return false;
+            }
+            (void) ::madvise(mp, (size_t) want, MADV_RANDOM);
+            ram_windows.push_back(RamWindow{(const uint8_t*) mp, pr.lo, pr.hi, want});
+        }
+#endif
+        if (!file.is_open() && ram_windows.empty()) {
+            err = "PleReader: lazy layout configured neither ssd nor ram windows";
+            return false;
+        }
+        lazy_pending = false;
+        return true;
+    }''',
+            ),
+            (
+                '''    double keepalive_due(double now) const {
+        if (keep_us <= 0 || !error.empty() || last_issue_us <= 0 || now - last_issue_us > keep_window_us) return -1;''',
+                '''    double keepalive_due(double now) const {
+        if (lazy_pending || !file.is_open() || keep_us <= 0 || !error.empty() || last_issue_us <= 0 || now - last_issue_us > keep_window_us) return -1;''',
             ),
             (
                 '''    if (!impl_->file.open(path, err, 0, /*mapped_elsewhere=*/true)) return false;
-    impl_->row_bytes = row_bytes;''',
-                '''    if (!impl_->file.open(path, err, 0, /*mapped_elsewhere=*/true)) return false;
-#ifdef __linux__
-    {
-        const char* mm_env = std::getenv("BASALT_ENGRAM_MMAP");
-        const bool want_mm = (table_offset == 0) &&
-            ((mm_env && std::strcmp(mm_env, "1") == 0) ||
-             ((!mm_env || std::strcmp(mm_env, "0") != 0) && path.rfind("/mnt/ram/", 0) == 0));
-        if (want_mm) {
-            const int mfd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-            struct stat mst{};
-            if (mfd >= 0 && ::fstat(mfd, &mst) == 0 && mst.st_size > 0) {
-                void* mp = ::mmap(nullptr, (size_t) mst.st_size, PROT_READ, MAP_SHARED, mfd, 0);
-                if (mp != MAP_FAILED) {
-                    impl_->mmap_head = (const uint8_t*) mp;
-                    impl_->mmap_head_bytes = (uint64_t) mst.st_size;
-                    (void) ::madvise(mp, (size_t) mst.st_size, MADV_RANDOM);
-                }
-            }
-            if (mfd >= 0) ::close(mfd);
+    impl_->row_bytes = row_bytes;
+    if (table_offset + n_rows * (uint64_t) row_bytes > impl_->file.size()) {
+        err = "PleReader: the table extends past the end of " + path;
+        close();
+        return false;
+    }''',
+                '''    impl_->row_bytes = row_bytes;
+    impl_->open_path = path;
+    impl_->layout_path.clear();
+    impl_->lazy_pending = false;
+    const char* lazy_env = std::getenv("BASALT_ENGRAM_LAZY_OPEN");
+    const char* layout_env = std::getenv("BASALT_ENGRAM_LAYOUT");
+    const bool want_lazy = (lazy_env && std::strcmp(lazy_env, "1") == 0);
+    if (want_lazy) {
+        if (layout_env && *layout_env) impl_->layout_path = layout_env;
+        impl_->lazy_pending = true;
+    } else {
+        if (!impl_->file.open(path, err, 0, /*mapped_elsewhere=*/true)) return false;
+        if (table_offset + n_rows * (uint64_t) row_bytes > impl_->file.size()) {
+            err = "PleReader: the table extends past the end of " + path;
+            close();
+            return false;
         }
-    }
+#ifdef __linux__
+        {
+            const char* mm_env = std::getenv("BASALT_ENGRAM_MMAP");
+            const bool want_mm = (table_offset == 0) &&
+                ((mm_env && std::strcmp(mm_env, "1") == 0) ||
+                 ((!mm_env || std::strcmp(mm_env, "0") != 0) && path.rfind("/mnt/ram/", 0) == 0));
+            if (want_mm) {
+                const int mfd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+                struct stat mst{};
+                if (mfd >= 0 && ::fstat(mfd, &mst) == 0 && mst.st_size > 0) {
+                    void* mp = ::mmap(nullptr, (size_t) mst.st_size, PROT_READ, MAP_SHARED, mfd, 0);
+                    if (mp != MAP_FAILED) {
+                        impl_->mmap_head = (const uint8_t*) mp;
+                        impl_->mmap_head_bytes = (uint64_t) mst.st_size;
+                        (void) ::madvise(mp, (size_t) mst.st_size, MADV_RANDOM);
+                    }
+                }
+                if (mfd >= 0) ::close(mfd);
+            }
+        }
 #endif
-    impl_->row_bytes = row_bytes;''',
+    }''',
             ),
             (
                 '''    m.file.close();
     DirectFile::free_aligned(m.slab);''',
-                '''#ifdef __linux__
-    if (m.mmap_head != nullptr) {
-        (void) ::munmap((void*) m.mmap_head, (size_t) m.mmap_head_bytes);
-        m.mmap_head = nullptr;
-        m.mmap_head_bytes = 0;
-    }
-#endif
+                '''    m.unmap_windows();
+    m.lazy_pending = false;
+    m.cache.skip_ranges.clear();
     m.file.close();
     DirectFile::free_aligned(m.slab);''',
+            ),
+            (
+                '''bool PleReader::is_open() const { return impl_->file.is_open(); }''',
+                '''bool PleReader::is_open() const { return impl_->file.is_open() || impl_->lazy_pending || !impl_->ram_windows.empty(); }''',
+            ),
+            (
+                '''    const uint32_t rb = m.row_bytes;
+    for (size_t i = 0; i < n; ++i) {''',
+                '''    if (m.lazy_pending) {
+        std::string lerr;
+        if (!m.ensure_opened(lerr)) {
+            if (m.error.empty()) m.error = lerr.empty() ? "PleReader: lazy open failed" : lerr;
+            m.tickets[id].pending = 0;
+            lk.unlock();
+            m.cv_done.notify_all();
+            return Ticket{id};
+        }
+    }
+    const uint32_t rb = m.row_bytes;
+    for (size_t i = 0; i < n; ++i) {''',
             ),
             (
                 '''        if (const uint8_t* hit = m.cache.find(rows[i])) {
@@ -477,6 +637,16 @@ def main():
             ++m.stats.cache_hits;
             continue;
         }
+        bool win_hit = false;
+        for (const auto& w : m.ram_windows) {
+            if (at >= w.lo && at + rb <= w.hi) {
+                std::memcpy(dst, w.ptr + (at - w.lo), rb);
+                ++m.stats.cache_hits;
+                win_hit = true;
+                break;
+            }
+        }
+        if (win_hit) continue;
         if (const uint8_t* hit = m.cache.find(rows[i])) {
             std::memcpy(dst, hit, rb);
             ++m.stats.cache_hits;
@@ -493,6 +663,13 @@ def main():
         if (rearm) m.cv_work.notify_one();
         return Ticket{id};
     }
+    if (!m.file.is_open()) {
+        if (m.error.empty()) m.error = "PleReader: row missed RAM windows with no SSD backing";
+        m.tickets[id].pending = 0;
+        lk.unlock();
+        m.cv_done.notify_all();
+        return Ticket{id};
+    }
     // the ticket is known before its reads are planned; it completes once every page it counts is read
     m.tickets[id].pending = 1;
     lk.unlock();''',
@@ -500,8 +677,10 @@ def main():
         ],
     )
 
-    # 7. Configurable Engram RowCache size via BASALT_ENGRAM_CACHE_MIB (BASALT_COLAB_ENGRAM_TAIL_CACHE):
-    #    Combined with Patch #6, 100% of RowCache shields the SSD tail (e.g. 1024 MiB = ~7.4M rows, 113x stock).
+    # 7. Configurable Engram RowCache size & max_inflight via BASALT_ENGRAM_CACHE_MIB / BASALT_ENGRAM_INFLIGHT
+    #    (BASALT_COLAB_ENGRAM_TAIL_CACHE):
+    #    Combined with Patch #6, 100% of RowCache shields the SSD ranges (up to 4096 MiB = ~29.8M IQ4_NL / 24.4M Q5_K rows),
+    #    and BASALT_ENGRAM_INFLIGHT (default 64, hybrid/SSD 256) raises Prefill concurrent I/O queue depth.
     patch_file(
         src,
         'src/models/deepseek41/model.cpp',
@@ -515,7 +694,7 @@ def main():
                 '''        const uint64_t engram_off = (engram_env && *engram_env) ? 0ull : e.file_offset;
         if (!engram_->open(engram_path, engram_off, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;''',
                 '''        const uint64_t engram_off = (engram_env && *engram_env) ? 0ull : e.file_offset;
-        // BASALT_COLAB_ENGRAM_TAIL_CACHE: size RowCache in MiB (0 disables; hybrid tail default 1024 MiB)
+        // BASALT_COLAB_ENGRAM_TAIL_CACHE: size RowCache in MiB (0 disables; hybrid default 4096 MiB) + inflight depth
         uint64_t cache_rows = 1ull << 16;
         if (const char* cm = std::getenv("BASALT_ENGRAM_CACHE_MIB"); cm && *cm) {
             char* endp = nullptr;
@@ -530,7 +709,13 @@ def main():
                 }
             }
         }
-        if (!engram_->open(engram_path, engram_off, e.rows, 64, cache_rows, err, e.row_bytes)) return false;''',
+        uint32_t inflight = 64u;
+        if (const char* inf = std::getenv("BASALT_ENGRAM_INFLIGHT"); inf && *inf) {
+            char* endp = nullptr;
+            const long long v = std::strtoll(inf, &endp, 10);
+            if (endp != inf && v >= 1) inflight = (uint32_t) std::min<long long>(v, 1024ll);
+        }
+        if (!engram_->open(engram_path, engram_off, e.rows, inflight, cache_rows, err, e.row_bytes)) return false;''',
             ),
         ],
     )

@@ -25,6 +25,20 @@ PACKS = {
 HEADER_BYTES = 65536
 GIB = 1024 ** 3
 SPLIT_ALIGN = 64 * 1024 * 1024  # 64 MiB (page-aligned + pfetch chunk-aligned)
+PAGE_BYTES = 4096
+
+
+def _range_get(url, start, end, hdr_file=None, timeout=60):
+    headers = {'Range': f'bytes={int(start)}-{int(end)}'}
+    if hdr_file and os.path.exists(hdr_file):
+        with open(hdr_file) as f:
+            for line in f:
+                k, _, v = line.strip().partition(':')
+                if k:
+                    headers[k.strip()] = v.strip()
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
 
 
 def parse_header(data):
@@ -41,17 +55,274 @@ def parse_header(data):
 
 
 def read_header(url, hdr_file=None):
-    headers = {'Range': f'bytes=0-{HEADER_BYTES - 1}'}
-    if hdr_file and os.path.exists(hdr_file):
-        with open(hdr_file) as f:
-            for line in f:
-                k, _, v = line.strip().partition(':')
-                if k:
-                    headers[k.strip()] = v.strip()
-    req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=60) as r:
-        data = r.read()
-    return parse_header(data)
+    return parse_header(_range_get(url, 0, HEADER_BYTES - 1, hdr_file=hdr_file))
+
+
+def read_meta(url, sections, hdr_file=None):
+    """Fetches and parses the small BASALTMF v2 `meta` JSON section via HTTP Range."""
+    meta_sec = next((s for s in sections if s['name'] == 'meta' and s['bytes'] > 0), None)
+    if meta_sec is None:
+        return {}
+    try:
+        raw = _range_get(url, meta_sec['offset'], meta_sec['offset'] + meta_sec['bytes'] - 1, hdr_file=hdr_file)
+        return json.loads(raw.decode('utf-8'))
+    except Exception:
+        return {}
+
+
+def extract_engram_subtables(meta, engram_bytes):
+    """Extracts per-layer, per-ngram-order Engram byte/row spans from BASALTMF v2 `meta`."""
+    eng = (meta or {}).get('engram')
+    if not isinstance(eng, dict):
+        return None
+    layers = eng.get('ple.layers')
+    ngram_size = int(eng.get('ple.ngram_size') or 0)
+    heads_per_ngram = int(eng.get('ple.heads_per_ngram') or 0)
+    head_offsets = eng.get('ple.head_offsets')
+    head_vocabs = eng.get('ple.head_vocab_sizes')
+    row_bytes = int(eng.get('row_bytes') or 0)
+    orders_per_layer = ngram_size - 1
+    if (
+        not isinstance(layers, list)
+        or not layers
+        or orders_per_layer < 1
+        or heads_per_ngram < 1
+        or row_bytes <= 0
+        or not isinstance(head_offsets, list)
+        or not isinstance(head_vocabs, list)
+    ):
+        return None
+    expected_heads = len(layers) * orders_per_layer * heads_per_ngram
+    if len(head_offsets) != expected_heads or len(head_vocabs) != expected_heads:
+        return None
+    total_rows = int(eng.get('rows') or (int(engram_bytes) // row_bytes))
+    if total_rows * row_bytes != int(engram_bytes):
+        return None
+
+    subtables = []
+    idx = 0
+    for li, layer in enumerate(layers):
+        for oi in range(orders_per_layer):
+            first_h = idx
+            last_h = idx + heads_per_ngram - 1
+            row_lo = int(head_offsets[first_h])
+            row_hi = int(head_offsets[last_h]) + int(head_vocabs[last_h])
+            subtables.append({
+                'layer': int(layer),
+                'layer_idx': li,
+                'ngram': 2 + oi,
+                'row_lo': row_lo,
+                'row_hi': row_hi,
+                'byte_lo': row_lo * row_bytes,
+                'byte_hi': row_hi * row_bytes,
+            })
+            idx += heads_per_ngram
+    return {
+        'row_bytes': row_bytes,
+        'total_rows': total_rows,
+        'subtables': subtables,
+    }
+
+
+def _merge_ranges(ranges):
+    pts = sorted((int(a), int(b)) for a, b in ranges if int(b) > int(a))
+    if not pts:
+        return []
+    out = [list(pts[0])]
+    for a, b in pts[1:]:
+        if a <= out[-1][1]:
+            if b > out[-1][1]:
+                out[-1][1] = b
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def subtract_ranges(want, have):
+    """Returns sorted disjoint ranges in `want` not already covered by `have`."""
+    want_m = _merge_ranges(want)
+    have_m = _merge_ranges(have)
+    out = []
+    hi = 0
+    for a, b in want_m:
+        while hi < len(have_m) and have_m[hi][1] <= a:
+            hi += 1
+        cur = a
+        j = hi
+        while j < len(have_m) and have_m[j][0] < b:
+            if have_m[j][0] > cur:
+                out.append((cur, have_m[j][0]))
+            cur = max(cur, have_m[j][1])
+            if cur >= b:
+                break
+            j += 1
+        if cur < b:
+            out.append((cur, b))
+    return out
+
+
+def _ssd_complement(engram_bytes, ram_windows):
+    """Complement of `ram_windows` in [0, engram_bytes) with +4096 B interior boundary overlap."""
+    eng = int(engram_bytes)
+    wins = _merge_ranges(ram_windows)
+    raw = []
+    cur = 0
+    for lo, hi in wins:
+        if lo > cur:
+            raw.append((cur, lo))
+        cur = max(cur, hi)
+    if cur < eng:
+        raw.append((cur, eng))
+    expanded = []
+    for a, b in raw:
+        ea = max(0, a - PAGE_BYTES) if a > 0 else 0
+        eb = min(eng, b + PAGE_BYTES) if b < eng else eng
+        expanded.append((ea, eb))
+    return _merge_ranges(expanded)
+
+
+def plan_engram_windows(engram_bytes, avail_ram_gib, engram_info=None, reserve_gib=5.0, min_ram_gib=16.0):
+    """Plans 64 MiB-aligned RAM mmap windows, +4096 B-protected sparse SSD ranges, and 4-gram RowCache skip rows.
+
+    Priority order: (layer_idx, -ngram) — Layer 1 4-gram/3-gram/2-gram first (zero layer-hiding before Layer 1),
+    then Layer 14 4-gram/3-gram/2-gram (2-gram is hottest in 4 GiB RowCache and last to place in RAM).
+    """
+    eng = int(engram_bytes)
+    usable_bytes = int(max(0.0, float(avail_ram_gib) - float(reserve_gib)) * GIB)
+    subtables = (engram_info or {}).get('subtables') or []
+
+    if usable_bytes >= eng:
+        return {
+            'ram_windows': [(0, eng)],
+            'ssd_ranges': [],
+            'cache_skip_rows': [],
+            'ram_bytes': eng,
+            'ssd_bytes': 0,
+        }
+
+    budget_bytes = (usable_bytes // SPLIT_ALIGN) * SPLIT_ALIGN
+    if budget_bytes < int(min_ram_gib * GIB):
+        ram_windows = []
+    elif subtables:
+        ordered = sorted(subtables, key=lambda st: (st['layer_idx'], -st['ngram']))
+        selected = []
+        for st in ordered:
+            cand_lo = (int(st['byte_lo']) // SPLIT_ALIGN) * SPLIT_ALIGN
+            cand_hi = min(eng, ((int(st['byte_hi']) + SPLIT_ALIGN - 1) // SPLIT_ALIGN) * SPLIT_ALIGN)
+            merged = _merge_ranges(selected + [(cand_lo, cand_hi)])
+            if sum(h - l for l, h in merged) <= budget_bytes:
+                selected = merged
+                continue
+            # Extend an adjacent RAM window into cold 3/4-gram subtables without fragmenting or chewing 2-gram headroom.
+            if int(st['ngram']) >= 3:
+                cur_bytes = sum(h - l for l, h in selected)
+                rem = ((budget_bytes - cur_bytes) // SPLIT_ALIGN) * SPLIT_ALIGN
+                if rem >= SPLIT_ALIGN:
+                    touch_hi = any(l <= cand_hi <= h for l, h in selected)
+                    touch_lo = any(l <= cand_lo <= h for l, h in selected)
+                    if touch_hi or touch_lo:
+                        if touch_hi:
+                            p_lo = max(cand_lo, ((cand_hi - rem) // SPLIT_ALIGN) * SPLIT_ALIGN)
+                            p_hi = cand_hi
+                        else:
+                            p_lo = cand_lo
+                            p_hi = min(cand_hi, cand_lo + rem)
+                        trial = _merge_ranges(selected + [(p_lo, p_hi)])
+                        if sum(h - l for l, h in trial) <= budget_bytes:
+                            selected = trial
+        ram_windows = selected
+    else:
+        head = min(budget_bytes, ((eng - GIB) // SPLIT_ALIGN) * SPLIT_ALIGN)
+        ram_windows = [(0, head)] if head >= int(min_ram_gib * GIB) else []
+
+    ssd_ranges = _ssd_complement(eng, ram_windows)
+
+    cache_skip_rows = []
+    for st in subtables:
+        if int(st['ngram']) >= 4:
+            blo, bhi = int(st['byte_lo']), int(st['byte_hi'])
+            fully_in_ram = any(wlo <= blo and bhi <= whi for wlo, whi in ram_windows)
+            if not fully_in_ram:
+                cache_skip_rows.append((int(st['row_lo']), int(st['row_hi'])))
+
+    return {
+        'ram_windows': ram_windows,
+        'ssd_ranges': ssd_ranges,
+        'cache_skip_rows': cache_skip_rows,
+        'ram_bytes': sum(h - l for l, h in ram_windows),
+        'ssd_bytes': sum(h - l for l, h in ssd_ranges),
+    }
+
+
+def build_engram_window_jobs(url, eng_offset, eng_bytes, ram_windows, ssd_ranges, ram_dir='/mnt/ram', ssd_file=''):
+    """Builds compact RAM window jobs (`engram_0.bin`, ...) and logical full-size sparse SSD jobs."""
+    ram_jobs = []
+    ram_layout = []
+    for idx, (lo, hi) in enumerate(ram_windows):
+        dest = os.path.join(ram_dir, f'engram_{idx}.bin')
+        ram_jobs.append({
+            'url': url,
+            'dest': dest,
+            'dest_size': int(hi) - int(lo),
+            'src_off': int(eng_offset) + int(lo),
+            'dest_off': 0,
+            'size': int(hi) - int(lo),
+        })
+        ram_layout.append((dest, int(lo), int(hi)))
+
+    ssd_jobs = []
+    if ssd_file:
+        for lo, hi in ssd_ranges:
+            ssd_jobs.append({
+                'url': url,
+                'dest': ssd_file,
+                'dest_size': int(eng_bytes),
+                'src_off': int(eng_offset) + int(lo),
+                'dest_off': int(lo),
+                'size': int(hi) - int(lo),
+            })
+    return ram_jobs, ssd_jobs, ram_layout
+
+
+def format_layout_text(ram_layout, ssd_file='', cache_skip_rows=()):
+    lines = ['# basalt-colab multi-window Engram layout (PleReader BASALT_ENGRAM_LAYOUT)']
+    if ssd_file:
+        lines.append(f'ssd {ssd_file}')
+    for path, lo, hi in ram_layout:
+        lines.append(f'ram {path} {int(lo)} {int(hi)}')
+    for rlo, rhi in cache_skip_rows:
+        lines.append(f'cache_skip {int(rlo)} {int(rhi)}')
+    return '\n'.join(lines) + '\n'
+
+
+def finalize_engram_layout(plan_doc, mem_avail_gib, ram_dir, ssd_file, reserve_gib=5.0):
+    """Post-/load finalizer: sizes RAM windows from real MemAvailable and computes any extra SSD delta."""
+    url = plan_doc['url']
+    eng_offset = int(plan_doc['eng_offset'])
+    eng_bytes = int(plan_doc['eng_bytes'])
+    engram_info = plan_doc.get('engram_info')
+    initial_ssd = [tuple(r) for r in (plan_doc.get('initial_ssd_ranges') or [])]
+
+    win_plan = plan_engram_windows(eng_bytes, mem_avail_gib, engram_info=engram_info, reserve_gib=reserve_gib)
+    final_ssd = win_plan['ssd_ranges']
+    ssd_extra = subtract_ranges(final_ssd, initial_ssd) if final_ssd else []
+
+    ram_jobs, ssd_extra_jobs, ram_layout = build_engram_window_jobs(
+        url, eng_offset, eng_bytes, win_plan['ram_windows'], ssd_extra, ram_dir=ram_dir, ssd_file=ssd_file,
+    )
+    layout_text = format_layout_text(
+        ram_layout,
+        ssd_file=ssd_file if final_ssd else '',
+        cache_skip_rows=win_plan['cache_skip_rows'],
+    )
+    return {
+        'plan': win_plan,
+        'ram_jobs': ram_jobs,
+        'ssd_extra_jobs': ssd_extra_jobs,
+        'ssd_extra_ranges': ssd_extra,
+        'has_ssd': bool(final_ssd),
+        'layout_text': layout_text,
+    }
 
 
 def summarize_sections(sections):
@@ -81,8 +352,9 @@ def _split_engram_bytes(engram_bytes, ram_total_gib, ram_budget_gib, reserve_gib
     return head, int(engram_bytes) - head
 
 
-def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vram_gib=96.0, explicit_budget_gib=0):
+def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vram_gib=96.0, explicit_budget_gib=0, ssd_dir='/content'):
     """Computes zero-SSD-expert staging plan (ram+ram, ram+hybrid/ram+ssd, or ssd+hybrid/ssd+ssd)."""
+    ssd_dir = (ssd_dir or '/content').rstrip('/') or '/content'
     bb_gib = backbone_bytes / GIB
     eng_gib = engram_bytes / GIB
     # Conservative usable VRAM for weights after drafter (2.4 GiB), KV, workspace, and reserve.
@@ -122,21 +394,21 @@ def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vra
         if head_b > 0:
             if tail_b / GIB > float(disk_free_gib) - 6.0:
                 raise RuntimeError(
-                    f'Engram tail ({tail_b / GIB:.1f} GiB) does not fit in /content disk ({disk_free_gib:.1f} GiB free)'
+                    f'Engram tail ({tail_b / GIB:.1f} GiB) does not fit in {ssd_dir} disk ({disk_free_gib:.1f} GiB free)'
                 )
             stage_mode = 'ram+hybrid'
             engram_path = '/mnt/ram/engram.bin'
-            engram_tail_path = '/content/engram_tail.bin'
+            engram_tail_path = f'{ssd_dir}/engram_tail.bin'
             engram_head_bytes = head_b
             engram_tail_bytes = tail_b
             parallel_tail = True
         else:
             if eng_gib > float(disk_free_gib) - 6.0:
                 raise RuntimeError(
-                    f'Engram ({eng_gib:.1f} GiB) does not fit in /content disk ({disk_free_gib:.1f} GiB free)'
+                    f'Engram ({eng_gib:.1f} GiB) does not fit in {ssd_dir} disk ({disk_free_gib:.1f} GiB free)'
                 )
             stage_mode = 'ram+ssd'
-            engram_path = '/content/engram.bin'
+            engram_path = f'{ssd_dir}/engram.bin'
             engram_head_bytes = 0
             engram_tail_bytes = int(engram_bytes)
             parallel_tail = True
@@ -144,21 +416,21 @@ def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vra
         if bb_gib > float(disk_free_gib) - 6.0:
             raise RuntimeError(
                 f'pack backbone ({bb_gib:.1f} GiB) exceeds both /mnt/ram ({ram_total_gib:.0f} GiB) '
-                f'and /content disk ({disk_free_gib:.1f} GiB free)'
+                f'and {ssd_dir} disk ({disk_free_gib:.1f} GiB free)'
             )
-        model_path = '/content/model.basalt'
-        punch_file = '/content/model.basalt'
+        model_path = f'{ssd_dir}/model.basalt'
+        punch_file = f'{ssd_dir}/model.basalt'
         auto_budget = min(max(55, int(ram_total_gib - 24)), max(100, int(ram_needed_gib + 8)))
         ram_budget = int(explicit_budget_gib) if int(explicit_budget_gib) > 0 else int(auto_budget)
         head_b, tail_b = _split_engram_bytes(engram_bytes, ram_total_gib, ram_budget)
         if head_b > 0:
             if tail_b / GIB > float(disk_free_gib) - 8.0:
                 raise RuntimeError(
-                    f'Engram tail ({tail_b / GIB:.1f} GiB) does not fit in /content disk ({disk_free_gib:.1f} GiB free)'
+                    f'Engram tail ({tail_b / GIB:.1f} GiB) does not fit in {ssd_dir} disk ({disk_free_gib:.1f} GiB free)'
                 )
             stage_mode = 'ssd+hybrid'
             engram_path = '/mnt/ram/engram.bin'
-            engram_tail_path = '/content/engram_tail.bin'
+            engram_tail_path = f'{ssd_dir}/engram_tail.bin'
             engram_head_bytes = head_b
             engram_tail_bytes = tail_b
             # Backbone already saturates /content's ~288 MiB/s write cap; download tail + RAM head together after /load punches backbone.
@@ -166,10 +438,10 @@ def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vra
         else:
             if eng_gib > float(disk_free_gib) - 8.0:
                 raise RuntimeError(
-                    f'Engram ({eng_gib:.1f} GiB) does not fit in /content disk ({disk_free_gib:.1f} GiB free)'
+                    f'Engram ({eng_gib:.1f} GiB) does not fit in {ssd_dir} disk ({disk_free_gib:.1f} GiB free)'
                 )
             stage_mode = 'ssd+ssd'
-            engram_path = '/content/engram.bin'
+            engram_path = f'{ssd_dir}/engram.bin'
             engram_head_bytes = 0
             engram_tail_bytes = int(engram_bytes)
             parallel_tail = False
@@ -300,6 +572,14 @@ def punch_sections(pack_path, names):
     return punched
 
 
+def _write_json(path, data):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--quant', default='ud-iq1_m')
@@ -312,11 +592,28 @@ def main():
     ap.add_argument('--engram-jobs', default=None)
     ap.add_argument('--engram-tail-jobs', default=None)
     ap.add_argument('--engram-size-out', default=None, help='Optional path to write exact Engram byte size')
+    ap.add_argument('--engram-plan-out', default=None,
+                    help='Emit multi-window Engram plan JSON + sparse SSD tail jobs for lazy post-/load finalize')
+    ap.add_argument('--est-ram-avail-gib', type=float, default=0.0,
+                    help='Estimated post-/load MemAvailable (GiB) used for initial parallel SSD range planning')
+    ap.add_argument('--no-initial-ssd', action='store_true',
+                    help='Defer all SSD range generation to --finalize-engram (used when PARALLEL_TAIL=0)')
+    ap.add_argument('--finalize-engram', action='store_true',
+                    help='Finalize RAM windows, layout file, and any extra SSD jobs from real post-/load MemAvailable')
+    ap.add_argument('--plan-json', default=None)
+    ap.add_argument('--mem-avail-gib', type=float, default=0.0)
+    ap.add_argument('--ram-dir', default='/mnt/ram')
+    ap.add_argument('--ssd-file', default='')
+    ap.add_argument('--layout-out', default=None)
+    ap.add_argument('--ram-jobs-out', default=None)
+    ap.add_argument('--ssd-extra-jobs-out', default=None)
+    ap.add_argument('--reserve-gib', type=float, default=5.0)
     ap.add_argument('--punch-sections', nargs='+', default=None,
                     help='Punch named sections (e.g. dspark/gguf dense) in --backbone-dest after /load')
     ap.add_argument('--test-punch', default=None, help='Probe FALLOC_FL_PUNCH_HOLE support in directory')
     ap.add_argument('--plan', action='store_true',
                     help='Read remote 64 KiB header and emit shell exports for optimal storage staging')
+    ap.add_argument('--ssd-dir', default='/content')
     ap.add_argument('--ram-total-gib', type=float, default=176.0)
     ap.add_argument('--disk-free-gib', type=float, default=220.0)
     ap.add_argument('--vram-gib', type=float, default=96.0)
@@ -333,11 +630,42 @@ def main():
         print(f'punched {args.punch_sections} in {args.backbone_dest}: freed {freed / GIB:.2f} GiB')
         return
 
+    if args.finalize_engram:
+        assert args.plan_json and args.layout_out and args.ram_jobs_out, \
+            '--plan-json, --layout-out, and --ram-jobs-out are required with --finalize-engram'
+        with open(args.plan_json) as f:
+            plan_doc = json.load(f)
+        res = finalize_engram_layout(
+            plan_doc,
+            mem_avail_gib=args.mem_avail_gib,
+            ram_dir=args.ram_dir,
+            ssd_file=args.ssd_file,
+            reserve_gib=args.reserve_gib,
+        )
+        parent = os.path.dirname(os.path.abspath(args.layout_out))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(args.layout_out, 'w') as f:
+            f.write(res['layout_text'])
+        _write_json(args.ram_jobs_out, res['ram_jobs'])
+        if args.ssd_extra_jobs_out:
+            _write_json(args.ssd_extra_jobs_out, res['ssd_extra_jobs'])
+        wp = res['plan']
+        extra_gib = sum(b - a for a, b in res['ssd_extra_ranges']) / GIB
+        print(
+            f"engram finalize (avail={args.mem_avail_gib:.1f} GiB): "
+            f"ram={wp['ram_bytes'] / GIB:.2f} GiB ({len(wp['ram_windows'])} win) | "
+            f"ssd={wp['ssd_bytes'] / GIB:.2f} GiB (extra={extra_gib:.2f} GiB) | "
+            f"cache_skip={len(wp['cache_skip_rows'])}"
+        )
+        return
+
     url = args.url or PACKS.get(args.quant.lower())
     if not url:
         sys.exit(f'unknown quant {args.quant!r} without --url')
 
-    file_bytes, sections = read_header(url, os.environ.get('HF_HDR'))
+    hf_hdr = os.environ.get('HF_HDR')
+    file_bytes, sections = read_header(url, hf_hdr)
 
     if args.plan:
         bb_bytes, eng_bytes = summarize_sections(sections)
@@ -349,6 +677,7 @@ def main():
                 disk_free_gib=args.disk_free_gib,
                 vram_gib=args.vram_gib,
                 explicit_budget_gib=args.ram_budget,
+                ssd_dir=args.ssd_dir,
             )
         except RuntimeError as e:
             sys.stderr.write(f'PLAN ERROR: {e}\n')
@@ -365,6 +694,7 @@ def main():
             ('RAM_BUDGET', str(plan['ram_budget'])),
             ('BACKBONE_GIB', str(plan['backbone_gib'])),
             ('ENGRAM_GIB', str(plan['engram_gib'])),
+            ('RAM_NEEDED_GIB', str(plan['ram_needed_gib'])),
             ('MODEL_URL', url),
         ):
             print(f'export {k}={shlex.quote(v)}')
@@ -381,18 +711,41 @@ def main():
         engram_head_bytes=args.engram_head_bytes,
     )
 
-    writes = [(args.backbone_jobs, bb_jobs), (args.engram_jobs, eng_jobs)]
+    eng_sec = next(s for s in sections if s['name'] == 'engram' and s['bytes'] > 0)
+    eng_total = eng_sec['bytes']
+
+    if args.engram_plan_out and args.engram_tail_dest:
+        meta = read_meta(url, sections, hf_hdr)
+        engram_info = extract_engram_subtables(meta, eng_total)
+        if args.no_initial_ssd:
+            initial_ssd = []
+            tail_jobs = []
+        else:
+            est_avail = args.est_ram_avail_gib
+            if est_avail <= 0.0:
+                est_avail = max(0.0, args.engram_head_bytes / GIB + args.reserve_gib)
+            init_plan = plan_engram_windows(eng_total, est_avail, engram_info=engram_info, reserve_gib=args.reserve_gib)
+            initial_ssd = init_plan['ssd_ranges']
+            _, tail_jobs, _ = build_engram_window_jobs(
+                url, eng_sec['offset'], eng_total, [], initial_ssd, ssd_file=args.engram_tail_dest,
+            )
+        plan_doc = {
+            'url': url,
+            'eng_offset': eng_sec['offset'],
+            'eng_bytes': eng_total,
+            'engram_info': engram_info,
+            'initial_ssd_ranges': [list(r) for r in initial_ssd],
+        }
+        _write_json(args.engram_plan_out, plan_doc)
+        eng_jobs = []  # populated by --finalize-engram after POST /load
+
+    _write_json(args.backbone_jobs, bb_jobs)
+    _write_json(args.engram_jobs, eng_jobs)
     if args.engram_tail_jobs and tail_jobs:
-        writes.append((args.engram_tail_jobs, tail_jobs))
-    for path, data in writes:
-        parent = os.path.dirname(os.path.abspath(path))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=2)
+        _write_json(args.engram_tail_jobs, tail_jobs)
     if args.engram_size_out:
         with open(args.engram_size_out, 'w') as f:
-            f.write(str(eng_jobs[0]['size']) + '\n')
+            f.write(str(eng_total if args.engram_plan_out else eng_jobs[0]['size']) + '\n')
 
     bb_gb = sum(j['size'] for j in bb_jobs) / 1e9
     eng_gb = sum(j['size'] for j in eng_jobs) / 1e9
