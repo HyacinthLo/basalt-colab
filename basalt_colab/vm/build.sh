@@ -91,23 +91,51 @@ if [ ! -x "$S/bin/basalt" ]; then
 fi
 
 PYDEPS=/mnt/ram/pydeps
-MISSING_PY=$(PYTHONPATH="$PYDEPS${PYTHONPATH:+:$PYTHONPATH}" python3 - <<'EOF'
-import importlib.util
-pkgs = [("numpy", "numpy"), ("jinja2", "jinja2"), ("markupsafe", "markupsafe"),
-        ("regex", "regex"), ("PIL", "pillow"), ("psutil", "psutil"), ("pypdf", "pypdf")]
-print(" ".join(pip_name for mod, pip_name in pkgs if importlib.util.find_spec(mod) is None))
+MISSING_REQ=$R/missing_req.txt
+PYTHONPATH="$PYDEPS${PYTHONPATH:+:$PYTHONPATH}" python3 - "$S/requirements.txt" "$MISSING_REQ" <<'EOF'
+import importlib.util, re, sys
+from pathlib import Path
+
+req_path, out_path = Path(sys.argv[1]), Path(sys.argv[2])
+pkgs = [
+    ("numpy", "numpy"),
+    ("jinja2", "jinja2"),
+    ("markupsafe", "markupsafe"),
+    ("regex", "regex"),
+    ("PIL", "pillow"),
+    ("psutil", "psutil"),
+    ("pypdf", "pypdf"),
+]
+missing = [pip_name for mod, pip_name in pkgs if importlib.util.find_spec(mod) is None]
+if not missing:
+    out_path.write_text("", encoding="utf-8")
+    raise SystemExit(0)
+
+pinned: dict[str, list[str]] = {}
+if req_path.is_file():
+    for raw in req_path.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        m = re.match(r"^([A-Za-z0-9_.-]+)", line)
+        if m:
+            pinned.setdefault(m.group(1).lower().replace("_", "-"), []).append(line)
+
+lines: list[str] = []
+for name in missing:
+    lines.extend(pinned.get(name.lower().replace("_", "-"), [name]))
+out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 EOF
-)
-if [ -n "$MISSING_PY" ]; then
+if [ -s "$MISSING_REQ" ]; then
   if [ -d /mnt/ram ]; then
     mkdir -p "$PYDEPS" /mnt/ram/tmp
-    TMPDIR=/mnt/ram/tmp pip install -q --no-cache-dir --no-deps --target "$PYDEPS" $MISSING_PY > $R/build_pip.log 2>&1 \
-      || pip install -q --no-deps $MISSING_PY > $R/build_pip.log 2>&1 \
+    TMPDIR=/mnt/ram/tmp pip install -q --no-cache-dir --no-deps --target "$PYDEPS" -r "$MISSING_REQ" > $R/build_pip.log 2>&1 \
+      || pip install -q --no-deps -r "$MISSING_REQ" > $R/build_pip.log 2>&1 \
       || pip install -q -r "$S/requirements.txt" > $R/build_pip.log 2>&1 \
       || { st "basalt pip FAILED"; exit 1; }
     rm -rf /mnt/ram/tmp
   else
-    pip install -q --no-deps $MISSING_PY > $R/build_pip.log 2>&1 || pip install -q -r "$S/requirements.txt" > $R/build_pip.log 2>&1 || { st "basalt pip FAILED"; exit 1; }
+    pip install -q --no-deps -r "$MISSING_REQ" > $R/build_pip.log 2>&1 || pip install -q -r "$S/requirements.txt" > $R/build_pip.log 2>&1 || { st "basalt pip FAILED"; exit 1; }
   fi
 fi
 

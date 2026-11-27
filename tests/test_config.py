@@ -781,6 +781,21 @@ class ConfigAndUnitTests(unittest.TestCase):
                 kr.set_password("google-colab-cli", "oauth_token", "fallback-tok")
                 self.assertEqual(kr.get_password("google-colab-cli", "oauth_token"), "fallback-tok")
 
+        # prebuilt_sha256 must be pinned (64 lowercase hex chars) whenever prebuilt_url is set
+        if m.prebuilt_url:
+            self.assertRegex(m.prebuilt_sha256, r"^[0-9a-f]{64}$")
+
+        # Installer selection avoids pipx on Python < 3.12 (google-colab-cli requires >= 3.12)
+        self.assertEqual(cli.pick_colab_installer(None, "/usr/bin/pipx", py_ver=(3, 11)), "uv")
+        self.assertEqual(cli.pick_colab_installer(None, "/usr/bin/pipx", py_ver=(3, 12)), "pipx")
+        self.assertEqual(cli.pick_colab_installer("/usr/bin/uv", "/usr/bin/pipx", py_ver=(3, 12)), "uv")
+        self.assertEqual(cli.pick_colab_installer(None, None, py_ver=(3, 12)), "uv")
+
+        # build.sh installs missing VM Python deps from Basalt's pinned requirements.txt
+        build_sh = (self.p.vm_dir / "build.sh").read_text(encoding="utf-8")
+        self.assertIn('"$S/requirements.txt" "$MISSING_REQ"', build_sh)
+        self.assertIn('-r "$MISSING_REQ"', build_sh)
+
 
 if __name__ == "__main__":
     unittest.main()
