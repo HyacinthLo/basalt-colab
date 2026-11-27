@@ -38,7 +38,7 @@
   - HF CDN → `/mnt/ram`（tmpfs）：**~3.45 GB/s（~3.21 GiB/s）**，可用上限 **~164 GiB**
   - HF CDN → `/content`（SSD `loop0`）：**~288 MiB/s（~0.281 GiB/s，比 tmpfs 慢 11.5×）**
 - 现有 `ssd+hybrid` 因为 Backbone（`~194.3 GiB`）超出 tmpfs（`164 GiB`）约 30 GiB，将**整块 194 GiB Backbone 降级写往 `/content`**（~11.5 min），且只能等 `/load` punch 释盘后再串行写 Engram SSD tail（~4.5–5 min），总冷启 **~18–21 分钟（~3.0 CU/次）**。
-- **物理下限**：`VRAM (~86 GiB) + RAM (~160 GiB) = 246 GiB`，因此 `320.14 GiB` 总包中**物理上真正必须写往 `/content` 慢盘的只有 `~66–76 GiB` Engram（取决于 `RowCache` 配额）**，**Backbone 在物理上 0 字节需要落 SSD**！
+- **物理下限**：`VRAM (~86 GiB) + RAM (176 GiB 扣除 ~9 GiB OS/残余 + 4 GiB RowCache + ≥5 GiB 动态安全垫 = ~158 GiB)`，因此 `320.14 GiB` 总包中**物理上必须写往 `/content` 慢盘的只有 `~78–84 GiB` Engram（标准推荐锁定 `41.96 GiB` Layer 1 3/4-gram 进 RAM 时为 `83.93 GiB`）**，**Backbone 在物理上 0 字节需要落 SSD**！
 
 ---
 
@@ -48,10 +48,10 @@
 
 | 阶段 | 方案 | 写 `/content` 总量 | 峰值 RAM 占用 | 预计冷启耗时 | 改动范围 |
 |---|---|---:|---:|---:|---|
-| 基线 | 当前 `ssd+hybrid` | ~270–282 GiB | ~160 GiB | ~18–21 min | 现有代码 |
+| 基线 | 当前 `ssd+hybrid` | ~278–282 GiB | ~160 GiB | ~18–21 min | 现有代码 |
 | **Stage 0** | 探测 G4 本地 NVMe scratch 盘 | 视硬件 | ~160 GiB | 若有 NVMe：**~2.2 min** | `boot.sh`（~10 行） |
-| **Stage 1（核心）** | **Loader 驱动微波分块流式加载（Micro-Wave）**（0 字节 Backbone 落盘 + `t=2s` 并行下稀疏 Engram SSD 段） | **`~68–76 GiB`**（物理下限） | **`~134 GiB`**（防 OOM） | **`~4.3–4.8 min`**（全量就绪） | `patch_basalt.py` + `basalt_jobs.py` + `wave_fetch.sh` + `boot.sh` |
-| **Stage 2（极致）** | **Engram SSD 段读优先异步落盘 + 4 KiB HTTP Range 无损回源**（专家 + RAM Window 就绪即开闸） | ~68–76 GiB（后台 Idle 写） | ~134 GiB | **~2.0–2.3 min 首字可用**（100% 无损） | `pfetch.py` + `patch_basalt.py` (`DirectFile`) + `boot.sh` |
+| **Stage 1（核心）** | **Loader 驱动微波分块流式加载（Micro-Wave）**（0 字节 Backbone 落盘 + `t=2s` 并行下稀疏 Engram SSD 段） | **`~78–84 GiB`**（安全物理下限） | **`~141 GiB`**（含 4 GiB RowCache，防 OOM） | **`~5.0–5.3 min`**（全量就绪） | `patch_basalt.py` + `basalt_jobs.py` + `wave_fetch.sh` + `boot.sh` |
+| **Stage 2（极致）** | **Engram SSD 段读优先异步落盘 + 4 KiB HTTP Range 无损回源**（专家 + RAM Window 就绪即开闸） | ~78–84 GiB（后台 Idle 写） | ~141 GiB | **~2.0–2.3 min 首字可用**（100% 无损） | `pfetch.py` + `patch_basalt.py` (`DirectFile`) + `boot.sh` |
 
 ---
 
@@ -62,13 +62,17 @@
 
 ---
 
-### Stage 1（核心）：Loader 驱动的微波分块流式加载（`~20 min → ~4.3–4.8 min`）
+### Stage 1（核心）：Loader 驱动的微波分块流式加载（`~20 min → ~5.0–5.3 min`）
 
-#### 关键架构修正：为什么 Wave 2 必须“微波分块（~16–20 GiB/批）”而不是整波拉取？
+#### 关键源码级不变量（已核实 `loader.cpp` / `model.cpp` / `ram_load.cpp`）
 
-- 如果 Wave 2 一次性将全部 `~108 GiB` `host_spans` 拉入 `/mnt/ram/model.basalt`，再一次性拷入 `alloc_ram()` 后才 `punch_spans`，瞬时物理内存峰值会达到 **`108 GiB (tmpfs) + 108 GiB (alloc_ram) + 8 GiB (OS/base) ≈ 224 GiB > 176 GiB`，必然触发 OOM Kill**！
-- **解法（Micro-Wave Streaming）**：在 [`patch_basalt.py`](../basalt_colab/vm/patch_basalt.py) Patch `#3b`（`src/core/loader.cpp`）中，将 `punch_host_wave` 按每批 **~16–20 GiB** 拆成 5–6 个微波循环：`BASALT_WAVE_FETCH_CMD` 拉 20 GiB → `run_wave(sub_wave)` 拷入 `alloc_ram` → 立刻 `punch_spans(sub_spans)` 释放 20 GiB tmpfs！
-- **效果**：加载期物理内存峰值从 `224 GiB` 骤降至 **`~134 GiB`**（保留 > 40 GiB 安全余量给 `RowCache` 与系统缓冲），且对 `UD-IQ1_M` / `UD-IQ2_XXS` 同样适用（tmpfs 峰值永远 ≤ ~20–40 GiB）；后续还可轻易扩展为双缓冲（拉取第 `i+1` 微波与拷贝第 `i` 微波重叠）。
+1. **Wave 2 必须“按偏移排序 + ~16–20 GiB 微波分块”防 OOM 与防误打洞**：
+   - `alloc_ram()` 走 `posix_memalign`/`mmap`（惰性虚拟分配），且 `pin_landed_complement()`（`plan.steps()`）和 `rounds[1]` 均在 Wave 2 全部结束后运行。
+   - 若 Wave 2 整波拉 `~108 GiB` 再拷入 `alloc_ram()`，峰值达 `108 + 108 + 9 + 4 = 229 GiB > 176 GiB` 必爆 OOM；拆为 **按文件偏移升序排序的 ~16–20 GiB 微波**（拉 20 GiB → 拷入 RAM → 立刻 punch 20 GiB）后，峰值降至 **`~141 GiB`**（留足 > 35 GiB 余量），且升序排序保证相邻微波字节区间单调不相交（inward 4K punch 数学上绝不破坏后批数据）并最大化 HTTP Range 连续性（3.45 GB/s）。
+2. **必须严格裁剪在 `experts` 小节内，严禁覆盖原地 Abliteration**：
+   - `rounds[0]` 同时包含 `dense`/`gguf` 与 VRAM 专家；导出 `dev_spans`/`host_spans` 给 `BASALT_WAVE_FETCH_CMD` 时**必须严格限定在 `experts` 小节 `[experts_off, experts_end)` 内**，避免 Wave 1 从 HF 重拉 `dense` 覆盖已打好的 62/62 abliteration 权重。
+3. **为何保持 tmpfs 微波中转而非 C++ 内置 HTTP**：
+   - `108 GiB` 在 DDR5 60+ GB/s 上多一次拷贝仅耗 **~1.8s**（<0.7% 启动时间），却换来 `basalt` 零新增 `libcurl`/`OpenSSL` 依赖、复用 3.47 GB/s 零 GIL `pfetch.py`、C++ 补丁控制在 ~30 行。
 
 ```mermaid
 sequenceDiagram
@@ -78,59 +82,60 @@ sequenceDiagram
     participant Loader as basalt Loader (POST /load)
     participant GPU as 96 GiB VRAM + Pinned RAM
 
-    Note over Boot,SSD: t = 2s: 启动后台流式写入 ~72 GiB 稀疏 Engram SSD 段 (~255s, 全程并行!)
-    Boot->>SSD: pfetch.py 稀疏 engram_tail.bin (Layer1 2-gram + Layer14, 后台并行)
+    Note over Boot,SSD: t = 2s: 启动后台流式写入 83.93 GiB 稀疏 Engram SSD 段 (~298s, 全程并行!)
+    Boot->>SSD: pfetch.py 稀疏 engram_tail.bin (Layer1 2-gram + Layer14, 两端+4KiB边界保护)
 
     Note over Boot,RAM: t = 2s: 仅下载非 experts 小节 (~8-10 GiB: header+meta+gguf+dspark+vision)
     Boot->>RAM: pfetch.py sparse model.basalt (~3s, experts 保持 0-block 空洞)
     Boot->>RAM: 原地 abliterate (62 个 dense 张量全在 gguf 内, ~1.5s)
-    Boot->>Loader: POST /load
+    Boot->>Loader: POST /load (BASALT_ENGRAM_LAZY_OPEN=1: 先分配 4 GiB RowCache, 延迟 mmap)
 
-    Note over Loader,GPU: Wave 1 (VRAM 波: ~85-88 GiB, 可按 32 GiB 微波)
-    Loader->>RAM: BASALT_WAVE_HOOK -> pfetch.py 拉取 dev_spans (~26s)
+    Note over Loader,GPU: Wave 1 (VRAM 波: 仅裁剪 experts 区间, 绝不碰 dense!)
+    Loader->>RAM: BASALT_WAVE_HOOK -> pfetch.py 拉取 dev_spans[experts] (~26s)
     Loader->>GPU: run_wave(rounds[0]) -> 写入 96 GiB VRAM (~6s)
     Loader->>RAM: punch_spans(dev_spans) -> /mnt/ram 立刻回落至 ~2 GiB
 
-    Note over Loader,GPU: Wave 2 (RAM 微波循环: 5-6 批 × ~20 GiB, 峰值 RAM <= 134 GiB!)
-    loop 每批 ~20 GiB host_spans
+    Note over Loader,GPU: Wave 2 (RAM 微波循环: 升序 5-6 批 × ~20 GiB, 峰值 RAM <= 141 GiB!)
+    loop 每批 ~20 GiB 升序 host_spans[experts]
         Loader->>RAM: BASALT_WAVE_HOOK -> pfetch.py 拉取 sub_spans (~6s)
         Loader->>GPU: run_wave(sub_wave) -> 写入 MADV_HUGEPAGE Pinned RAM (~1.5s)
         Loader->>RAM: punch_spans(sub_spans) -> 立刻释回 20 GiB tmpfs
     end
 
-    Note over Boot,RAM: t ≈ 90s: 全部 384/384 专家已 100% 在 VRAM+RAM 就绪!
-    Boot->>RAM: pfetch.py ~50-54 GiB Engram RAM Window (~16s)
-    Boot->>SSD: wait PID_TAIL (Stage 1 等后台写完; Stage 2 直接开闸!)
+    Note over Boot,RAM: t ≈ 90s: 全部 384/384 专家已就绪! 读真实 MemAvailable 安全定容 RAM Window
+    Boot->>RAM: pfetch.py 41.96 GiB Layer1 3/4-gram RAM Window (~13s, 保底留 >=10 GiB 安全余量)
+    Boot->>SSD: wait PID_TAIL (Stage 1 等后台写完; Stage 2 直接开闸触发 Lazy Open!)
 ```
 
 #### 具体代码改动清单
 
 1. **[`basalt_colab/vm/basalt_jobs.py`](../basalt_colab/vm/basalt_jobs.py)**
-   - 消除双重 RAM 预留（原 `auto_budget` `+8 GiB` 与 `_split_engram_bytes` `reserve_gib=14 GiB` 叠加浪费 ~22 GiB RAM），统一为单一安全预留（~6–8 GiB）并显式扣除 `ENGRAM_CACHE_MIB`（`RowCache` 预算），避免挤压专家或 OOM。
+   - **不再靠 `MemTotal` 静态盲猜硬扣双重预留**：配合 `BASALT_ENGRAM_LAZY_OPEN=1`，`/load` 时不预设过紧的 `RAM_BUDGET`（让 `expert_tier.cpp` 吃下全部剩余专家，0 专家落盘）；`/load` 完成后直接读真实 `/proc/meminfo` `MemAvailable`，按 `min(目标窗口, MemAvailable - 5 GiB)` 安全定容 RAM Window（若仍需静态预估则须按 `ram_needed + 12–13 GiB + RowCache` 计算，绝不可只扣 6–8 GiB）。
    - 新增规划模式 `wave+hybrid`（当 `bb_gib > ram_total_gib - 12.0` 且 `ram_needed_gib <= max_ram_experts_gib` 时启用，替代慢速 `ssd+hybrid`）：
      - `model_path = "/mnt/ram/model.basalt"`，`punch_file = "/mnt/ram/model.basalt"`，`parallel_tail = True`（0 字节 Backbone 写 `/content`，Engram SSD 段在 `t=2s` 立刻启动！）。
      - `j_basalt_bb_base.json`：仅包含 `header + meta + gguf + dspark/gguf + vision/mmproj`（排除 `experts` 与 `engram`，共 ~8–10 GiB），`dest_size` 仍为完整 `file_bytes`（稀疏空洞文件）。
-     - 输出 **RAM Window `[ram_lo, ram_hi)`**（`j_basalt_eng.json`）与 **逻辑全长稀疏 SSD 段**（`j_basalt_eng_tail.json`，参见第 4.3 节）。
+     - 输出 **64 MiB 对齐的 RAM Window `[ram_lo, ram_hi)`**（`j_basalt_eng.json`）与 **逻辑全长稀疏 SSD 段**（`j_basalt_eng_tail.json`，两端各加 `+4096 B` 页边界防零读保护，参见第 4.3 节）。
 2. **[`basalt_colab/vm/patch_basalt.py`](../basalt_colab/vm/patch_basalt.py)**
    - 新增 Patch `#9 BASALT_COLAB_WAVE_FETCH`（位于 `src/core/loader.cpp`，紧贴现有 Patch `#3b`）：
-     - 检查环境变量 `BASALT_WAVE_FETCH_CMD`（例如 `/content/vm/wave_fetch.sh`）与 `BASALT_WAVE_CHUNK_GIB`（默认 `20`）。
-     - Wave 1：对 `rounds[0]` 按块（或整波）导出落在 `experts` 区间的 `dev_spans` 到临时 JSON → 执行 `BASALT_WAVE_FETCH_CMD <spans.json> wave1` → `run_wave` → `punch_spans`。
-     - Wave 2：将 `punch_host_wave` 按 `BASALT_WAVE_CHUNK_GIB`（~20 GiB）切分为若干 `sub_wave`，每批严格执行 `fetch(sub_spans)` → `run_wave(sub_wave)` → `punch_spans(sub_spans)`，确保物理内存峰值不超过 `host_bytes + 20 GiB + 8 GiB`。
-   - **顺带验证 Patch `#3a`（`expert_tier.cpp`）**：由于 `/mnt/ram/model.basalt` 此时仅实际占用 ~8–10 GiB，主机 `MemAvailable` 本身就接近 ~160 GiB，规划更准。
+     - 检查 `BASALT_WAVE_FETCH_CMD`、`BASALT_WAVE_CHUNK_GIB`（默认 `20`）与 `BASALT_EXPERTS_RANGE`（`start:end`，严格裁剪只拉 `experts` 区间，绝不覆写 abliterated `dense`）。
+     - Wave 1：导出裁剪后的 `dev_spans` → 执行 `BASALT_WAVE_FETCH_CMD <spans.json> wave1` → `run_wave` → `punch_spans`。
+     - Wave 2：将 `punch_host_wave` 按**文件起始偏移升序排序**并按 `BASALT_WAVE_CHUNK_GIB`（~20 GiB）切分为若干 `sub_wave`，每批严格执行 `fetch(sub_spans)` → `run_wave(sub_wave)` → `punch_spans(sub_spans)`。
+   - 新增 **`BASALT_ENGRAM_LAZY_OPEN=1`**（`src/ngram/ple_reader.cpp`）：
+     - `DsModel::load()` 在 `POST /load` 最早阶段调用 `engram_->open()` 时，**仅分配 `RowCache`**（让随后的 `expert_tier.cpp` 准确扣除 `RowCache` 后再规划专家），把 `DirectFile::open()` + `mmap()` 延迟至首次 `issue()`（即 `boot.sh` Warmup 请求，此时 `/mnt/ram/engram.bin` 已按真实 `MemAvailable` 下完定型）；后台 `worker()` 在 `!m.file.is_open()` 时跳过 `keepalive` 读盘。
 3. **[`basalt_colab/vm/wave_fetch.sh`](../basalt_colab/vm/)（新增 ~20 行脚本）**
    - 读取 `spans.json`，生成 `pfetch.py` job 列表（按 `src_off = dest_off = span.start, size = span.end - span.start` 直接从 `MODEL_URL` 拉取到 `/mnt/ram/model.basalt`），以 `--workers $WORKERS --chunk-mb 128` 满速写入。
 4. **[`basalt_colab/vm/boot.sh`](../basalt_colab/vm/boot.sh)**
-   - `wave+hybrid` 下自动设置 `BASALT_WAVE_FETCH_CMD=/content/vm/wave_fetch.sh`、在 `t=2s` 启动 `PID_TAIL` 并行下稀疏 Engram SSD 段、前置仅拉 `j_basalt_bb_base.json`（~3s）→ 原地 abliteration（~1.5s）→ `POST /load`（内部自动跑 Wave 1 + Wave 2 微波）→ 拉 Engram RAM Window（~16s）→ `wait $PID_TAIL`。
+   - `wave+hybrid` 下设置 `BASALT_WAVE_FETCH_CMD` + `BASALT_EXPERTS_RANGE` + `BASALT_ENGRAM_LAZY_OPEN=1`：在 `t=2s` 启动 `PID_TAIL` 并行下 100% 必落盘的稀疏 Engram SSD 段（Layer 1 `2-gram` + Layer 14 = `83.93 GiB`）→ 前置拉 `j_basalt_bb_base.json`（~3s）→ 原地 abliteration（~1.5s）→ `POST /load`（Wave 1 + Wave 2 微波）→ 读真实 `MemAvailable` 定容并拉取 `41.96 GiB` RAM Window（~13s）→ `wait $PID_TAIL` → Warmup（触发 Lazy Open）→ 开闸。
 
 #### 收益与风险评估
-- **全量就绪时间**：`~20 s` (Colab 分配) + `max(105 s [Wave1+Wave2微波+RAM Window], 255 s [~72 GiB SSD 段])` + `5 s` (warmup) ≈ **`~4.3–4.8 分钟`**（比 20 分钟提速 **4.3×**，冷启 CU 从 ~3.0 降至 **~0.68 CU**）。
-- **稳定性**：100% 本地闭环，峰值 RAM ≤ 134 GiB 绝不 OOM，开闸后零外部网络依赖，风险极低。
+- **全量就绪时间**：`~20 s` (Colab 分配) + `max(105 s [Wave1+Wave2微波+RAM Window], 298 s [83.93 GiB 稀疏 SSD 段])` + `5 s` (warmup) ≈ **`~5.0–5.3 分钟`**（比 20 分钟提速 **3.8×**，冷启 CU 从 ~3.0 降至 **~0.77 CU**）。
+- **稳定性**：100% 本地闭环，加载峰值 RAM ≤ 141 GiB、运行期保留 `~10–13 GiB` 安全余量，绝不 OOM、绝不覆写 abliteration、跨页零精度损坏。
 
 ---
 
-### Stage 2（极致体验）：读优先异步落盘 + 无损 HTTP Range 回源（`~4.6 min → ~2.2 min` 首字可用）
+### Stage 2（极致体验）：读优先异步落盘 + 无损 HTTP Range 回源（`~5.2 min → ~2.2 min` 首字可用）
 
-在 Stage 1 基础上，`t ≈ 115 s` 时**全部 384/384 专家 + ~50 GiB RAM Window Engram 均已在 VRAM/RAM 就绪**，唯一在等的是后台还要写 ~2.5 分钟的 ~72 GiB SSD Engram 段。
+在 Stage 1 基础上，`t ≈ 115 s` 时**全部 384/384 专家 + `41.96 GiB` Layer 1 3/4-gram RAM Window + `4 GiB` RowCache 均已在 VRAM/RAM 就绪**，唯一在等的是后台还要写 ~3 分钟的 `83.93 GiB` SSD Engram 段。
 
 #### 实现路径（含读写竞争防饿死保护）
 
@@ -181,27 +186,39 @@ sequenceDiagram
 
 ### 4.3 优雅统一的推理期优化方案（100% 逐比特无损）
 
-1. **单区间 RAM Window `[ram_lo, ram_hi)` + 逻辑全长稀疏 SSD 文件（核心重构，比前缀切分更简洁）**
+1. **单区间 RAM Window `[ram_lo, ram_hi)` + 逻辑全长稀疏 SSD 文件（含 4 KiB 跨页防零读保护）**
    - `/content/engram_tail.bin` 创建为逻辑全长（`125.89 GiB`）的**稀疏文件**，只下载不在 RAM Window 里的区间（RAM 区间保持 0-block 空洞，0 字节重复落盘）；
-   - `/mnt/ram/engram.bin` 紧致存放 `[ram_lo, ram_hi)`（通过环境变量 `BASALT_ENGRAM_RAM_OFF` 指定起点，默认 `0` 保持 100% 向下兼容）：
-     - `PleReader` 命中 `[ram_lo, ram_hi)` → `mmap_head[at - ram_lo]`（80 ns 零拷贝）；
+   - `/mnt/ram/engram.bin` 紧致存放 `[ram_lo, ram_hi)`（强制对齐 `64 MiB`，通过环境变量 `BASALT_ENGRAM_RAM_OFF` 指定起点，默认 `0` 保持 100% 向下兼容）：
+     - `PleReader` 命中 `at >= ram_lo && at + rb <= ram_hi` → `mmap_head[at - ram_lo]`（80 ns 零拷贝）；
      - 未命中 → `DirectFile` 直接 `pread(fd2, buf, len, at)`（**无需再做 `offset - split_bytes` 偏移换算**！）。
+   - **关键边界防坑（防静默读出全零）**：因 `Q5_K` 行宽 `176 B` 不能整除 `4096 B`，跨 `ram_lo`/`ram_hi` 边界的那两行会触发 `DirectFile` 4 KiB 读进入空洞；**稀疏 SSD 文件下载区间在 `ram_lo` 之后与 `ram_hi` 之前各多覆盖 1 页（`+4096 B`，总共仅多占 8 KiB）**，保证全表 `768,022,850` 行 100% 逐比特精确。
    - **放置策略**：
-     - 若可用 RAM ≥ `63 GiB`（如 `solo` 模式 + 去除双重预留）：设 `[0, 62.94 GiB)`，**Layer 1 100% 在 RAM（0 次 Layer 1 盘读）**；
-     - 若可用 RAM 为 `46–56 GiB`（如 `parallel=2` 且留出 `4–8 GiB RowCache`）：设 `ram_lo = 20.98 GiB`（Layer 1 `3-gram` 起点），将 **Layer 1 `3-gram + 4-gram`（`41.96 GiB`）** 全部锁进 RAM，剩余容量顺延覆盖 Layer 14 或回吞 Layer 1 `2-gram`；仅将最易被 `RowCache` 命中的 `2-gram` 留在 SSD，**可将 Layer 1 有效盘读 IOPS 砍掉 70%–85%+**。
-2. **扩大 `RowCache` 至 `4–8 GiB` + 5 行“防 4-gram 冲刷”准入过滤（拒绝 `PageCache`）**
+     - 物理计算表明 G4 扣除 `~108 GiB` 专家 + `~9 GiB` 系统/残余 + `4 GiB` `RowCache` + `≥5 GiB` 动态缓冲后仅剩 `~50 GiB < 62.94 GiB`（无法安全硬塞完整 Layer 1）；
+     - 因此固定优先锁定 **`[20.98 GiB, 62.94 GiB)`（对齐后 `~41.96 GiB`，覆盖 100% Layer 1 `3-gram + 4-gram`）** 进 `/mnt/ram`，仅将最易命中的 Layer 1 `2-gram`（`20.98 GiB`）与 Layer 14（`62.95 GiB`）放 `/content`；
+     - **顺带惠及 `UD-IQ2_XXS`**：`UD-IQ2_XXS` 仅需 `~77 GiB` RAM 专家，套用同一策略可将 **Layer 1 全部（`51.50 GiB`）+ Layer 14 `3-gram + 4-gram`（`34.34 GiB`）= `85.84 GiB`** 全部装进 RAM，落盘的仅剩 `17.17 GiB` Layer 14 `2-gram`（有效盘读砍掉 ~80–90%）。
+2. **`4 GiB` `RowCache` + `RowCache::insert()` 统一防 4-gram 冲刷过滤（拒绝 `PageCache`）**
    - **保持 `/content` 走 `O_DIRECT`（0 `PageCache`）**：`PageCache` 以 4096 B 页缓存 176 B 均匀哈希行，空间浪费高达 **95.7%（密度比 `RowCache` 低 23×）**，且易与 `Pinned RAM`/`tmpfs` 争抢内存触发 Colab cgroup direct reclaim 或 OOM Kill。
-   - **放宽 Patch `#7` `RowCache` clamp**：将 [`patch_basalt.py`](../basalt_colab/vm/patch_basalt.py) 的 `4096 MiB` 上限放宽至 `16384 MiB`，`UD-Q2_K_XL` 默认配 **`4096–8192 MiB`**（存 `2,400–4,800 万` 行，等效 **`92–184 GiB PageCache`**，并从 RAM Window 预算中显式扣除）。
-   - **5 行防冲刷准入过滤**：因 `RowCache` 为组内 round-robin 替换，在 `PleReader` 插入前跳过落在 SSD 的 **Layer 14 `4-gram`** 行号区间，防止长 Prompt Prefill 一次性冷 4-gram 冲刷掉高频 2/3-gram 热缓存。
-3. **Colab G4 176 GiB 黄金配比（`UD-Q2_K_XL`）**
-   - **Pinned RAM 专家**：`~106–112 GiB`（第一优先级，0 专家落盘）
-   - **OS / KV / Prefill / Vision 安全缓冲**：`~6–8 GiB`
-   - **`RowCache`**：`4–8 GiB`（横跨 Layer 1 & 14 拦截高频 2/3-gram）
-   - **静态 `/mnt/ram` RAM Window (`mmap`)**：`~48–56 GiB`（全覆盖 Layer 1 `3-gram + 4-gram` `41.96 GiB`，`solo` 下逼近全覆盖 Layer 1 `62.94 GiB`）
+   - **为何 `4 GiB` 就是真实甜点（无需扩大 Patch `#7` 现有 `4096 MiB` clamp）**：
+     - 即使一场长达 **50 万 token** 的多轮编码会话，出现过的不同 2-gram 总数也仅约 5–20 万个（× 8 heads ≈ `160 万` 行 × `176 B` ≈ **`281 MiB`**）；
+     - `4 GiB` `RowCache`（`2,440 万` 行，等效 `92 GiB PageCache`）已足够将 Layer 1 + Layer 14 的高频 2-gram 吃到 **95–99% 命中率**（Layer 1 有效读盘趋近于 `< 0.3 次/token`），且不会在 `POST /load` 早期抢占 `expert_tier.cpp` 内存预算。
+   - **5 行防冲刷准入过滤（必须放在 `RowCache::insert()` 内部唯一入口）**：`ple_reader.cpp` 在 `worker()`（单页行）和 `collect()`（跨页 `split` 行）两处均调用 `m.cache.insert()`；在 `RowCache::insert()` 内部直接跳过落在 SSD 的 **Layer 14 `4-gram`** 行号区间，彻底防止 16K Prefill 一次性冷 4-gram 冲刷热 2/3-gram 缓存。
+3. **Colab G4 176 GiB 黄金安全配比（`UD-Q2_K_XL`）**
+   - **Pinned RAM 专家**：`~106–110 GiB`（第一优先级，0 专家落盘）
+   - **OS / CUDA / `model.basalt` 残余 / host buffers**：`~9 GiB`（刚性底噪）
+   - **`RowCache`**：**`4 GiB`**（`POST /load` 早期分配，Patch `#7` 现有上限直接支持）
+   - **静态 `/mnt/ram` RAM Window (`mmap`)**：**`~42 GiB`**（精确覆盖 Layer 1 `3-gram + 4-gram` `[20.98, 62.94)`，`/load` 后按真实 `MemAvailable - 5 GiB` 安全定容）
+   - **动态运行期余量**：**`~10–13 GiB`**（充裕覆盖多图 Vision `dynamic`、1M FP8 KV、并发请求与 `1.2 GiB` 熔断线，绝不 OOM）
    - **`PageCache`**：`0`（保持 `O_DIRECT`）
 4. **放开 `PleReader` `max_inflight`（64 → 256）+ Stage 0 探测本地 NVMe**
    - 在 [`patch_basalt.py`](../basalt_colab/vm/patch_basalt.py) 中将 `engram_->open(..., 64, ...)` 改为可由 `BASALT_ENGRAM_INFLIGHT` 配置（默认 `256`，匹配 `DirectFile` 256 线程），提升 16K Prefill 并发队列深度；若 Stage 0 命中本地 NVMe 则 IOPS 瓶颈直接归零。
 5. **备选（自转混合包，几乎无损）**：`UD-Q2_K_XL` 专家 + 4-bit Engram（`MXFP4` 136 B/行共 `97.3 GiB`，**Layer 1 仅 `48.6 GiB`**；或 `IQ4_NL` 共 `103 GiB`），立省 **23–29 GiB RAM**，`parallel=2` 下也能 100% 装下整个 Layer 1 + 部分 Layer 14。
+
+### 4.4 客观物理边界与残余局限（无法靠软件消除）
+
+1. **冷启动写盘下限**：无本地 NVMe 时，~83.9 GiB 稀疏 Engram 写入 288 MiB/s 的 `/content` 存在 ~298s 的硬除法下限（Stage 1 约 `~5.0–5.3 min`）；压至 `~2.2 min` 需启用 Stage 2（前 ~3 分钟冷行偶发 5–15 ms HTTP 回源）。
+2. **首次冷 16K–128K 超长 Prefill 的 Layer 14 读盘延迟**：Layer 14 主体在 `/content`，首轮超长上下文 Prefill 仍受 GCE PD 随机读 IOPS 限制；第二轮起由 32 GiB `conv_cache` 增量复用 + `4 GiB RowCache` 恢复满速。
+3. **Colab 无 Swap 约束**：严守 `/load` 后 `MemAvailable` 至少保留 `≥ 5 GiB` 安全垫，不试图把 62.94 GiB 全量 Layer 1 硬塞进 RAM。
+4. **上游补丁维护面**：外挂补丁集中在 `loader.cpp` / `ple_reader.cpp` / `direct_file.cpp` / `model.cpp` 4 个文件；每次升级 Basalt tag 均由 CI 锚点检查与预编译 `sm_120` 流水线把关。
 
 ---
 
@@ -214,9 +231,9 @@ sequenceDiagram
 2. **接入 `UD-Q2_K_XL` 包直链**：
    - 回填 `manifest.json` `packs.ud-q2_k_xl.url`；
    - 放行 `config.py` 对 `ud-q2_k_xl` 免填 `--pack-url`（沿用 `manifest.json` 内置 URL）。
-3. **先落地 Stage 0 + Stage 1（Micro-Wave）+ Engram 推理优化（RAM Window + `4–8 GiB` 过滤 `RowCache` + `max_inflight=256`），单次真机 G4 实测验收**：
-   - 核验 `timeline.txt`：Wave 1 / Wave 2 各微波耗时与 punch 回收、`/mnt/ram` 与整体内存峰值（目标 ≤ 135 GiB、绝不 OOM）、`/content` 写入总量（确认 0 字节 Backbone 落盘、仅 ~68–76 GiB 稀疏 Engram）；
-   - 核验 `basalt` 启动日志：`expert homes`（目标 143–153/384 in VRAM，0 on SSD）、`0 lossy flags`、RAM Window 区间（确认覆盖 Layer 1 `3-gram+4-gram` 或全 Layer 1）；
+3. **先落地 Stage 0 + Stage 1（Micro-Wave）+ Engram 推理优化（`LAZY_OPEN` + RAM Window + `+4096 B` 边界保护 + `4 GiB` 过滤 `RowCache` + `max_inflight=256`），单次真机 G4 实测验收**：
+   - 核验 `timeline.txt`：Wave 1（仅 `experts` 不覆写 abliteration）/ Wave 2 升序微波耗时与 punch 回收、整体内存峰值（目标 ≤ 141 GiB、绝不 OOM）、`/content` 写入总量（0 字节 Backbone 落盘、仅 ~83.9 GiB 稀疏 Engram）；
+   - 核验 `basalt` 启动日志：`expert homes`（目标 143–153/384 in VRAM，0 on SSD）、`0 lossy flags`、abliteration 生效验证、RAM Window 精确覆盖 Layer 1 `3-gram+4-gram`（`41.96 GiB`）且边界两行逐字节一致；
    - 核验推理吞吐与 Engram I/O：实测 `conv / struct / prose` Decode 吞吐、16K 长 Prompt Prefill 吞吐以及 `PleReader` 读盘延迟（p50/p99）与 `RowCache` 命中率。
 4. **按需叠加 Stage 2（读优先异步落盘）**：
-   - 若希望将 ~4.5 min 进一步压至 ~2.2 min，再实现 `ready_bitmap` + Unix-socket Keep-Alive Range 回源 + `$R/READY` 后的 `ionice -c 3` 限速退让，并用 `test_config.py` 本地单测验证未就绪 chunk 回源、就绪切换与稀疏文件偏移的逐字节一致性。
+   - 若希望将 ~5.2 min 进一步压至 ~2.2 min，再实现 `ready_bitmap` + Unix-socket Keep-Alive Range 回源 + `$R/READY` 后的 `ionice -c 3` 限速退让，并用 `test_config.py` 本地单测验证未就绪 chunk 回源、就绪切换与稀疏文件边界页的逐字节一致性。
