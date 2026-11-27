@@ -44,3 +44,12 @@ clients / browser --HTTP--> basalt-colab :18080 (/_console, /_control/*, /v1/*, 
 - [`basalt_colab/term.py`](basalt_colab/term.py) + [`basalt_colab/cli.py`](basalt_colab/cli.py): terminal UI helpers and strict `argparse` CLI entrypoint (`basalt-colab` / `python3 -m basalt_colab`).
 - [`basalt_colab/vm/`](basalt_colab/vm/): packaged VM scripts (`boot.sh`, `build.sh`, `serve.sh`, `patch_basalt.py`, `basalt_jobs.py`, `abliterate_basalt.py`, `abliterate.c`, `pfetch.py`, `gate.py`).
 - [`docs/how-it-works.md`](docs/how-it-works.md) & [`docs/q2k-xl-acceleration.md`](docs/q2k-xl-acceleration.md): architecture overview and planned `UD-Q2_K_XL` cold-start acceleration roadmap.
+
+## Upstream Version Governance
+
+Always verify upstream releases (`jesdga95/basalt`, `googlecolab/google-colab-cli`) before bumping pins, maintain the verified list in [`basalt_colab/vm/manifest.json`](basalt_colab/vm/manifest.json), and point `colab_cli` at the **latest verified version** so fresh installs receive the newest verified release while `basalt-colab doctor` flags unverified installs.
+
+- **`google-colab-cli` verified matrix** (last audited `2026-11-27`):
+  - **`0.8.0`** — **Verified & pinned default** (`colab_cli`). Fixes Windows SSH portability (`#181`), `exec --timeout` busy-wait (`#185`), `0600` state/log permissions (`#196`), and piped `ssh` auto-update suppression. Uses native Keychain / Windows Credential Manager on macOS & Windows; on Linux, `colab_env()` injects the zero-dep [`basalt_colab/keyring_shim/basalt_colab_keyring.py`](basalt_colab/keyring_shim/basalt_colab_keyring.py) (`FallbackFileKeyring`) which delegates to native GNOME Keyring / KWallet when available and falls back to an owner-only (`0600`) atomic file store on headless Linux/WSL2/Docker/SSH/Termux (with automatic migration from `0.7.5` `token.json`).
+  - `0.7.5`, `0.7.6` — **Verified & supported** (`colab_cli_supported`). Existing installs continue to work; `basalt-colab doctor` notes `0.8.0` as the latest verified release.
+  - `1.0.0` *(upcoming, upstream `#289`)* — **Watch closely**: migrates to Colab Public API + GCP quota project (`colab init-gcp-project`); requires explicit setup/OAuth adaptation & cross-platform verification before upgrading.

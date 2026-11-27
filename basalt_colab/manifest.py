@@ -33,9 +33,17 @@ class Manifest:
     g4_cu_per_hour: float
     estimated_speed_tok_s: float
     packs: dict[str, PackSpec] = field(default_factory=dict)
+    colab_cli_supported: tuple[str, ...] = ("0.7.5", "0.7.6", "0.8.0")
 
     def pack(self, quant: str) -> PackSpec | None:
         return self.packs.get(quant.strip().lower())
+
+    def colab_cli_pinned_version(self) -> str:
+        _, sep, ver = self.colab_cli.partition("==")
+        return ver.strip() if sep else ""
+
+    def is_colab_cli_supported(self, version: str | None) -> bool:
+        return bool(version and version.strip() in self.colab_cli_supported)
 
 
 def load_manifest(vm_dir: Path) -> Manifest:
@@ -53,6 +61,13 @@ def load_manifest(vm_dir: Path) -> Manifest:
             estimated_speed_tok_s=float(info.get("estimated_speed_tok_s", raw.get("estimated_speed_tok_s", 160.4))),
             description=str(info.get("description", "")),
         )
+    colab_cli = raw.get("colab_cli", "google-colab-cli==0.8.0")
+    raw_supported = raw.get("colab_cli_supported")
+    if isinstance(raw_supported, list) and raw_supported:
+        supported = tuple(str(v).strip() for v in raw_supported if str(v).strip())
+    else:
+        _, sep, pinned = str(colab_cli).partition("==")
+        supported = (pinned.strip(),) if sep and pinned.strip() else ()
     return Manifest(
         basalt_repo=raw["basalt_repo"],
         basalt_tag=raw["basalt_tag"],
@@ -63,8 +78,9 @@ def load_manifest(vm_dir: Path) -> Manifest:
         pack_model_id=raw["pack_model_id"],
         abliteration_url=raw["abliteration_url"],
         abliteration_sha256=raw["abliteration_sha256"],
-        colab_cli=raw.get("colab_cli", "google-colab-cli==0.7.5"),
+        colab_cli=colab_cli,
         g4_cu_per_hour=float(raw.get("g4_cu_per_hour", 8.9)),
         estimated_speed_tok_s=float(raw.get("estimated_speed_tok_s", 160.4)),
         packs=packs,
+        colab_cli_supported=supported,
     )
