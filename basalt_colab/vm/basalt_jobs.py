@@ -256,10 +256,11 @@ def plan_engram_windows(engram_bytes, avail_ram_gib, engram_info=None, reserve_g
 
 def build_engram_window_jobs(url, eng_offset, eng_bytes, ram_windows, ssd_ranges, ram_dir='/mnt/ram', ssd_file=''):
     """Builds compact RAM window jobs (`engram_0.bin`, ...) and logical full-size sparse SSD jobs."""
+    ram_base = (ram_dir or '/mnt/ram').rstrip('/') or '/mnt/ram'
     ram_jobs = []
     ram_layout = []
     for idx, (lo, hi) in enumerate(ram_windows):
-        dest = os.path.join(ram_dir, f'engram_{idx}.bin')
+        dest = f'{ram_base}/engram_{idx}.bin'
         ram_jobs.append({
             'url': url,
             'dest': dest,
