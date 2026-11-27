@@ -16,7 +16,8 @@ export PORT=18081 UNCENSOR=${UNCENSOR:-1} UNCENSOR_SCALE=${UNCENSOR_SCALE:-1.0} 
 export PARALLEL=${PARALLEL:-2} KV_TYPE=${KV_TYPE:-fp8} VISION_MODE=${VISION_MODE:-dynamic}
 export SPEC_MAX=${SPEC_MAX:-6} DRAFT_EXPERTS=${DRAFT_EXPERTS:-32}
 export VRAM_RESERVE=${VRAM_RESERVE:-450} RAM_BUDGET=${RAM_BUDGET:-0}
-export ROUTING_MODE=${ROUTING_MODE:-exact} POOL_WORKERS=${POOL_WORKERS:-0} ENGRAM_CACHE_MIB=${ENGRAM_CACHE_MIB:-1024}
+export ROUTING_MODE=${ROUTING_MODE:-exact} POOL_WORKERS=${POOL_WORKERS:-0} ENGRAM_CACHE_MIB=${ENGRAM_CACHE_MIB:-4096}
+export ENGRAM_INFLIGHT=${ENGRAM_INFLIGHT:-256}
 export CONV_CACHE_MIB=${CONV_CACHE_MIB:-32768}
 export MODEL_QUANT=${MODEL_QUANT:-ud-iq1_m}
 export MODEL_ALIAS=${MODEL_ALIAS:-DeepSeek-V4.1-Flash-1017-UD-IQ1_M}
@@ -57,16 +58,70 @@ fi
 
 st "boot start engine=basalt quant=$MODEL_QUANT model=$MODEL_ALIAS ref=${BASALT_REF:-pinned} ctx=$CTX parallel=$PARALLEL kv=$KV_TYPE vision=$VISION_MODE route=$ROUTING_MODE vram_res=$VRAM_RESERVE uncensored=$UNCENSOR scale=$UNCENSOR_SCALE"
 
+# Stage 0: Probe for fast local NVMe scratch mount (>600 MiB/s synced write, >=120 GiB free); fallback to /content
+SSD_DIR=/content
+if [ -n "${BASALT_SSD_DIR:-}" ]; then
+  SSD_DIR="$BASALT_SSD_DIR"
+  mkdir -p "$SSD_DIR"
+else
+  while read -r dev mnt fstype _; do
+    case "$mnt" in
+      /|/boot*|/content|/mnt/ram|/proc*|/sys*|/dev*|/run*|/tmp) continue ;;
+    esac
+    case "$fstype" in
+      ext4|xfs|btrfs) ;;
+      *) continue ;;
+    esac
+    [ -w "$mnt" ] || continue
+    avail_g=$(df -BG --output=avail "$mnt" 2>/dev/null | tail -1 | tr -dc '0-9')
+    [ "${avail_g:-0}" -ge 120 ] || continue
+    probe="$mnt/.basalt_io_probe.$$"
+    w_mibs=$(python3 - "$probe" <<'PYEOF'
+import os, sys, time
+p = sys.argv[1]
+sz = 128 * 1024 * 1024
+try:
+    t0 = time.monotonic()
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        buf = b"\x5a" * (4 * 1024 * 1024)
+        for _ in range(sz // len(buf)):
+            os.write(fd, buf)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    dt = max(time.monotonic() - t0, 1e-4)
+    print(int((sz / 1048576.0) / dt))
+except OSError:
+    print(0)
+finally:
+    try:
+        os.unlink(p)
+    except OSError:
+        pass
+PYEOF
+    )
+    if [ "${w_mibs:-0}" -gt 600 ]; then
+      SSD_DIR="$mnt/basalt_scratch"
+      mkdir -p "$SSD_DIR"
+      st "stage0: selected fast local scratch $SSD_DIR (dev=$dev fs=$fstype free=${avail_g}GiB write=${w_mibs}MiB/s)"
+      break
+    fi
+  done < /proc/mounts
+fi
+export SSD_DIR
+export CONV_CACHE_DIR="${CONV_CACHE_DIR:-$SSD_DIR/conv_cache}"
+
 RAM_GIB=$(awk '/MemTotal/ {printf "%.1f", $2/1048576}' /proc/meminfo)
 TMPFS_GIB=$(awk '/MemTotal/ {print int($2/1048576) - 6}' /proc/meminfo)
-DISK_FREE_GIB=$(df -BG --output=avail /content | tail -1 | tr -dc '0-9')
+DISK_FREE_GIB=$(df -BG --output=avail "$SSD_DIR" | tail -1 | tr -dc '0-9')
 VRAM_GIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | awk '{printf "%.1f", ($1>0?$1:98304)/1024}')
 VRAM_GIB=${VRAM_GIB:-96.0}
 mountpoint -q /mnt/ram || mount -t tmpfs -o size=${TMPFS_GIB}G tmpfs /mnt/ram
 
 # Inspect remote 64 KiB .basalt header and plan ram+ram / ram+hybrid / ssd+hybrid (fail-fast if > VM RAM+VRAM)
 PLAN_OUT=$(python3 $V/basalt_jobs.py --plan --quant "$MODEL_QUANT" --url "$MODEL_URL" \
-  --ram-total-gib "$RAM_GIB" --disk-free-gib "$DISK_FREE_GIB" --vram-gib "$VRAM_GIB" \
+  --ssd-dir "$SSD_DIR" --ram-total-gib "$RAM_GIB" --disk-free-gib "$DISK_FREE_GIB" --vram-gib "$VRAM_GIB" \
   --ram-budget "$RAM_BUDGET" 2> $R/plan_err.txt) || {
   st "storage plan FAILED ($(tr '\n' ' ' < $R/plan_err.txt))"
   exit 1
@@ -74,44 +129,61 @@ PLAN_OUT=$(python3 $V/basalt_jobs.py --plan --quant "$MODEL_QUANT" --url "$MODEL
 eval "$PLAN_OUT"
 ENG_SPLIT_DESC="${ENGRAM_GIB}GiB"
 if [ -n "${ENGRAM_TAIL_PATH:-}" ]; then
-  ENG_SPLIT_DESC="$(python3 -c "print(f'{int($ENGRAM_HEAD_BYTES)/1073741824:.1f}GiB-RAM+{int($ENGRAM_TAIL_BYTES)/1073741824:.1f}GiB-SSD')")"
+  ENG_SPLIT_DESC="$(python3 -c "print(f'{int($ENGRAM_HEAD_BYTES)/1073741824:.1f}GiB-RAM+{int($ENGRAM_TAIL_BYTES)/1073741824:.1f}GiB-SSD(lazy)')")"
 fi
-st "storage plan mode=$STAGE_MODE bb=${BACKBONE_GIB}GiB eng=${ENG_SPLIT_DESC} ram_budget=${RAM_BUDGET}GiB parallel_tail=${PARALLEL_TAIL} (vm ram=${RAM_GIB}GiB disk=${DISK_FREE_GIB}GiB vram=${VRAM_GIB}GiB)"
+st "storage plan mode=$STAGE_MODE bb=${BACKBONE_GIB}GiB eng=${ENG_SPLIT_DESC} ram_budget=${RAM_BUDGET}GiB parallel_tail=${PARALLEL_TAIL} ssd_dir=$SSD_DIR (vm ram=${RAM_GIB}GiB disk=${DISK_FREE_GIB}GiB vram=${VRAM_GIB}GiB)"
 
-# Probe hole-punching on /content before downloading 200+ GiB in ssd+* modes
+# Probe hole-punching on $SSD_DIR before downloading 200+ GiB in ssd+* modes
 if [[ "$STAGE_MODE" == ssd+* ]]; then
-  python3 $V/basalt_jobs.py --test-punch /content > $R/punch_probe.txt 2>&1 || {
-    st "GUARD: /content does not support FALLOC_FL_PUNCH_HOLE ($(cat $R/punch_probe.txt 2>/dev/null)) FAILED"
+  python3 $V/basalt_jobs.py --test-punch "$SSD_DIR" > $R/punch_probe.txt 2>&1 || {
+    st "GUARD: $SSD_DIR does not support FALLOC_FL_PUNCH_HOLE ($(cat $R/punch_probe.txt 2>/dev/null)) FAILED"
     exit 1
   }
-  st "punch probe /content ok"
+  st "punch probe $SSD_DIR ok"
 fi
 
-python3 $V/basalt_jobs.py --quant "$MODEL_QUANT" --url "$MODEL_URL" \
-  --backbone-dest "$MODEL_PATH" --backbone-jobs "$R/j_basalt_bb.json" \
-  --engram-dest "$ENGRAM_PATH" --engram-jobs "$R/j_basalt_eng.json" \
-  --engram-tail-dest "${ENGRAM_TAIL_PATH:-}" --engram-head-bytes "${ENGRAM_HEAD_BYTES:-0}" \
-  --engram-tail-jobs "$R/j_basalt_eng_tail.json" \
-  --engram-size-out "$R/engram_size.txt" > $R/fetch.log 2>&1 || { st "basalt_jobs FAILED"; exit 1; }
-ENGRAM_HEAD_SIZE=$(cat $R/engram_size.txt)
-
-# Pre-create 0-block sparse Engram file(s) so PleReader::open sees exact logical sizes during /load
-python3 -I -c "
+if [ -n "${ENGRAM_TAIL_PATH:-}" ]; then
+  # Hybrid modes: allocate RowCache during /load, defer Engram mmap/open until post-/load real MemAvailable finalize
+  export BASALT_ENGRAM_LAZY_OPEN=1
+  export BASALT_ENGRAM_LAYOUT=/mnt/ram/engram_layout.txt
+  rm -f "$BASALT_ENGRAM_LAYOUT" /mnt/ram/engram_*.bin "$R/j_basalt_eng_tail.json" "$R/j_basalt_eng_tail_extra.json"
+  EST_RAM_AVAIL_GIB=$(python3 -c "print(max(0.0, float('$RAM_GIB') - float('${RAM_NEEDED_GIB:-0}') - 11.5 - float('$ENGRAM_CACHE_MIB')/1024.0))")
+  PLAN_EXTRA_ARGS=(--engram-plan-out "$R/engram_plan.json" --est-ram-avail-gib "$EST_RAM_AVAIL_GIB")
+  [ "${PARALLEL_TAIL:-0}" = 0 ] && PLAN_EXTRA_ARGS+=(--no-initial-ssd)
+  python3 $V/basalt_jobs.py --quant "$MODEL_QUANT" --url "$MODEL_URL" \
+    --backbone-dest "$MODEL_PATH" --backbone-jobs "$R/j_basalt_bb.json" \
+    --engram-dest "$ENGRAM_PATH" --engram-jobs "$R/j_basalt_eng.json" \
+    --engram-tail-dest "$ENGRAM_TAIL_PATH" --engram-head-bytes "${ENGRAM_HEAD_BYTES:-0}" \
+    --engram-tail-jobs "$R/j_basalt_eng_tail.json" \
+    --engram-size-out "$R/engram_size.txt" "${PLAN_EXTRA_ARGS[@]}" > $R/fetch.log 2>&1 || { st "basalt_jobs FAILED"; exit 1; }
+  ENGRAM_TOTAL_SIZE=$(cat $R/engram_size.txt)
+  # Pre-create logical full-size 0-block sparse SSD file for parallel/delta range writes
+  python3 -I -c "
 import os
-def prep(p, sz):
-    if p and int(sz) > 0:
-        f = os.open(p, os.O_WRONLY | os.O_CREAT, 0o644)
-        os.ftruncate(f, int(sz))
-        os.close(f)
-prep('$ENGRAM_PATH', '$ENGRAM_HEAD_SIZE')
-prep('${ENGRAM_TAIL_PATH:-}', '${ENGRAM_TAIL_BYTES:-0}')
+f = os.open('$ENGRAM_TAIL_PATH', os.O_WRONLY | os.O_CREAT, 0o644)
+os.ftruncate(f, int('$ENGRAM_TOTAL_SIZE'))
+os.close(f)
 "
+else
+  python3 $V/basalt_jobs.py --quant "$MODEL_QUANT" --url "$MODEL_URL" \
+    --backbone-dest "$MODEL_PATH" --backbone-jobs "$R/j_basalt_bb.json" \
+    --engram-dest "$ENGRAM_PATH" --engram-jobs "$R/j_basalt_eng.json" \
+    --engram-size-out "$R/engram_size.txt" > $R/fetch.log 2>&1 || { st "basalt_jobs FAILED"; exit 1; }
+  ENGRAM_HEAD_SIZE=$(cat $R/engram_size.txt)
+  # Pre-create 0-block sparse Engram file so PleReader::open sees exact logical size during /load
+  python3 -I -c "
+import os
+f = os.open('$ENGRAM_PATH', os.O_WRONLY | os.O_CREAT, 0o644)
+os.ftruncate(f, int('$ENGRAM_HEAD_SIZE'))
+os.close(f)
+"
+fi
 
 # Launch parallel build + abliteration fetch + backbone fetch (+ SSD Engram tail if PARALLEL_TAIL=1!)
 SSD_WORKERS=$(( WORKERS < 16 ? WORKERS : 16 ))
 PID_TAIL=""
 if [ "${PARALLEL_TAIL:-0}" = 1 ]; then
-  if [ -n "${ENGRAM_TAIL_PATH:-}" ] && [ -s "$R/j_basalt_eng_tail.json" ]; then
+  if [ -n "${ENGRAM_TAIL_PATH:-}" ] && [ -s "$R/j_basalt_eng_tail.json" ] && grep -q '"url"' "$R/j_basalt_eng_tail.json"; then
     { python3 $V/pfetch.py $R/j_basalt_eng_tail.json --workers $SSD_WORKERS --chunk-mb 64 --tag basalt-eng-tail --log $R/fetch_tail.log \
       && st "engram tail done ($ENGRAM_TAIL_PATH)" || st "engram tail FAILED"; } &
     PID_TAIL=$!
@@ -133,7 +205,7 @@ if [ "$UNCENSOR" = 1 ]; then
 fi
 BB_WORKERS=$WORKERS
 BB_CHUNK=128
-[[ "$MODEL_PATH" == /content/* ]] && { BB_WORKERS=$SSD_WORKERS; BB_CHUNK=64; }
+[[ "$MODEL_PATH" != /mnt/ram/* ]] && { BB_WORKERS=$SSD_WORKERS; BB_CHUNK=64; }
 { python3 $V/pfetch.py $R/j_basalt_bb.json --workers $BB_WORKERS --chunk-mb $BB_CHUNK --tag basalt-bb --log $R/fetch.log \
   && st "backbone fetched ($MODEL_QUANT -> $MODEL_PATH)" || st "backbone FAILED"; } &
 PID_BB=$!
@@ -173,31 +245,65 @@ if [ -n "${BASALT_PUNCH_FILE:-}" ]; then
 fi
 st "pin: VRAM ${VRAM} MiB, model $(du -sh "$MODEL_PATH" | awk '{print $1}'), mode=$STAGE_MODE"
 
-# Stream RAM Engram (full in ram+ram, head in ram+hybrid/ssd+hybrid) and/or sequential SSD tail
+# Stream RAM Engram (full in ram+ram, multi-window RAM + sparse SSD in hybrid modes)
 if [[ "$ENGRAM_PATH" == /mnt/ram/* ]]; then
   ( for k in $(seq 1 600); do [ -f $R/READY ] && exit 0; a=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
       [ "$a" -lt 1200 ] && { for p in $(pgrep -f "[p]fetch.py"); do kill $p; done; st "GUARD: ${a} MiB RAM available, engram fetch stopped FAILED"; exit 0; }; sleep 2; done ) &
 fi
 
-# In ssd+hybrid (where PARALLEL_TAIL=0), start SSD tail & RAM head concurrently now that /content backbone is punched!
-if [ "${PARALLEL_TAIL:-0}" = 0 ] && [ -n "${ENGRAM_TAIL_PATH:-}" ] && [ -s "$R/j_basalt_eng_tail.json" ]; then
-  { python3 $V/pfetch.py $R/j_basalt_eng_tail.json --workers $SSD_WORKERS --chunk-mb 64 --tag basalt-eng-tail --log $R/fetch_tail.log \
-    && st "engram tail done ($ENGRAM_TAIL_PATH)" || st "engram tail FAILED"; } &
-  PID_TAIL=$!
+if [ "${BASALT_ENGRAM_LAZY_OPEN:-0}" = 1 ]; then
+  MEM_AVAIL_GIB=$(awk '/MemAvailable/ {printf "%.2f", $2/1048576}' /proc/meminfo)
+  FIN_MSG=$(python3 $V/basalt_jobs.py --finalize-engram \
+    --plan-json "$R/engram_plan.json" \
+    --mem-avail-gib "$MEM_AVAIL_GIB" \
+    --ram-dir /mnt/ram \
+    --ssd-file "$ENGRAM_TAIL_PATH" \
+    --layout-out "$BASALT_ENGRAM_LAYOUT" \
+    --ram-jobs-out "$R/j_basalt_eng.json" \
+    --ssd-extra-jobs-out "$R/j_basalt_eng_tail_extra.json" 2>&1) || {
+      [ -n "$PID_TAIL" ] && kill $PID_TAIL 2>/dev/null || true
+      st "engram finalize FAILED ($FIN_MSG)"; exit 1;
+    }
+  st "$FIN_MSG"
+
+  # If 100% of Engram fit in RAM windows, cancel any unnecessary background SSD tail fetch
+  if ! grep -q '^ssd ' "$BASALT_ENGRAM_LAYOUT"; then
+    [ -n "$PID_TAIL" ] && { kill $PID_TAIL 2>/dev/null || true; PID_TAIL=""; }
+    rm -f "$ENGRAM_TAIL_PATH"
+  elif [ "${PARALLEL_TAIL:-0}" = 0 ] && [ -s "$R/j_basalt_eng_tail_extra.json" ] && grep -q '"url"' "$R/j_basalt_eng_tail_extra.json"; then
+    # In ssd+hybrid (PARALLEL_TAIL=0), start exact post-/load SSD ranges concurrently with RAM windows
+    mv -f "$R/j_basalt_eng_tail_extra.json" "$R/j_basalt_eng_tail.json"
+    { python3 $V/pfetch.py $R/j_basalt_eng_tail.json --workers $SSD_WORKERS --chunk-mb 64 --tag basalt-eng-tail --log $R/fetch_tail.log \
+      && st "engram tail done ($ENGRAM_TAIL_PATH)" || st "engram tail FAILED"; } &
+    PID_TAIL=$!
+  fi
+
+  if [ -s "$R/j_basalt_eng.json" ] && grep -q '"url"' "$R/j_basalt_eng.json"; then
+    python3 $V/pfetch.py $R/j_basalt_eng.json --workers $WORKERS --chunk-mb 128 --tag basalt-eng --log $R/fetch.log \
+      && st "engram RAM windows done" || { [ -n "$PID_TAIL" ] && kill $PID_TAIL 2>/dev/null || true; st "engram FAILED"; exit 1; }
+  fi
+  if [ -n "$PID_TAIL" ]; then
+    wait $PID_TAIL
+  fi
+  # Fetch any delta SSD ranges if real MemAvailable was tighter than initial estimate (disjoint from initial ranges)
+  if [ -s "$R/j_basalt_eng_tail_extra.json" ] && grep -q '"url"' "$R/j_basalt_eng_tail_extra.json"; then
+    python3 $V/pfetch.py $R/j_basalt_eng_tail_extra.json --workers $SSD_WORKERS --chunk-mb 64 --tag basalt-eng-tail-extra --log $R/fetch_tail.log \
+      && st "engram tail delta done ($ENGRAM_TAIL_PATH)" || { st "engram tail delta FAILED"; exit 1; }
+  fi
+else
+  # Non-hybrid fast path (ram+ram UD-IQ1_M, ram+ssd, ssd+ssd)
+  if [ "$STAGE_MODE" != "ram+ssd" ] || [ "${PARALLEL_TAIL:-0}" = 0 ]; then
+    ENG_WORKERS=$WORKERS
+    ENG_CHUNK=128
+    [[ "$ENGRAM_PATH" != /mnt/ram/* ]] && { ENG_WORKERS=$SSD_WORKERS; ENG_CHUNK=64; }
+    python3 $V/pfetch.py $R/j_basalt_eng.json --workers $ENG_WORKERS --chunk-mb $ENG_CHUNK --tag basalt-eng --log $R/fetch.log \
+      && st "engram done ($ENGRAM_PATH)" || { [ -n "$PID_TAIL" ] && kill $PID_TAIL 2>/dev/null || true; st "engram FAILED"; exit 1; }
+  fi
+  if [ -n "$PID_TAIL" ]; then
+    wait $PID_TAIL
+  fi
 fi
 
-# Stream primary Engram file unless it was already started in background (ram+ssd with PARALLEL_TAIL=1)
-if [ "$STAGE_MODE" != "ram+ssd" ] || [ "${PARALLEL_TAIL:-0}" = 0 ]; then
-  ENG_WORKERS=$WORKERS
-  ENG_CHUNK=128
-  [[ "$ENGRAM_PATH" == /content/* ]] && { ENG_WORKERS=$SSD_WORKERS; ENG_CHUNK=64; }
-  python3 $V/pfetch.py $R/j_basalt_eng.json --workers $ENG_WORKERS --chunk-mb $ENG_CHUNK --tag basalt-eng --log $R/fetch.log \
-    && st "engram done ($ENGRAM_PATH)" || { [ -n "$PID_TAIL" ] && kill $PID_TAIL 2>/dev/null || true; st "engram FAILED"; exit 1; }
-fi
-
-if [ -n "$PID_TAIL" ]; then
-  wait $PID_TAIL
-fi
 seen FAILED && { st "engram FAILED"; exit 1; }
 free -b > $R/free_after_engram.txt
 touch $R/READY

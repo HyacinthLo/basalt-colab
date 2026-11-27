@@ -212,7 +212,7 @@ class BasaltConfig:
     draft_experts: int = 32
     routing_mode: str = "exact"
     pool_workers: int = 0
-    engram_cache_mib: int = 1024
+    engram_cache_mib: int = 4096
     conv_cache_mib: int = 32768
     vram_reserve_mib: int = 450
     resident_budget_gib: int = 0

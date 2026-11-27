@@ -18,7 +18,8 @@ export VRAM_RESERVE=${VRAM_RESERVE:-450}
 export RAM_BUDGET=${RAM_BUDGET:-55}
 export ROUTING_MODE=${ROUTING_MODE:-exact}
 export POOL_WORKERS=${POOL_WORKERS:-0}
-export ENGRAM_CACHE_MIB=${ENGRAM_CACHE_MIB:-1024}
+export ENGRAM_CACHE_MIB=${ENGRAM_CACHE_MIB:-4096}
+export ENGRAM_INFLIGHT=${ENGRAM_INFLIGHT:-256}
 export ANSWER_ROOM=${ANSWER_ROOM:-auto}
 export MODEL_PATH=${MODEL_PATH:-/mnt/ram/model.basalt}
 export ENGRAM_PATH=${ENGRAM_PATH:-/mnt/ram/engram.bin}
@@ -83,17 +84,26 @@ if [ -d /mnt/ram/pydeps ]; then
   export PYTHONPATH="/mnt/ram/pydeps${PYTHONPATH:+:$PYTHONPATH}"
 fi
 export BASALT_ENGRAM_FILE="$ENGRAM_PATH"
-if [[ "$ENGRAM_PATH" == /mnt/ram/* ]]; then
-  export BASALT_ENGRAM_MMAP=1
-fi
-if [ -n "${ENGRAM_TAIL_PATH:-}" ]; then
-  export BASALT_ENGRAM_TAIL_FILE="$ENGRAM_TAIL_PATH"
+if [ "${BASALT_ENGRAM_LAZY_OPEN:-0}" = 1 ] && [ -n "${BASALT_ENGRAM_LAYOUT:-}" ]; then
+  export BASALT_ENGRAM_LAZY_OPEN=1
+  export BASALT_ENGRAM_LAYOUT
   export BASALT_ENGRAM_CACHE_MIB="$ENGRAM_CACHE_MIB"
-elif [[ "$ENGRAM_PATH" == /mnt/ram/* ]]; then
-  # Pure RAM Engram uses zero-copy mmap() directly; disable redundant RowCache
-  export BASALT_ENGRAM_CACHE_MIB=0
+  export BASALT_ENGRAM_INFLIGHT="$ENGRAM_INFLIGHT"
 else
-  export BASALT_ENGRAM_CACHE_MIB="$ENGRAM_CACHE_MIB"
+  if [[ "$ENGRAM_PATH" == /mnt/ram/* ]]; then
+    export BASALT_ENGRAM_MMAP=1
+  fi
+  if [ -n "${ENGRAM_TAIL_PATH:-}" ]; then
+    export BASALT_ENGRAM_TAIL_FILE="$ENGRAM_TAIL_PATH"
+    export BASALT_ENGRAM_CACHE_MIB="$ENGRAM_CACHE_MIB"
+    export BASALT_ENGRAM_INFLIGHT="$ENGRAM_INFLIGHT"
+  elif [[ "$ENGRAM_PATH" == /mnt/ram/* ]]; then
+    # Pure RAM Engram uses zero-copy mmap() directly; disable redundant RowCache
+    export BASALT_ENGRAM_CACHE_MIB=0
+  else
+    export BASALT_ENGRAM_CACHE_MIB="$ENGRAM_CACHE_MIB"
+    export BASALT_ENGRAM_INFLIGHT="$ENGRAM_INFLIGHT"
+  fi
 fi
 if [ -n "${BASALT_PUNCH_FILE:-}" ]; then
   export BASALT_PUNCH_FILE
