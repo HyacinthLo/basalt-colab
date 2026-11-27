@@ -3,7 +3,7 @@
   "basalt_tag": "v0.5.7",
   "basalt_commit": "400b411c58031d064812ea21a259b2381acdaa3e",
   "prebuilt_url": "https://github.com/HyacinthLo/basalt-colab/releases/download/prebuilt-v0.5.7/basalt-v0.5.7-deepseek41-sm120-linux-x64.tar.gz",
-  "prebuilt_sha256": "f1e2b5bc564769432d394a6463697c99d26c2d947650cf6f407e39b17806836e",
+  "prebuilt_sha256": "19fc693041fada3d174e09242f70858f28dd608019715048259826cfb8c74bb4",
   "pack_url": "https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt/resolve/main/DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt",
   "pack_model_id": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M",
   "packs": {
