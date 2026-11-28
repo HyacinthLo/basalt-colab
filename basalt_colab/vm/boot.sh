@@ -29,6 +29,7 @@ mkdir -p $R /mnt/ram /content/patch $D
 rm -rf $R/READY $R/load_done $R/engram_claim
 
 T0=$(date +%s)
+export BOOT_T0="$T0"
 st() { echo "$(( $(date +%s) - T0 ))s $(date +%T) $*" >> $R/timeline.txt; }
 seen() { grep -qE "$1" $R/timeline.txt; }
 hdr() { echo "Authorization: Bearer $(cat /content/secrets/key)"; }

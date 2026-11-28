@@ -199,7 +199,8 @@ def main():
         ],
     )
 
-    # 3a. ExpertTier: credit punchable tmpfs backbone bytes into avail when BASALT_PUNCH_FILE is active
+    # 3a. ExpertTier: credit punchable tmpfs backbone bytes into avail when BASALT_PUNCH_FILE is active,
+    #     and fail fast if any experts spill to file while BASALT_PUNCH_FILE is active (would read punched zeros).
     patch_file(
         src,
         'src/core/expert_tier.cpp',
@@ -230,6 +231,17 @@ def main():
     }
 #endif
     // places per layer above the reserve, less the spare each layer keeps, in `bytes` of RAM''',
+            ),
+            (
+                '''    // the CPU side: the file view, the per-layer formats, the pool
+    if (homes_.file > 0) {''',
+                '''    // the CPU side: the file view, the per-layer formats, the pool
+    if (homes_.file > 0) {
+        if (const char* pf = std::getenv("BASALT_PUNCH_FILE"); pf && *pf) {
+            err = s_.name + ": " + std::to_string(homes_.file) +
+                  " experts/layer spilled to file while BASALT_PUNCH_FILE is active (would read punched zeros)";
+            return false;
+        }''',
             ),
         ],
     )

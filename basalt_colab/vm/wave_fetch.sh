@@ -37,8 +37,10 @@ EOF
 )
 
 [ "${BYTES:-0}" -gt 0 ] || exit 0
-python3 "$V/pfetch.py" "$JOBS_JSON" --workers "${WORKERS:-64}" --chunk-mb 128 \
+python3 "$V/pfetch.py" "$JOBS_JSON" --keepalive --workers "${WORKERS:-64}" --chunk-mb 128 \
   --tag "basalt-${TAG}" --log "$R/fetch_wave.log"
 rm -f "$JOBS_JSON"
 GIB_STR=$(python3 -c "print(f'{int($BYTES)/1073741824:.2f}')")
-echo "0s $(date +%T) wave fetch ${TAG} done (${GIB_STR} GiB)" >> "$R/timeline.txt"
+ELAPSED=$(( $(date +%s) - ${BOOT_T0:-$(date +%s)} ))
+[ "$ELAPSED" -lt 0 ] && ELAPSED=0
+echo "${ELAPSED}s $(date +%T) wave fetch ${TAG} done (${GIB_STR} GiB)" >> "$R/timeline.txt"

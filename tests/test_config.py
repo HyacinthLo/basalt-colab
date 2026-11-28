@@ -353,6 +353,7 @@ class ConfigAndUnitTests(unittest.TestCase):
                 ("wave+hybrid", "/mnt/ram/model.basalt", "/mnt/ram/engram.bin", "/content/engram_tail.bin", True),
             )
             self.assertEqual(p_q2xl["punch_file"], "/mnt/ram/model.basalt")
+            self.assertGreaterEqual(p_q2xl["ram_budget"], 145)
             self.assertGreaterEqual(p_q2xl["engram_head_bytes"], int(30 * GIB))
             self.assertEqual(p_q2xl["engram_head_bytes"] + p_q2xl["engram_tail_bytes"], int(125.9 * GIB))
 
@@ -977,13 +978,21 @@ class ConfigAndUnitTests(unittest.TestCase):
             self.assertRegex("70s 00:01:10 engram done (/mnt/ram/engram.bin)", step_pats["engram"])
             self.assertRegex("85s 00:01:25 engram tail delta done (/content/engram_tail.bin)", step_pats["engram_delta"])
 
-            # 7) End-to-end Linux test of wave_fetch.sh against local HTTP Range server
+            # 7) End-to-end Linux test of wave_fetch.sh (--keepalive) across 20 disjoint expert spans:
+            #    verifies persistent HTTP/1.1 Keep-Alive connection reuse, 503 retry, dense preservation, and BOOT_T0 timing.
             if sys.platform.startswith("linux"):
                 import http.server
                 import threading
 
-                total_len = 512 * 1024
+                total_len = 2 * 1024 * 1024
                 remote = bytes((i * 19 + 7) & 0xFF for i in range(total_len))
+                injected_503 = [True]
+                accepts = [0]
+
+                class CountingHTTPServer(http.server.ThreadingHTTPServer):
+                    def get_request(self):
+                        accepts[0] += 1
+                        return super().get_request()
 
                 class WaveRangeHandler(http.server.BaseHTTPRequestHandler):
                     protocol_version = "HTTP/1.1"
@@ -992,6 +1001,12 @@ class ConfigAndUnitTests(unittest.TestCase):
                         pass
 
                     def do_GET(self):
+                        if injected_503[0]:
+                            injected_503[0] = False
+                            self.send_response(503)
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
                         m = re.match(r"bytes=(\d+)-(\d+)", self.headers.get("Range", ""))
                         if not m:
                             self.send_response(400)
@@ -1006,7 +1021,7 @@ class ConfigAndUnitTests(unittest.TestCase):
                         self.end_headers()
                         self.wfile.write(chunk)
 
-                srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), WaveRangeHandler)
+                srv = CountingHTTPServer(("127.0.0.1", 0), WaveRangeHandler)
                 port = srv.server_address[1]
                 th = threading.Thread(target=srv.serve_forever, daemon=True)
                 th.start()
@@ -1019,8 +1034,10 @@ class ConfigAndUnitTests(unittest.TestCase):
                         mf.truncate(total_len)
                         mf.seek(0)
                         mf.write(b"\xEE" * 65536)
+                    # 20 disjoint 32 KiB spans separated by 32 KiB untouched holes (simulating scattered experts)
+                    spans = [[65536 + i * 65536, 65536 + i * 65536 + 32768] for i in range(20)]
                     spans_file = res_dir / "spans.json"
-                    spans_file.write_text(json.dumps([[65536, 196608], [327680, 458752]]), encoding="utf-8")
+                    spans_file.write_text(json.dumps(spans), encoding="utf-8")
                     env_w = dict(
                         os.environ,
                         R=str(res_dir),
@@ -1029,19 +1046,24 @@ class ConfigAndUnitTests(unittest.TestCase):
                         MODEL_PATH=str(model_file),
                         MODEL_FILE_BYTES=str(total_len),
                         WORKERS="2",
+                        BOOT_T0=str(int(time.time()) - 12),
                     )
                     rw = subprocess.run(
                         ["bash", str(self.p.vm_dir / "wave_fetch.sh"), str(spans_file), "wave1"],
                         env=env_w, capture_output=True, text=True, timeout=30,
                     )
                     self.assertEqual(rw.returncode, 0, rw.stderr + rw.stdout)
+                    # Persistent Keep-Alive: 20 spans + 1 retry across 2 workers must reuse sockets (<< 20 accepts!)
+                    self.assertLessEqual(accepts[0], 5, f"expected Keep-Alive socket reuse, got {accepts[0]} accepts")
                     got = model_file.read_bytes()
                     self.assertEqual(got[:65536], b"\xEE" * 65536)  # dense untouched!
-                    self.assertEqual(got[65536:196608], remote[65536:196608])
-                    self.assertEqual(got[196608:327680], b"\x00" * 131072)  # untouched hole!
-                    self.assertEqual(got[327680:458752], remote[327680:458752])
-                    tl = (res_dir / "timeline.txt").read_text(encoding="utf-8")
-                    self.assertRegex(tl.strip(), step_pats["wave1"])
+                    for lo, hi in spans:
+                        self.assertEqual(got[lo:hi], remote[lo:hi])
+                        self.assertEqual(got[hi:hi + 32768], b"\x00" * 32768)  # untouched hole!
+                    tl = (res_dir / "timeline.txt").read_text(encoding="utf-8").strip()
+                    self.assertRegex(tl, step_pats["wave1"])
+                    self.assertGreaterEqual(int(tl.split("s ", 1)[0]), 10)
+                    self.assertIn("keepalive", (res_dir / "fetch_wave.log").read_text(encoding="utf-8"))
                 finally:
                     srv.shutdown()
                     srv.server_close()

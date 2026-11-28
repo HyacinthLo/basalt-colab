@@ -9,9 +9,9 @@ and plans zero-SSD-expert staging (honoring Stage 0 `--ssd-dir` when fast local 
       Backbone -> /mnt/ram/model.basalt (punch-on-read)
       Engram RAM windows (~83-86 GiB: Layer 1 all + Layer 14 3/4-gram) -> /mnt/ram/engram_*.bin
       Engram sparse SSD (~17-20 GiB Layer 14 2-gram, +4096 B boundary overlap) -> $SSD_DIR/engram_tail.bin (parallel at t=2s!)
-  - ssd+hybrid / ssd+ssd (e.g. UD-Q2_K_XL, ~194.3 + 125.9 GiB Q5_K):
-      Backbone -> $SSD_DIR/model.basalt (punch-on-read)
-      Engram RAM window (~42 GiB Layer 1 3/4-gram) -> /mnt/ram/engram_0.bin + sparse SSD (~84 GiB) -> $SSD_DIR/engram_tail.bin
+  - wave+hybrid (Stage 1 Micro-Wave, e.g. UD-Q2_K_XL, ~194.3 + 125.9 GiB Q5_K):
+      0 bytes backbone on SSD! Base sections (~10 GiB) + ~20 GiB active micro-wave -> /mnt/ram/model.basalt (punch-on-read)
+      Engram RAM window (~42 GiB Layer 1 3/4-gram) -> /mnt/ram/engram_0.bin + sparse SSD (~84 GiB) -> $SSD_DIR/engram_tail.bin (parallel at t=2s!)
   - Fail-fast guard rejects packs whose backbone exceeds zero-SSD-expert VRAM+RAM capacity (e.g. NVFP4).
 """
 import argparse, ctypes, json, os, shlex, struct, sys, tempfile, urllib.request
@@ -417,11 +417,15 @@ def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vra
     elif wave_enabled:
         # Stage 1 Micro-Wave: 0 bytes backbone on SSD! Base non-expert sections (~10 GiB) + ~20 GiB active micro-wave
         # live in /mnt/ram/model.basalt (peak RAM <= ~141 GiB), so sparse Engram SSD tail starts in parallel at t=2s.
+        # Decouple Engram split estimate from the resident-budget-gib cap: expert_tier.cpp only allocates the actual
+        # non-VRAM experts, so a generous cap prevents artificial file spill under fp16 KV or parallel=4 while
+        # post-/load --finalize-engram sizes the RAM window from real MemAvailable.
         model_path = '/mnt/ram/model.basalt'
         punch_file = '/mnt/ram/model.basalt'
-        auto_budget = min(max(55, int(ram_total_gib - 24)), max(100, int(ram_needed_gib + 12)))
+        auto_budget = max(100, int(ram_total_gib - 26))
         ram_budget = int(explicit_budget_gib) if int(explicit_budget_gib) > 0 else int(auto_budget)
-        head_b, tail_b = _split_engram_bytes(engram_bytes, ram_total_gib, ram_budget)
+        est_ram_experts = int(explicit_budget_gib) if int(explicit_budget_gib) > 0 else max(55, int(ram_needed_gib + 6))
+        head_b, tail_b = _split_engram_bytes(engram_bytes, ram_total_gib, est_ram_experts)
         if head_b > 0:
             if tail_b / GIB > float(disk_free_gib) - 8.0:
                 raise RuntimeError(

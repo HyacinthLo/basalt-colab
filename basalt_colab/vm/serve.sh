@@ -110,6 +110,7 @@ fi
 if [ -n "${BASALT_WAVE_FETCH_CMD:-}" ]; then
   export BASALT_WAVE_FETCH_CMD BASALT_EXPERTS_RANGE BASALT_WAVE_CHUNK_GIB
   export MODEL_URL MODEL_PATH MODEL_FILE_BYTES WORKERS
+  [ -n "${BOOT_T0:-}" ] && export BOOT_T0
   [ -n "${HF_HDR:-}" ] && export HF_HDR
 fi
 echo "$BIN serve --config $R/basalt_config.json --api-key-file /content/secrets/key" > $R/serve_cmd.txt
