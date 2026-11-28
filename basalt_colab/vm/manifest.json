@@ -2,8 +2,8 @@
   "basalt_repo": "https://github.com/jesdga95/basalt.git",
   "basalt_tag": "v0.6.0",
   "basalt_commit": "111b050dac1f1ab2c561b57815cfb6791e0ab31f",
-  "prebuilt_url": "",
-  "prebuilt_sha256": "",
+  "prebuilt_url": "https://github.com/HyacinthLo/basalt-colab/releases/download/prebuilt-v0.6.0/basalt-v0.6.0-deepseek41-sm120-linux-x64.tar.gz",
+  "prebuilt_sha256": "201328db9f4fc8b3203764ffa03a6791d488bcda123c27cf28807b5a5d8bcd42",
   "pack_url": "https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt/resolve/main/DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt",
   "pack_model_id": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M",
   "packs": {
