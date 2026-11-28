@@ -21,7 +21,6 @@ CLIENT_ALIASES = {
     "opencode": "opencode",
     "openai": "openai",
     "cursor": "openai",
-    "cherry": "openai",
     "generic": "openai",
 }
 
@@ -319,12 +318,12 @@ def client_bundle(ep: ClientEndpoint, client: str) -> dict[str, Any]:
             "notes": "Or run `basalt-colab connect opencode --write` to update the managed file and launch with OPENCODE_CONFIG=...",
         }
 
-    # Generic OpenAI / Cursor / Cherry Studio
+    # Generic OpenAI / Anthropic API (SDKs, Cursor, curl)
     env_pairs = env_vars(ep)
     return {
         "id": "openai",
-        "label": "OpenAI / Cursor",
-        "subtitle": "Generic OpenAI (/v1) & Anthropic (/v1/messages) settings for Cursor, Cherry Studio, ChatBox, curl",
+        "label": "OpenAI / Anthropic API",
+        "subtitle": "Generic OpenAI (/v1) & Anthropic (/v1/messages) settings for SDKs, Cursor, and curl",
         "file_hint": "App Provider Settings",
         "snippet_lang": "text",
         "snippet": (

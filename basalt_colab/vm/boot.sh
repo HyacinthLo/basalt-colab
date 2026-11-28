@@ -1,15 +1,16 @@
 #!/bin/bash
 # Cold start on Colab G4 using Basalt v0.5.7 (DeepSeek-V4.1-Flash):
-#   1. Inspect 64 KiB .basalt header -> auto-plan storage tier:
+#   0. Stage 0: probe for fast local NVMe scratch (>600 MiB/s synced write, >=120 GiB free); fallback /content
+#   1. Inspect 64 KiB .basalt header (+ meta for hybrid) -> auto-plan storage tier:
 #        - ram+ram    (UD-IQ1_M):   100% RAM backbone + 100% RAM Engram
-#        - ram+hybrid (UD-IQ2_XXS): RAM backbone + ~78 GiB RAM Engram head + ~25 GiB SSD tail (parallel at t=2s!)
-#        - ssd+hybrid (UD-Q2_K_XL): SSD backbone (punch-on-read) + ~36 GiB RAM Engram head + ~67 GiB SSD tail
+#        - ram+hybrid (UD-IQ2_XXS): RAM backbone + lazy multi-window RAM (~83-86 GiB) + sparse SSD tail (~17-20 GiB, parallel at t=2s)
+#        - ssd+hybrid (UD-Q2_K_XL): SSD backbone (punch-on-read) + lazy RAM window (~42 GiB Layer 1 3/4-gram) + sparse SSD (~84 GiB)
 #   2. Parallel: fetch/build patched Basalt + fetch sparse backbone + fetch 43 KB abliteration edit
-#                (+ parallel SSD Engram tail download when PARALLEL_TAIL=1)
+#                (+ parallel sparse SSD Engram tail download when PARALLEL_TAIL=1)
 #   3. In-place abliteration via standalone abliterate (~1.5-3s, 62/62 tensors, tunable UNCENSOR_SCALE)
-#   4. Start basalt serve + POST /load (punch-on-read reclaims backbone storage before RAM Engram stream)
-#   5. Stream RAM Engram head (~25-32s) & join background SSD Engram tail (usually already done!)
-#   6. Warmup + open gate.py on :18080 + arm VM-side hard-cap backstop
+#   4. Start basalt serve + POST /load (punch-on-read reclaims backbone; hybrid allocates 4 GiB RowCache & defers Engram open)
+#   5. Finalize RAM Engram windows from real post-/load MemAvailable (--finalize-engram) & join SSD tail
+#   6. Warmup (triggers lazy multi-window mmap) + open gate.py on :18080 + arm VM-side hard-cap backstop
 set -uo pipefail
 : "${CTX:?}"
 export PORT=18081 UNCENSOR=${UNCENSOR:-1} UNCENSOR_SCALE=${UNCENSOR_SCALE:-1.0} WORKERS=${WORKERS:-64}

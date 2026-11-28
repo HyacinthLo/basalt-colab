@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Generate pfetch.py HTTP Range job JSONs and storage plans for Basalt DeepSeek-V4.1-Flash packs.
 
-Reads only the 64 KiB BASALTMF v2 header via HTTP Range request and plans zero-SSD-expert staging:
+Reads the 64 KiB BASALTMF v2 header (and small `meta` section for hybrid packs) via HTTP Range
+and plans zero-SSD-expert staging (honoring Stage 0 `--ssd-dir` when fast local NVMe is present):
   - ram+ram (e.g. UD-IQ1_M, 139.1 + 103.0 GiB):
       Backbone -> /mnt/ram/model.basalt (punch-on-read) + 100% Engram -> /mnt/ram/engram.bin
   - ram+hybrid (e.g. UD-IQ2_XXS, 162.85 + 103.0 GiB):
       Backbone -> /mnt/ram/model.basalt (punch-on-read)
-      Engram head (~78 GiB) -> /mnt/ram/engram.bin (fast tmpfs after /load, ~25-30s)
-      Engram tail (~25 GiB) -> /content/engram_tail.bin (downloaded in PARALLEL at t=2s, 0 extra wait!)
-  - ssd+hybrid / ssd+ssd (e.g. UD-Q2_K_XL, ~205 + 103.0 GiB):
-      Backbone -> /content/model.basalt (punch-on-read)
-      Engram head (~36 GiB) -> /mnt/ram/engram.bin + tail (~67 GiB) -> /content/engram_tail.bin
+      Engram RAM windows (~83-86 GiB: Layer 1 all + Layer 14 3/4-gram) -> /mnt/ram/engram_*.bin
+      Engram sparse SSD (~17-20 GiB Layer 14 2-gram, +4096 B boundary overlap) -> $SSD_DIR/engram_tail.bin (parallel at t=2s!)
+  - ssd+hybrid / ssd+ssd (e.g. UD-Q2_K_XL, ~194.3 + 125.9 GiB Q5_K):
+      Backbone -> $SSD_DIR/model.basalt (punch-on-read)
+      Engram RAM window (~42 GiB Layer 1 3/4-gram) -> /mnt/ram/engram_0.bin + sparse SSD (~84 GiB) -> $SSD_DIR/engram_tail.bin
   - Fail-fast guard rejects packs whose backbone exceeds zero-SSD-expert VRAM+RAM capacity (e.g. NVFP4).
 """
 import argparse, ctypes, json, os, shlex, struct, sys, tempfile, urllib.request

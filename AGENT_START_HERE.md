@@ -38,12 +38,12 @@ clients / browser --HTTP--> basalt-colab :18080 (/_console, /_control/*, /v1/*, 
 - [`basalt_colab/config.py`](basalt_colab/config.py): typed `config.toml` (`tomllib` + TOML writer), `BootOverrides`, `HOT_FIELDS` single source of truth, profiles (`exact`, `solo`, opt-in lossy `balanced`), validation, and `config_meta()`.
 - [`basalt_colab/clients.py`](basalt_colab/clients.py): live-synced config & env generator for `dsh`, `claude`, `codex`, `opencode`, and `openai`.
 - [`basalt_colab/usage.py`](basalt_colab/usage.py): append-only `usage.jsonl` CU billing ledger & daily/monthly aggregation.
-- [`basalt_colab/colab.py`](basalt_colab/colab.py): Colab CLI wrapper, `vmx()`, `vm_logs()`, SSH builder, lockfile, LF-normalized tarball bundler, redacting logger.
+- [`basalt_colab/colab.py`](basalt_colab/colab.py) + [`basalt_colab/keyring_shim/basalt_colab_keyring.py`](basalt_colab/keyring_shim/basalt_colab_keyring.py): Colab CLI wrapper, Linux headless `0600` keyring fallback, `vmx()`, `vm_logs()`, SSH builder, lockfile, LF-normalized tarball bundler, redacting logger.
 - [`basalt_colab/lifecycle.py`](basalt_colab/lifecycle.py): `VmState` (`StrEnum`) & `Manager` (backoff alloc, orphan-boot cancel, tunnel repair, SSE event pub/sub, cached Basalt telemetry, watchdog).
 - [`basalt_colab/proxy.py`](basalt_colab/proxy.py) + [`basalt_colab/console.py`](basalt_colab/console.py) + [`basalt_colab/web/console.html`](basalt_colab/web/console.html): HTTP proxy, CORS, `rewrite_request`, zero-polling `selectors` client-disconnect cancel, SSE `/_control/events`, `/_control/*`, and static Control Console asset.
 - [`basalt_colab/term.py`](basalt_colab/term.py) + [`basalt_colab/cli.py`](basalt_colab/cli.py): terminal UI helpers and strict `argparse` CLI entrypoint (`basalt-colab` / `python3 -m basalt_colab`).
-- [`basalt_colab/vm/`](basalt_colab/vm/): packaged VM scripts (`boot.sh`, `build.sh`, `serve.sh`, `patch_basalt.py`, `basalt_jobs.py`, `abliterate_basalt.py`, `abliterate.c`, `pfetch.py`, `gate.py`).
-- [`docs/how-it-works.md`](docs/how-it-works.md) & [`docs/q2k-xl-acceleration.md`](docs/q2k-xl-acceleration.md): architecture overview and planned `UD-Q2_K_XL` cold-start acceleration roadmap.
+- [`basalt_colab/vm/`](basalt_colab/vm/): packaged VM scripts (`boot.sh` with Stage 0 NVMe probe, `build.sh`, `serve.sh`, `patch_basalt.py` with multi-window lazy Engram + `RowCache` filter + `INFLIGHT=256`, `basalt_jobs.py`, `abliterate_basalt.py`, `abliterate.c`, `pfetch.py`, `gate.py`).
+- [`docs/how-it-works.md`](docs/how-it-works.md) & [`docs/q2k-xl-acceleration.md`](docs/q2k-xl-acceleration.md): architecture overview and `UD-Q2_K_XL` acceleration blueprint (Stage 0 + Engram landed; Stage 1/2 pending Basalt `>=v0.5.8`).
 
 ## Upstream Version Governance
 

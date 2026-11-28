@@ -49,6 +49,7 @@ KEEPALIVE_S = 5
 UPSTREAM_TIMEOUT = 3600
 
 STEPS = (
+    ("stage0", r"stage0: ", "fast local NVMe scratch detected"),
     ("plan", r"storage plan mode=", "storage layout planned"),
     ("patch", r"abliteration edit fetched", "abliteration edit downloaded (43 KB)"),
     ("engram_tail", r"engram tail done", "Engram SSD tail downloaded (parallel)"),
@@ -57,7 +58,9 @@ STEPS = (
     ("abliterate", r"abliteration applied", "abliteration baked into weights (62/62)"),
     ("loaded", r"weights loaded", "model loaded onto GPU + RAM"),
     ("pinned", r"pin: ", "backbone storage punched & reclaimed"),
-    ("engram", r"engram done", "Engram table loaded"),
+    ("engram_finalize", r"engram finalize ", "Engram RAM windows sized"),
+    ("engram", r"engram (?:RAM windows )?done", "Engram table loaded"),
+    ("engram_delta", r"engram tail delta done", "Engram SSD delta downloaded"),
     ("warm", r"first token", "warmup answer done"),
 )
 LATER = (

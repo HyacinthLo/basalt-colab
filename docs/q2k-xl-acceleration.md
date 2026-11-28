@@ -1,6 +1,6 @@
 # `UD-Q2_K_XL` 加速冷启动与推理期 Engram 优化蓝图
 
-> **状态**：方案已完成架构复审（含 Wave 2 峰值内存校验与推理期 Engram IOPS 分析），待上游条件齐备后直接按阶段落地（当前 `v0.5.7` 生产链路零侵入）。
+> **状态**：**Stage 0（本地 NVMe 探测）与第 4.3 节 Engram 运行期优化**（`BASALT_ENGRAM_LAZY_OPEN=1`、多窗口 RAM `mmap` + `+4096 B` 防零读稀疏 SSD、`4 GiB` `RowCache` + `RowCache::insert()` 4-gram 准入过滤、`BASALT_ENGRAM_INFLIGHT=256`）已于 PR `#5`/`#6` 合入 `main` 并刷新 `prebuilt-v0.5.7`（`UD-IQ2_XXS` 已直接受益）；**Stage 1（Micro-Wave）与 Stage 2（异步落盘）**待上游 `v0.5.8` 与 HF `UD-Q2_K_XL.basalt` 就绪后直接接入。
 
 ---
 

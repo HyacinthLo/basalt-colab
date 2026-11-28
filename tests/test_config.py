@@ -938,6 +938,22 @@ class ConfigAndUnitTests(unittest.TestCase):
             self.assertIn("BASALT_ENGRAM_LAZY_OPEN=1", boot_sh)
             self.assertIn("BASALT_ENGRAM_LAYOUT", serve_sh)
             self.assertIn("BASALT_ENGRAM_INFLIGHT", serve_sh)
+
+            # 6) lifecycle.STEPS matches both ram+ram and hybrid multi-window boot timeline lines
+            from basalt_colab import clients, lifecycle
+            step_pats = {k: pat for k, pat, _ in lifecycle.STEPS}
+            self.assertRegex("1s 00:00:01 stage0: selected fast local scratch /mnt/nvme/basalt_scratch", step_pats["stage0"])
+            self.assertRegex("45s 00:00:45 engram finalize (avail=88.0 GiB): ram=82.94 GiB (2 win)", step_pats["engram_finalize"])
+            self.assertRegex("70s 00:01:10 engram RAM windows done", step_pats["engram"])
+            self.assertRegex("70s 00:01:10 engram done (/mnt/ram/engram.bin)", step_pats["engram"])
+            self.assertRegex("85s 00:01:25 engram tail delta done (/content/engram_tail.bin)", step_pats["engram_delta"])
+
+            # Generic OpenAI client metadata excludes retired GUI chat client references
+            self.assertIsNone(clients.resolve_client("cherry"))
+            ep = clients.ClientEndpoint.from_config(config.Config(), "sk-ds41-test", port=18080, paths=self.p)
+            oa = clients.client_bundle(ep, "openai")
+            self.assertEqual(oa["label"], "OpenAI / Anthropic API")
+            self.assertNotIn("cherry", oa["subtitle"].lower())
         finally:
             sys.path.remove(str(self.p.vm_dir))
 
