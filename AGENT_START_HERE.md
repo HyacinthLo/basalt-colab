@@ -1,6 +1,6 @@
 # AGENT_START_HERE (`basalt-colab`)
 
-`basalt-colab` is a zero-dependency Python 3.11+ package (`dependencies = []`, Linux/macOS/Windows) that runs uncensored **DeepSeek-V4.1-Flash (`UD-IQ1_M` / `UD-IQ2_XXS` / planned `UD-Q2_K_XL`)** on a single Google Colab G4 (RTX PRO 6000 Blackwell 96 GB) via **Basalt v0.5.7**, behind a local OpenAI + Anthropic + Unified Control Console gateway.
+`basalt-colab` is a zero-dependency Python 3.11+ package (`dependencies = []`, Linux/macOS/Windows) that runs uncensored **DeepSeek-V4.1-Flash (`UD-IQ1_M` / `UD-IQ2_XXS` / `UD-Q2_K_XL` via `--pack-url`)** on a single Google Colab G4 (RTX PRO 6000 Blackwell 96 GB) via **Basalt v0.6.0**, behind a local OpenAI + Anthropic + Unified Control Console gateway.
 
 ```text
 clients / browser --HTTP--> basalt-colab :18080 (/_console, /_control/*, /v1/*, /)
@@ -42,8 +42,8 @@ clients / browser --HTTP--> basalt-colab :18080 (/_console, /_control/*, /v1/*, 
 - [`basalt_colab/lifecycle.py`](basalt_colab/lifecycle.py): `VmState` (`StrEnum`) & `Manager` (backoff alloc, orphan-boot cancel, tunnel repair, SSE event pub/sub, cached Basalt telemetry, watchdog).
 - [`basalt_colab/proxy.py`](basalt_colab/proxy.py) + [`basalt_colab/console.py`](basalt_colab/console.py) + [`basalt_colab/web/console.html`](basalt_colab/web/console.html): HTTP proxy, CORS, `rewrite_request`, zero-polling `selectors` client-disconnect cancel, SSE `/_control/events`, `/_control/*`, and static Control Console asset.
 - [`basalt_colab/term.py`](basalt_colab/term.py) + [`basalt_colab/cli.py`](basalt_colab/cli.py): terminal UI helpers and strict `argparse` CLI entrypoint (`basalt-colab` / `python3 -m basalt_colab`).
-- [`basalt_colab/vm/`](basalt_colab/vm/): packaged VM scripts (`boot.sh` with Stage 0 NVMe probe, `build.sh`, `serve.sh`, `patch_basalt.py` with multi-window lazy Engram + `RowCache` filter + `INFLIGHT=256`, `basalt_jobs.py`, `abliterate_basalt.py`, `abliterate.c`, `pfetch.py`, `gate.py`).
-- [`docs/how-it-works.md`](docs/how-it-works.md) & [`docs/q2k-xl-acceleration.md`](docs/q2k-xl-acceleration.md): architecture overview and `UD-Q2_K_XL` acceleration blueprint (Stage 0 + Engram landed; Stage 1/2 pending Basalt `>=v0.5.8`).
+- [`basalt_colab/vm/`](basalt_colab/vm/): packaged VM scripts (`boot.sh` with Stage 0 NVMe probe & Stage 1 `wave+hybrid`, `wave_fetch.sh`, `build.sh`, `serve.sh`, `patch_basalt.py` with Stage 1 Micro-Wave loader + multi-window lazy Engram + `RowCache` filter + `INFLIGHT=256`, `basalt_jobs.py`, `abliterate_basalt.py`, `abliterate.c`, `pfetch.py`, `gate.py`).
+- [`docs/how-it-works.md`](docs/how-it-works.md) & [`docs/q2k-xl-acceleration.md`](docs/q2k-xl-acceleration.md): architecture overview and `UD-Q2_K_XL` acceleration blueprint (Basalt `v0.6.0` + Stage 0 + Stage 1 Micro-Wave + Engram landed; optional Stage 2 & official HF pack pending).
 
 ## Upstream Version Governance
 

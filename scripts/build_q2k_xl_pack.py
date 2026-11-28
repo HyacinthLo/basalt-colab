@@ -3,9 +3,9 @@
 
 Downloads Unsloth's 7-shard UD-Q2_K_XL GGUF (~335 GB) + mmproj-BF16.gguf (~1 GB) +
 dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf (~8 GB), converts them into a single BASALTMF v2
-`.basalt` pack via Basalt's `tools/convert/convert.py` (requires Basalt >=v0.5.8 with PR #481,
-or pass `--basalt-ref main` prior to the v0.5.8 tag), verifies every section SHA-256,
-and optionally uploads the result to your Hugging Face repository.
+`.basalt` pack via Basalt's `tools/convert/convert.py` (natively supported by the pinned
+Basalt v0.6.0 release with PR #481), verifies every section SHA-256, and optionally uploads
+the result to your Hugging Face repository.
 
 Requirements:
   - ~720 GB free disk space on the conversion host (344 GB source + ~344 GB output),
@@ -13,8 +13,8 @@ Requirements:
   - `git`, `python3` (with `numpy` if Basalt's converter needs it), and `hf` (huggingface_hub CLI).
 
 Usage:
-  python3 scripts/build_q2k_xl_pack.py --work-dir /data/q2k_xl_build --basalt-ref main
-  python3 scripts/build_q2k_xl_pack.py --work-dir /data/q2k_xl_build --basalt-ref main --upload-repo YourName/DeepSeek-V4.1-Flash-1017-Basalt
+  python3 scripts/build_q2k_xl_pack.py --work-dir /data/q2k_xl_build
+  python3 scripts/build_q2k_xl_pack.py --work-dir /data/q2k_xl_build --upload-repo YourName/DeepSeek-V4.1-Flash-1017-Basalt
 """
 from __future__ import annotations
 

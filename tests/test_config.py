@@ -34,7 +34,7 @@ class ConfigAndUnitTests(unittest.TestCase):
 
     def test_manifest_and_vm_files_in_sync(self) -> None:
         m = manifest.load_manifest(self.p.vm_dir)
-        self.assertEqual(m.basalt_tag, "v0.5.7")
+        self.assertEqual(m.basalt_tag, "v0.6.0")
         self.assertEqual(m.pack_model_id, config.DEFAULT_MODEL_ALIAS)
         self.assertIsNotNone(m.pack("ud-iq1_m"))
         self.assertIsNotNone(m.pack("ud-iq2_xxs"))
@@ -253,8 +253,9 @@ class ConfigAndUnitTests(unittest.TestCase):
         doc = json.loads(cfg_path.read_text(encoding="utf-8"))
         self.assertEqual(doc["version"], 2)
         m0 = doc["models"][0]
-        self.assertEqual((m0["max-context"], m0["slot-full-context"], m0["kv"], m0["vision"], m0["temperature"], m0["top-p"]),
-                         (1048576, True, "fp8", "dynamic", 0.7, 0.95))
+        self.assertNotIn("slot-full-context", m0)
+        self.assertEqual((m0["max-context"], m0["kv"], m0["vision"], m0["temperature"], m0["top-p"]),
+                         (1048576, "fp8", "dynamic", 0.7, 0.95))
         self.assertEqual((m0["answer-room"], m0["idle-unload"]), (0, 0))
         self.assertEqual(doc["engine"]["conversation-cache-disk-mib"], 32768)
         self.assertEqual(doc["engine"]["vram-reserve-mib"], 450)
@@ -300,6 +301,14 @@ class ConfigAndUnitTests(unittest.TestCase):
             self.assertEqual((len(eng_jobs), len(tail_jobs)), (1, 0))
             self.assertEqual(sum(j["size"] for j in bb_jobs), 65536 + 4096 + 1048576 + 262144 + 65536 + 4194304)
 
+            # Stage 1 Micro-Wave exclude_experts=True omits `experts` section while preserving full sparse dest_size
+            bb_base, _, _ = bj.build_jobs(
+                "https://example.test/m.basalt", fb, parsed, "/mnt/ram/model.basalt", "/mnt/ram/engram.bin",
+                exclude_experts=True,
+            )
+            self.assertEqual(sum(j["size"] for j in bb_base), 65536 + 4096 + 1048576 + 262144 + 65536)
+            self.assertTrue(all(j["dest_size"] == fb for j in bb_base))
+
             # Split Engram build_jobs produces contiguous head + tail summing to total engram
             _, head_j, split_tail_j = bj.build_jobs(
                 "https://example.test/m.basalt", fb, parsed,
@@ -337,11 +346,25 @@ class ConfigAndUnitTests(unittest.TestCase):
             self.assertLessEqual(p_iq2["engram_tail_bytes"], int(28 * GIB))
             self.assertEqual(p_iq2["engram_head_bytes"] + p_iq2["engram_tail_bytes"], int(103.0 * GIB))
 
-            p_q2xl = bj.plan_storage(int(205.0 * GIB), int(103.0 * GIB), ram_total_gib=176.9, disk_free_gib=236.0, vram_gib=95.6)
-            self.assertEqual((p_q2xl["stage_mode"], p_q2xl["model_path"], p_q2xl["engram_path"], p_q2xl["engram_tail_path"]),
-                             ("ssd+hybrid", "/content/model.basalt", "/mnt/ram/engram.bin", "/content/engram_tail.bin"))
+            # Stage 1 Micro-Wave default: 0 bytes backbone on SSD, parallel Engram SSD tail at t=2s
+            p_q2xl = bj.plan_storage(int(194.3 * GIB), int(125.9 * GIB), ram_total_gib=176.9, disk_free_gib=236.0, vram_gib=95.6)
+            self.assertEqual(
+                (p_q2xl["stage_mode"], p_q2xl["model_path"], p_q2xl["engram_path"], p_q2xl["engram_tail_path"], p_q2xl["parallel_tail"]),
+                ("wave+hybrid", "/mnt/ram/model.basalt", "/mnt/ram/engram.bin", "/content/engram_tail.bin", True),
+            )
+            self.assertEqual(p_q2xl["punch_file"], "/mnt/ram/model.basalt")
+            self.assertGreaterEqual(p_q2xl["ram_budget"], 145)
             self.assertGreaterEqual(p_q2xl["engram_head_bytes"], int(30 * GIB))
-            self.assertEqual(p_q2xl["engram_head_bytes"] + p_q2xl["engram_tail_bytes"], int(103.0 * GIB))
+            self.assertEqual(p_q2xl["engram_head_bytes"] + p_q2xl["engram_tail_bytes"], int(125.9 * GIB))
+
+            # Legacy ssd+hybrid remains reachable via wave_enabled=False
+            p_q2xl_ssd = bj.plan_storage(
+                int(205.0 * GIB), int(103.0 * GIB), ram_total_gib=176.9, disk_free_gib=236.0, vram_gib=95.6, wave_enabled=False,
+            )
+            self.assertEqual(
+                (p_q2xl_ssd["stage_mode"], p_q2xl_ssd["model_path"], p_q2xl_ssd["engram_path"], p_q2xl_ssd["engram_tail_path"], p_q2xl_ssd["parallel_tail"]),
+                ("ssd+hybrid", "/content/model.basalt", "/mnt/ram/engram.bin", "/content/engram_tail.bin", False),
+            )
 
             with self.assertRaises(RuntimeError):
                 bj.plan_storage(int(294.2 * GIB), int(104.4 * GIB), ram_total_gib=176.9, disk_free_gib=236.0, vram_gib=95.6)
@@ -797,6 +820,7 @@ class ConfigAndUnitTests(unittest.TestCase):
         self.assertIn('-r "$MISSING_REQ"', build_sh)
         self.assertIn('grep -a -q "BASALT_ENGRAM_LAZY_OPEN"', build_sh)
         self.assertIn('grep -a -q "BASALT_ENGRAM_INFLIGHT"', build_sh)
+        self.assertIn('grep -a -q "BASALT_WAVE_FETCH_CMD"', build_sh)
 
     def test_stage0_and_multiwindow_engram_planner(self) -> None:
         sys.path.insert(0, str(self.p.vm_dir))
@@ -935,18 +959,114 @@ class ConfigAndUnitTests(unittest.TestCase):
             serve_sh = (self.p.vm_dir / "serve.sh").read_text(encoding="utf-8")
             self.assertIn("stage0: selected fast local scratch", boot_sh)
             self.assertIn("--finalize-engram", boot_sh)
+            self.assertIn("--exclude-experts", boot_sh)
+            self.assertIn("BASALT_WAVE_FETCH_CMD", boot_sh)
+            self.assertIn("BASALT_EXPERTS_RANGE", boot_sh)
             self.assertIn("BASALT_ENGRAM_LAZY_OPEN=1", boot_sh)
             self.assertIn("BASALT_ENGRAM_LAYOUT", serve_sh)
             self.assertIn("BASALT_ENGRAM_INFLIGHT", serve_sh)
+            self.assertIn("BASALT_WAVE_FETCH_CMD", serve_sh)
+            self.assertIn("BASALT_EXPERTS_RANGE", serve_sh)
 
-            # 6) lifecycle.STEPS matches both ram+ram and hybrid multi-window boot timeline lines
+            # 6) lifecycle.STEPS matches ram+ram, hybrid multi-window, and Stage 1 wave1 timeline lines
             from basalt_colab import clients, lifecycle
             step_pats = {k: pat for k, pat, _ in lifecycle.STEPS}
             self.assertRegex("1s 00:00:01 stage0: selected fast local scratch /mnt/nvme/basalt_scratch", step_pats["stage0"])
+            self.assertRegex("0s 00:01:05 wave fetch wave1 done (82.40 GiB)", step_pats["wave1"])
             self.assertRegex("45s 00:00:45 engram finalize (avail=88.0 GiB): ram=82.94 GiB (2 win)", step_pats["engram_finalize"])
             self.assertRegex("70s 00:01:10 engram RAM windows done", step_pats["engram"])
             self.assertRegex("70s 00:01:10 engram done (/mnt/ram/engram.bin)", step_pats["engram"])
             self.assertRegex("85s 00:01:25 engram tail delta done (/content/engram_tail.bin)", step_pats["engram_delta"])
+
+            # 7) End-to-end Linux test of wave_fetch.sh (--keepalive) across 20 disjoint expert spans:
+            #    verifies persistent HTTP/1.1 Keep-Alive connection reuse, 503 retry, dense preservation, and BOOT_T0 timing.
+            if sys.platform.startswith("linux"):
+                import http.server
+                import threading
+
+                total_len = 2 * 1024 * 1024
+                remote = bytes((i * 19 + 7) & 0xFF for i in range(total_len))
+                injected_503 = [True]
+                accepts = [0]
+
+                class CountingHTTPServer(http.server.ThreadingHTTPServer):
+                    def get_request(self):
+                        accepts[0] += 1
+                        return super().get_request()
+
+                class WaveRangeHandler(http.server.BaseHTTPRequestHandler):
+                    protocol_version = "HTTP/1.1"
+
+                    def log_message(self, fmt, *args):
+                        pass
+
+                    def do_GET(self):
+                        if injected_503[0]:
+                            injected_503[0] = False
+                            self.send_response(503)
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
+                        m = re.match(r"bytes=(\d+)-(\d+)", self.headers.get("Range", ""))
+                        if not m:
+                            self.send_response(400)
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                            return
+                        s, e = int(m.group(1)), int(m.group(2))
+                        chunk = remote[s:e + 1]
+                        self.send_response(206)
+                        self.send_header("Content-Range", f"bytes {s}-{e}/{len(remote)}")
+                        self.send_header("Content-Length", str(len(chunk)))
+                        self.end_headers()
+                        self.wfile.write(chunk)
+
+                srv = CountingHTTPServer(("127.0.0.1", 0), WaveRangeHandler)
+                port = srv.server_address[1]
+                th = threading.Thread(target=srv.serve_forever, daemon=True)
+                th.start()
+                try:
+                    res_dir = self.tmp / "wave_res"
+                    res_dir.mkdir()
+                    model_file = res_dir / "model.basalt"
+                    # Pre-populate [0, 64 KiB) with custom "abliterated dense" sentinel bytes
+                    with model_file.open("wb") as mf:
+                        mf.truncate(total_len)
+                        mf.seek(0)
+                        mf.write(b"\xEE" * 65536)
+                    # 20 disjoint 32 KiB spans separated by 32 KiB untouched holes (simulating scattered experts)
+                    spans = [[65536 + i * 65536, 65536 + i * 65536 + 32768] for i in range(20)]
+                    spans_file = res_dir / "spans.json"
+                    spans_file.write_text(json.dumps(spans), encoding="utf-8")
+                    env_w = dict(
+                        os.environ,
+                        R=str(res_dir),
+                        V=str(self.p.vm_dir),
+                        MODEL_URL=f"http://127.0.0.1:{port}/model.basalt",
+                        MODEL_PATH=str(model_file),
+                        MODEL_FILE_BYTES=str(total_len),
+                        WORKERS="2",
+                        BOOT_T0=str(int(time.time()) - 12),
+                    )
+                    rw = subprocess.run(
+                        ["bash", str(self.p.vm_dir / "wave_fetch.sh"), str(spans_file), "wave1"],
+                        env=env_w, capture_output=True, text=True, timeout=30,
+                    )
+                    self.assertEqual(rw.returncode, 0, rw.stderr + rw.stdout)
+                    # Persistent Keep-Alive: 20 spans + 1 retry across 2 workers must reuse sockets (<< 20 accepts!)
+                    self.assertLessEqual(accepts[0], 5, f"expected Keep-Alive socket reuse, got {accepts[0]} accepts")
+                    got = model_file.read_bytes()
+                    self.assertEqual(got[:65536], b"\xEE" * 65536)  # dense untouched!
+                    for lo, hi in spans:
+                        self.assertEqual(got[lo:hi], remote[lo:hi])
+                        self.assertEqual(got[hi:hi + 32768], b"\x00" * 32768)  # untouched hole!
+                    tl = (res_dir / "timeline.txt").read_text(encoding="utf-8").strip()
+                    self.assertRegex(tl, step_pats["wave1"])
+                    self.assertGreaterEqual(int(tl.split("s ", 1)[0]), 10)
+                    self.assertIn("keepalive", (res_dir / "fetch_wave.log").read_text(encoding="utf-8"))
+                finally:
+                    srv.shutdown()
+                    srv.server_close()
 
             # Generic OpenAI client metadata excludes retired GUI chat client references
             self.assertIsNone(clients.resolve_client("cherry"))

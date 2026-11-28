@@ -1,6 +1,6 @@
 # `UD-Q2_K_XL` 加速冷启动与推理期 Engram 优化蓝图
 
-> **状态**：**Stage 0（本地 NVMe 探测）与第 4.3 节 Engram 运行期优化**（`BASALT_ENGRAM_LAZY_OPEN=1`、多窗口 RAM `mmap` + `+4096 B` 防零读稀疏 SSD、`4 GiB` `RowCache` + `RowCache::insert()` 4-gram 准入过滤、`BASALT_ENGRAM_INFLIGHT=256`）已于 PR `#5`/`#6` 合入 `main` 并刷新 `prebuilt-v0.5.7`（`UD-IQ2_XXS` 已直接受益）；**Stage 1（Micro-Wave）与 Stage 2（异步落盘）**待上游 `v0.5.8` 与 HF `UD-Q2_K_XL.basalt` 就绪后直接接入。
+> **状态**：**Basalt `v0.6.0`（含 `#481` `UD-Q2_K_XL` 原生支持、`#802` +21% struct decode、`#573` Engram MMQ GEMM、`#808` 原生共享 KV 池）、Stage 0（本地 NVMe 探测）、Stage 1（Micro-Wave `wave+hybrid` 零 SSD Backbone 流式加载）以及第 4.3 节 Engram 运行期优化**（`BASALT_ENGRAM_LAZY_OPEN=1`、多窗口 RAM `mmap` + `+4096 B` 防零读稀疏 SSD、`4 GiB` `RowCache` + `RowCache::insert()` 4-gram 准入过滤、`BASALT_ENGRAM_INFLIGHT=256`）均已落地；当前可通过 `scripts/build_q2k_xl_pack.py` 自转包 + `--pack-url` 立即启用 `UD-Q2_K_XL`，或等待上游 HF 发布官方包后直接免参启用（可选 **Stage 2 异步落盘** 视需要再叠加）。
 
 ---
 
@@ -8,13 +8,13 @@
 
 当以下两项上游条件就绪时，即可启动本方案：
 
-- [ ] **条件 A：Basalt 新版本发布（含 PR [`#481`](https://github.com/jesdga95/basalt/pull/481) `fcd05701` 及后续稳定性修复）**
+- [x] **条件 A：Basalt 新版本发布（已落地 `v0.6.0` `111b050d`，含 PR [`#481`](https://github.com/jesdga95/basalt/pull/481) 及数十项稳定性与性能升级）**
   - 原生支持 `UD-Q2_K_XL`（`MXFP4` / `IQ3_S` down experts + `Q5_K` 176 B/row Engram + 加载期 `native_expert_supported` 校验）。
-  - 同步吸收 `v0.5.7` 之后的关键服务端修复（如 `#645` 重启死锁、`#646` tool_choice grammar、`#718` SSE 信号量泄漏）。
-  - 核对 [`basalt_colab/vm/patch_basalt.py`](../basalt_colab/vm/patch_basalt.py) 在目标 tag 上的锚点，触发 [`.github/workflows/build-basalt-prebuilt.yml`](../.github/workflows/build-basalt-prebuilt.yml) 产出 `prebuilt-v0.5.8` 并回填 [`basalt_colab/vm/manifest.json`](../basalt_colab/vm/manifest.json)（含 `prebuilt_sha256`）。
+  - 同步吸收 `v0.5.7` 之后的关键性能与稳定性升级（`#802` struct decode +21%、`#573` Engram MMQ、`#808` 原生共享 KV 池、`#834`/`#835` 上游化、`#645`/`#646`/`#718`/`#832`/`#854` 等）。
+  - [`basalt_colab/vm/patch_basalt.py`](../basalt_colab/vm/patch_basalt.py) 已完成 `v0.6.0` 锚点适配与 Stage 1 `BASALT_COLAB_WAVE_FETCH` 落地，并由 [`.github/workflows/build-basalt-prebuilt.yml`](../.github/workflows/build-basalt-prebuilt.yml) 产出 `prebuilt-v0.6.0` 回填 [`basalt_colab/vm/manifest.json`](../basalt_colab/vm/manifest.json)。
 - [ ] **条件 B：Hugging Face `UD-Q2_K_XL.basalt` 仓库就绪**
-  - 上游 `jesdga/DeepSeek-V4.1-Flash-1017-Basalt` 发布官方包，或使用 [`scripts/build_q2k_xl_pack.py`](../scripts/build_q2k_xl_pack.py)（在 `v0.5.8` 发版前需加 `--basalt-ref main`）转换并上传至自托管 HF 仓库。
-  - 回填 `manifest.json` 中 `packs.ud-q2_k_xl.url`。
+  - 上游 `jesdga/DeepSeek-V4.1-Flash-1017-Basalt` 发布官方包，或直接使用 [`scripts/build_q2k_xl_pack.py`](../scripts/build_q2k_xl_pack.py)（现已默认对齐 `v0.6.0`，无需 `--basalt-ref main`）转换并上传至自托管 HF 仓库。
+  - 官方包发布后回填 `manifest.json` 中 `packs.ud-q2_k_xl.url`。
 
 ---
 
@@ -222,16 +222,15 @@ sequenceDiagram
 
 ---
 
-## 5. 升级与验证步骤（待上游就绪后按序执行）
+## 5. 升级与验证步骤
 
-1. **升级 Basalt 基线**：
-   - 将 [`manifest.json`](../basalt_colab/vm/manifest.json) 指向新 tag（`v0.5.8`）及对应 commit；
-   - 在本地或 CI 验证 `patch_basalt.py` 对新 tag 全部现有 patch 锚点 100% 匹配；
-   - 触发 `.github/workflows/build-basalt-prebuilt.yml` 发布 `prebuilt-v0.5.8` 并锁定 `prebuilt_sha256`。
-2. **接入 `UD-Q2_K_XL` 包直链**：
-   - 回填 `manifest.json` `packs.ud-q2_k_xl.url`；
-   - 放行 `config.py` 对 `ud-q2_k_xl` 免填 `--pack-url`（沿用 `manifest.json` 内置 URL）。
-3. **先落地 Stage 0 + Stage 1（Micro-Wave）+ Engram 推理优化（`LAZY_OPEN` + RAM Window + `+4096 B` 边界保护 + `4 GiB` 过滤 `RowCache` + `max_inflight=256`），单次真机 G4 实测验收**：
+1. **升级 Basalt 基线（已完成）**：
+   - [`manifest.json`](../basalt_colab/vm/manifest.json) 已指向 `v0.6.0` (`111b050dac1f1ab2c561b57815cfb6791e0ab31f`)；
+   - [`patch_basalt.py`](../basalt_colab/vm/patch_basalt.py) 对 `v0.6.0` 全部 7 个补丁锚点验证通过，且 C++ `PleReader` 与 Stage 1 Micro-Wave `Loader::run()` 均通过实编实测；
+   - `.github/workflows/build-basalt-prebuilt.yml` 发布 `prebuilt-v0.6.0` 并锁定 `prebuilt_sha256`。
+2. **接入 `UD-Q2_K_XL` 包直链（待官方 HF 发布；当前可用 `--pack-url`）**：
+   - 待官方包发布后回填 `manifest.json` `packs.ud-q2_k_xl.url`，并放行 `config.py` 对 `ud-q2_k_xl` 免填 `--pack-url`。
+3. **Stage 0 + Stage 1（Micro-Wave）+ Engram 推理优化（已落地代码，待真机 G4 实测验收）**：
    - 核验 `timeline.txt`：Wave 1（仅 `experts` 不覆写 abliteration）/ Wave 2 升序微波耗时与 punch 回收、整体内存峰值（目标 ≤ 141 GiB、绝不 OOM）、`/content` 写入总量（0 字节 Backbone 落盘、仅 ~83.9 GiB 稀疏 Engram）；
    - 核验 `basalt` 启动日志：`expert homes`（目标 143–153/384 in VRAM，0 on SSD）、`0 lossy flags`、abliteration 生效验证、RAM Window 精确覆盖 Layer 1 `3-gram+4-gram`（`41.96 GiB`）且边界两行逐字节一致；
    - 核验推理吞吐与 Engram I/O：实测 `conv / struct / prose` Decode 吞吐、16K 长 Prompt Prefill 吞吐以及 `PleReader` 读盘延迟（p50/p99）与 `RowCache` 命中率。

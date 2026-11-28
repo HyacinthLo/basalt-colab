@@ -9,9 +9,9 @@ and plans zero-SSD-expert staging (honoring Stage 0 `--ssd-dir` when fast local 
       Backbone -> /mnt/ram/model.basalt (punch-on-read)
       Engram RAM windows (~83-86 GiB: Layer 1 all + Layer 14 3/4-gram) -> /mnt/ram/engram_*.bin
       Engram sparse SSD (~17-20 GiB Layer 14 2-gram, +4096 B boundary overlap) -> $SSD_DIR/engram_tail.bin (parallel at t=2s!)
-  - ssd+hybrid / ssd+ssd (e.g. UD-Q2_K_XL, ~194.3 + 125.9 GiB Q5_K):
-      Backbone -> $SSD_DIR/model.basalt (punch-on-read)
-      Engram RAM window (~42 GiB Layer 1 3/4-gram) -> /mnt/ram/engram_0.bin + sparse SSD (~84 GiB) -> $SSD_DIR/engram_tail.bin
+  - wave+hybrid (Stage 1 Micro-Wave, e.g. UD-Q2_K_XL, ~194.3 + 125.9 GiB Q5_K):
+      0 bytes backbone on SSD! Base sections (~10 GiB) + ~20 GiB active micro-wave -> /mnt/ram/model.basalt (punch-on-read)
+      Engram RAM window (~42 GiB Layer 1 3/4-gram) -> /mnt/ram/engram_0.bin + sparse SSD (~84 GiB) -> $SSD_DIR/engram_tail.bin (parallel at t=2s!)
   - Fail-fast guard rejects packs whose backbone exceeds zero-SSD-expert VRAM+RAM capacity (e.g. NVFP4).
 """
 import argparse, ctypes, json, os, shlex, struct, sys, tempfile, urllib.request
@@ -354,8 +354,8 @@ def _split_engram_bytes(engram_bytes, ram_total_gib, ram_budget_gib, reserve_gib
     return head, int(engram_bytes) - head
 
 
-def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vram_gib=96.0, explicit_budget_gib=0, ssd_dir='/content'):
-    """Computes zero-SSD-expert staging plan (ram+ram, ram+hybrid/ram+ssd, or ssd+hybrid/ssd+ssd)."""
+def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vram_gib=96.0, explicit_budget_gib=0, ssd_dir='/content', wave_enabled=True):
+    """Computes zero-SSD-expert staging plan (ram+ram, ram+hybrid/ram+ssd, wave+hybrid, or ssd+hybrid/ssd+ssd)."""
     ssd_dir = (ssd_dir or '/content').rstrip('/') or '/content'
     bb_gib = backbone_bytes / GIB
     eng_gib = engram_bytes / GIB
@@ -414,6 +414,39 @@ def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vra
             engram_head_bytes = 0
             engram_tail_bytes = int(engram_bytes)
             parallel_tail = True
+    elif wave_enabled:
+        # Stage 1 Micro-Wave: 0 bytes backbone on SSD! Base non-expert sections (~10 GiB) + ~20 GiB active micro-wave
+        # live in /mnt/ram/model.basalt (peak RAM <= ~141 GiB), so sparse Engram SSD tail starts in parallel at t=2s.
+        # Decouple Engram split estimate from the resident-budget-gib cap: expert_tier.cpp only allocates the actual
+        # non-VRAM experts, so a generous cap prevents artificial file spill under fp16 KV or parallel=4 while
+        # post-/load --finalize-engram sizes the RAM window from real MemAvailable.
+        model_path = '/mnt/ram/model.basalt'
+        punch_file = '/mnt/ram/model.basalt'
+        auto_budget = max(100, int(ram_total_gib - 26))
+        ram_budget = int(explicit_budget_gib) if int(explicit_budget_gib) > 0 else int(auto_budget)
+        est_ram_experts = int(explicit_budget_gib) if int(explicit_budget_gib) > 0 else max(55, int(ram_needed_gib + 6))
+        head_b, tail_b = _split_engram_bytes(engram_bytes, ram_total_gib, est_ram_experts)
+        if head_b > 0:
+            if tail_b / GIB > float(disk_free_gib) - 8.0:
+                raise RuntimeError(
+                    f'Engram tail ({tail_b / GIB:.1f} GiB) does not fit in {ssd_dir} disk ({disk_free_gib:.1f} GiB free)'
+                )
+            stage_mode = 'wave+hybrid'
+            engram_path = '/mnt/ram/engram.bin'
+            engram_tail_path = f'{ssd_dir}/engram_tail.bin'
+            engram_head_bytes = head_b
+            engram_tail_bytes = tail_b
+            parallel_tail = True
+        else:
+            if eng_gib > float(disk_free_gib) - 8.0:
+                raise RuntimeError(
+                    f'Engram ({eng_gib:.1f} GiB) does not fit in {ssd_dir} disk ({disk_free_gib:.1f} GiB free)'
+                )
+            stage_mode = 'wave+ssd'
+            engram_path = f'{ssd_dir}/engram.bin'
+            engram_head_bytes = 0
+            engram_tail_bytes = int(engram_bytes)
+            parallel_tail = True
     else:
         if bb_gib > float(disk_free_gib) - 6.0:
             raise RuntimeError(
@@ -464,7 +497,7 @@ def plan_storage(backbone_bytes, engram_bytes, ram_total_gib, disk_free_gib, vra
     }
 
 
-def build_jobs(url, file_bytes, sections, backbone_dest, engram_dest, engram_tail_dest='', engram_head_bytes=0):
+def build_jobs(url, file_bytes, sections, backbone_dest, engram_dest, engram_tail_dest='', engram_head_bytes=0, exclude_experts=False):
     backbone_jobs = [{
         'url': url,
         'dest': backbone_dest,
@@ -480,6 +513,8 @@ def build_jobs(url, file_bytes, sections, backbone_dest, engram_dest, engram_tai
         if s['name'] == 'engram':
             assert eng_sec is None, 'multiple engram sections found'
             eng_sec = s
+        elif exclude_experts and s['name'] == 'experts':
+            continue
         else:
             backbone_jobs.append({
                 'url': url,
@@ -616,6 +651,10 @@ def main():
     ap.add_argument('--plan', action='store_true',
                     help='Read remote 64 KiB header and emit shell exports for optimal storage staging')
     ap.add_argument('--ssd-dir', default='/content')
+    ap.add_argument('--no-wave', action='store_true',
+                    help='Disable Stage 1 wave+hybrid mode (force legacy ssd+hybrid/ssd+ssd fallback)')
+    ap.add_argument('--exclude-experts', action='store_true',
+                    help='Exclude `experts` section from backbone jobs (Stage 1 wave+hybrid streams experts on demand)')
     ap.add_argument('--ram-total-gib', type=float, default=176.0)
     ap.add_argument('--disk-free-gib', type=float, default=220.0)
     ap.add_argument('--vram-gib', type=float, default=96.0)
@@ -671,6 +710,8 @@ def main():
 
     if args.plan:
         bb_bytes, eng_bytes = summarize_sections(sections)
+        exp_sec = next((s for s in sections if s['name'] == 'experts' and s['bytes'] > 0), None)
+        experts_range = f"{exp_sec['offset']}:{exp_sec['offset'] + exp_sec['bytes']}" if exp_sec else ''
         try:
             plan = plan_storage(
                 bb_bytes,
@@ -680,6 +721,7 @@ def main():
                 vram_gib=args.vram_gib,
                 explicit_budget_gib=args.ram_budget,
                 ssd_dir=args.ssd_dir,
+                wave_enabled=(not args.no_wave and bool(experts_range)),
             )
         except RuntimeError as e:
             sys.stderr.write(f'PLAN ERROR: {e}\n')
@@ -697,6 +739,8 @@ def main():
             ('BACKBONE_GIB', str(plan['backbone_gib'])),
             ('ENGRAM_GIB', str(plan['engram_gib'])),
             ('RAM_NEEDED_GIB', str(plan['ram_needed_gib'])),
+            ('MODEL_FILE_BYTES', str(file_bytes)),
+            ('EXPERTS_RANGE', experts_range),
             ('MODEL_URL', url),
         ):
             print(f'export {k}={shlex.quote(v)}')
@@ -711,6 +755,7 @@ def main():
         args.engram_dest,
         engram_tail_dest=args.engram_tail_dest,
         engram_head_bytes=args.engram_head_bytes,
+        exclude_experts=args.exclude_experts,
     )
 
     eng_sec = next(s for s in sections if s['name'] == 'engram' and s['bytes'] > 0)

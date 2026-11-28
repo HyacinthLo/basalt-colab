@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
-"""Surgical Colab G4 patches for jesdga95/basalt v0.5.7 (BASALT_COLAB_PATCH).
+"""Surgical Colab G4 patches for jesdga95/basalt v0.6.0 (BASALT_COLAB_PATCH).
 
-Applies three opt-in/fallback patches so Basalt DeepSeek-V4.1-Flash packs boot in ~2 min and
-serve at full speed on Colab G4 (96 GiB VRAM + 176 GiB RAM + 232 GB Disk):
+Note: Basalt v0.6.0 upstreamed O_DIRECT->EINVAL tmpfs fallback (#835) and alloc_ram
+MADV_HUGEPAGE (#834). Remaining patches enable zero-SSD-expert ~95s boot, Stage 1
+Micro-Wave streaming (wave+hybrid), and multi-window lazy Engram on Colab G4:
   1. src/models/deepseek41/model.cpp (BASALT_COLAB_ENGRAM_ENV):
-     When BASALT_ENGRAM_FILE is set, open the 110.6 GB Engram table from that separate path at
-     offset 0 (e.g. /mnt/ram/engram.bin on tmpfs) instead of inside the sparse .basalt backbone.
-  2. src/platform/direct_file.cpp (BASALT_COLAB_TMPFS_FALLBACK):
-     When open(..., O_RDONLY | O_DIRECT | O_CLOEXEC) fails with EINVAL (tmpfs / overlayfs),
-     fall back cleanly to O_RDONLY | O_CLOEXEC.
-  3. src/core/expert_tier.cpp & src/core/loader.cpp (BASALT_COLAB_PUNCH_ON_READ):
-     When BASALT_PUNCH_FILE is set (e.g. /mnt/ram/model.basalt on tmpfs):
-       - expert_tier.cpp credits the file's punchable tmpfs blocks (st_blocks*512 minus 2 GiB
-         kept for header/meta/token_embd/vision) to `avail` so the RAM expert tier plans the
-         full ~54 GiB complement before weights are punched.
-       - loader.cpp executes device (VRAM) reads first, punches all inward-4K-aligned spans of
-         (device_reads \\ host_reads) via fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)
-         (~66 GiB freed immediately), then executes host (RAM) reads and punches host_reads
-         (~54 GiB freed immediately) — dropping /mnt/ram/model.basalt from 140 GiB -> ~2 GiB
-         before pin_landed_complement() and the 110.6 GB Engram download.
+     BASALT_ENGRAM_FILE separate path at offset 0, BASALT_ENGRAM_CACHE_MIB (0..4096 MiB),
+     and BASALT_ENGRAM_INFLIGHT (1..1024, default 256).
+  2. src/platform/direct_file.cpp (BASALT_COLAB_ENGRAM_SPLIT):
+     Legacy split head+tail file support when BASALT_ENGRAM_TAIL_FILE is set.
+  3a. src/core/expert_tier.cpp (BASALT_COLAB_PUNCH_ON_READ):
+     Credits punchable tmpfs backbone blocks (st_blocks*512 minus 2 GiB) into avail.
+  3b. src/core/loader.cpp (BASALT_COLAB_PUNCH_ON_READ + BASALT_COLAB_WAVE_FETCH):
+     Two-wave barriered execution + inward-4K FALLOC_FL_PUNCH_HOLE on BASALT_PUNCH_FILE.
+     When BASALT_WAVE_FETCH_CMD + BASALT_EXPERTS_RANGE are set (Stage 1 wave+hybrid),
+     clips spans strictly to [experts_lo, experts_hi) (never touching abliterated dense),
+     fetches Wave 1 VRAM experts on demand, then sorts Wave 2 RAM experts by ascending
+     file offset and streams in ~20 GiB micro-waves (fetch -> load -> punch, peak <=141 GiB).
+  4. serve/service.py (BASALT_COLAB_PUNCH_GUARD):
+     Refuses unload and engine respawn once BASALT_PUNCH_FILE has punched tmpfs weights.
+  5. src/ngram/ple_reader.cpp (BASALT_COLAB_ENGRAM_MMAP):
+     Zero-copy mmap(), BASALT_ENGRAM_LAZY_OPEN=1, multi-window BASALT_ENGRAM_LAYOUT
+     (ram + logical full-size sparse ssd), and unified RowCache::insert() cache_skip filter.
+  6. src/core/ram_load.cpp (BASALT_COLAB_RAM_PARALLEL_PIN):
+     4-thread parallel cudaHostRegister across layer spans when unlimited.
 
 Usage: python3 patch_basalt.py BASALT_SRC_DIR
 """
@@ -52,57 +57,68 @@ def main():
         sys.exit('usage: python3 patch_basalt.py BASALT_SRC_DIR')
     src = sys.argv[1]
 
-    # 1. Separate Engram file via BASALT_ENGRAM_FILE
+    # 1. Separate Engram file + configurable RowCache MiB (0..4096) & inflight depth (1..1024)
     patch_file(
         src,
         'src/models/deepseek41/model.cpp',
         'BASALT_COLAB_ENGRAM_ENV',
         [
             (
+                '#include <cstdio>',
+                '#include <cstdio>\n#include <cstdlib>',
+            ),
+            (
                 '''    if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
-        if (!engram_->open(path, e.file_offset, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;
+        // Map now so tier_spec() reserves its RAM; lock/touch in attach() after the expert tier's reads finish so
+        // buffered expert reads cannot evict unlocked Engram pages from the OS page cache.
+        if (ple_ram) {
+            if (!engram_->open_ram(path, e.file_offset, e.rows, err, e.row_bytes, /*lock=*/false)) return false;
+        } else if (!engram_->open(path, e.file_offset, e.rows, 256, 1 << 20, err, e.row_bytes)) {
+            return false;
+        }
     }''',
                 '''    if (pack_.engram.present) {
         engram_ = std::make_unique<ngram::PleReader>();
         const EngramInfo& e = pack_.engram;
-        // BASALT_COLAB_ENGRAM_ENV: allow serving the 110.6 GB Engram table from a separate tmpfs file
+        // BASALT_COLAB_ENGRAM_ENV + BASALT_COLAB_ENGRAM_TAIL_CACHE:
+        // separate Engram path at offset 0, RowCache size in MiB (0..4096), and inflight depth (1..1024).
         const char* engram_env = std::getenv("BASALT_ENGRAM_FILE");
         const std::string engram_path = (engram_env && *engram_env) ? std::string(engram_env) : path;
         const uint64_t engram_off = (engram_env && *engram_env) ? 0ull : e.file_offset;
-        if (!engram_->open(engram_path, engram_off, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;
+        if (ple_ram) {
+            if (!engram_->open_ram(engram_path, engram_off, e.rows, err, e.row_bytes, /*lock=*/false)) return false;
+        } else {
+            uint64_t cache_rows = 1ull << 20;
+            if (const char* cm = std::getenv("BASALT_ENGRAM_CACHE_MIB"); cm && *cm) {
+                char* endp = nullptr;
+                const long long mib = std::strtoll(cm, &endp, 10);
+                if (endp != cm && mib >= 0) {
+                    if (mib == 0) {
+                        cache_rows = 0;
+                    } else {
+                        const uint64_t clamped_mib = std::min<uint64_t>((uint64_t) mib, 4096ull);
+                        const uint64_t rb = std::max<uint32_t>(e.row_bytes, 1u);
+                        cache_rows = std::min<uint64_t>(e.rows, (clamped_mib << 20) / rb) & ~7ull;
+                    }
+                }
+            }
+            uint32_t inflight = 256u;
+            if (const char* inf = std::getenv("BASALT_ENGRAM_INFLIGHT"); inf && *inf) {
+                char* endp = nullptr;
+                const long long v = std::strtoll(inf, &endp, 10);
+                if (endp != inf && v >= 1) inflight = (uint32_t) std::min<long long>(v, 1024ll);
+            }
+            if (!engram_->open(engram_path, engram_off, e.rows, inflight, cache_rows, err, e.row_bytes)) return false;
+        }
     }''',
             ),
         ],
     )
 
-    # 2. DirectFile EINVAL fallback for tmpfs / overlayfs
-    patch_file(
-        src,
-        'src/platform/direct_file.cpp',
-        'BASALT_COLAB_TMPFS_FALLBACK',
-        [
-            (
-                '#include <cstdlib>',
-                '#include <cerrno>\n#include <cstdlib>',
-            ),
-            (
-                '''    impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-    if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }''',
-                '''    impl_->fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-    if (impl_->fd < 0 && errno == EINVAL) { // BASALT_COLAB_TMPFS_FALLBACK: tmpfs rejects O_DIRECT
-        impl_->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    }
-    if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }''',
-            ),
-        ],
-    )
-
-    # 2b. DirectFile split Engram tail support (BASALT_COLAB_ENGRAM_SPLIT):
-    # Allows serving the Engram table across two page-aligned files:
-    #   [0, split_bytes)         -> BASALT_ENGRAM_FILE (e.g. /mnt/ram/engram.bin on tmpfs)
-    #   [split_bytes, total)     -> BASALT_ENGRAM_TAIL_FILE (e.g. /content/engram_tail.bin)
+    # 2. DirectFile legacy split Engram tail support (BASALT_COLAB_ENGRAM_SPLIT)
+    #    (O_DIRECT -> EINVAL tmpfs fallback is native in Basalt v0.6.0 via #835)
     patch_file(
         src,
         'src/platform/direct_file.cpp',
@@ -111,23 +127,34 @@ def main():
             (
                 '''struct DirectFile::Impl {
     int fd = -1;
+    bool no_buffering = false;
     uint64_t size = 0;''',
                 '''struct DirectFile::Impl {
     int fd = -1;
-    int fd2 = -1; // BASALT_COLAB_ENGRAM_SPLIT: optional tail file for hybrid RAM+SSD Engram
+    int fd2 = -1; // BASALT_COLAB_ENGRAM_SPLIT: optional legacy tail file for split Engram
     uint64_t split_bytes = 0;
+    bool no_buffering = false;
     uint64_t size = 0;''',
             ),
             (
-                '''            const ssize_t got = pread(fd, p.buffer, p.length, (off_t) p.offset);''',
-                '''            const bool in_tail = (fd2 >= 0 && p.offset >= split_bytes);
-            const ssize_t got = pread(in_tail ? fd2 : fd, p.buffer, p.length,
-                                      (off_t) (in_tail ? p.offset - split_bytes : p.offset));''',
+                '''                const ssize_t got = pread(fd, dst + total, p.length - total, (off_t) (p.offset + total));''',
+                '''                const uint64_t cur_off = p.offset + total;
+                const bool in_tail = (fd2 >= 0 && cur_off >= split_bytes);
+                const ssize_t got = pread(in_tail ? fd2 : fd, dst + total, p.length - total,
+                                          (off_t) (in_tail ? cur_off - split_bytes : cur_off));''',
             ),
             (
-                '''    if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
+                '''    if (impl_->fd < 0) {
+        impl_->no_buffering = false;
+        err = "DirectFile: cannot open " + path;
+        return false;
+    }
     return finish_open(path, err, workers);''',
-                '''    if (impl_->fd < 0) { err = "DirectFile: cannot open " + path; return false; }
+                '''    if (impl_->fd < 0) {
+        impl_->no_buffering = false;
+        err = "DirectFile: cannot open " + path;
+        return false;
+    }
     const char* eng_head = std::getenv("BASALT_ENGRAM_FILE");
     const char* eng_tail = std::getenv("BASALT_ENGRAM_TAIL_FILE");
     if (eng_head && *eng_head && eng_tail && *eng_tail && path == eng_head) {
@@ -159,18 +186,21 @@ def main():
             (
                 '''    if (impl_->fd >= 0) ::close(impl_->fd);
     impl_->fd = -1;
+    impl_->no_buffering = false;
     impl_->size = 0;''',
                 '''    if (impl_->fd >= 0) ::close(impl_->fd);
     if (impl_->fd2 >= 0) ::close(impl_->fd2);
     impl_->fd = -1;
     impl_->fd2 = -1;
     impl_->split_bytes = 0;
+    impl_->no_buffering = false;
     impl_->size = 0;''',
             ),
         ],
     )
 
-    # 3a. ExpertTier: credit punchable tmpfs backbone bytes into avail when BASALT_PUNCH_FILE is active
+    # 3a. ExpertTier: credit punchable tmpfs backbone bytes into avail when BASALT_PUNCH_FILE is active,
+    #     and fail fast if any experts spill to file while BASALT_PUNCH_FILE is active (would read punched zeros).
     patch_file(
         src,
         'src/core/expert_tier.cpp',
@@ -202,10 +232,22 @@ def main():
 #endif
     // places per layer above the reserve, less the spare each layer keeps, in `bytes` of RAM''',
             ),
+            (
+                '''    // the CPU side: the file view, the per-layer formats, the pool
+    if (homes_.file > 0) {''',
+                '''    // the CPU side: the file view, the per-layer formats, the pool
+    if (homes_.file > 0) {
+        if (const char* pf = std::getenv("BASALT_PUNCH_FILE"); pf && *pf) {
+            err = s_.name + ": " + std::to_string(homes_.file) +
+                  " experts/layer spilled to file while BASALT_PUNCH_FILE is active (would read punched zeros)";
+            return false;
+        }''',
+            ),
         ],
     )
 
-    # 3b. Loader: two-wave barriered execution + inward-4K fallocate(PUNCH_HOLE) on BASALT_PUNCH_FILE
+    # 3b. Loader: two-wave barriered execution + inward-4K fallocate(PUNCH_HOLE) + Stage 1 Micro-Wave
+    #     (BASALT_COLAB_PUNCH_ON_READ + BASALT_COLAB_WAVE_FETCH)
     patch_file(
         src,
         'src/core/loader.cpp',
@@ -213,15 +255,22 @@ def main():
         [
             (
                 '#include <cstring>',
-                '#include <cstdlib>\n#include <cstring>\n#ifdef __linux__\n#include <fcntl.h>\n#include <sys/stat.h>\n#include <unistd.h>\n#endif',
+                '#include <cstdio>\n#include <cstdlib>\n#include <cstring>\n#include <fstream>\n#ifdef __linux__\n#include <fcntl.h>\n#include <sys/stat.h>\n#include <sys/wait.h>\n#include <unistd.h>\n#endif',
             ),
             (
                 '''    const size_t device_tasks = rounds[0].size();
-    rounds[0].insert(rounds[0].end(), host_reads.begin(), host_reads.end());''',
-                '''    // BASALT_COLAB_PUNCH_ON_READ: when punching a tmpfs model file on read, finish all device reads first,
-    // punch device-only byte ranges to reclaim ~66 GiB RAM, then run host reads and punch host ranges (~54 GiB).
+    rounds[0].insert(rounds[0].end(), host_reads.begin(), host_reads.end());
+    const int n_workers = (int) std::min<size_t>((size_t) m.threads, std::max(rounds[0].size(), rounds[1].size()));''',
+                '''    // BASALT_COLAB_PUNCH_ON_READ + BASALT_COLAB_WAVE_FETCH:
+    // When punching a tmpfs model file on read, run Wave 1 (VRAM) -> punch, then Wave 2 (RAM) -> punch.
+    // When BASALT_WAVE_FETCH_CMD + BASALT_EXPERTS_RANGE are also set (Stage 1 wave+hybrid), stream ONLY
+    // [experts_lo, experts_hi) on demand (never touching abliterated dense), sorting Wave 2 by ascending
+    // file offset and executing in ~20 GiB micro-waves (peak RAM <= 141 GiB, 0 bytes backbone on SSD).
     int punch_fd = -1;
     std::vector<bool> file_is_punch(handles.size(), false);
+    std::string wave_fetch_cmd;
+    uint64_t experts_lo = 0, experts_hi = 0;
+    uint64_t wave_chunk_bytes = 20ull << 30;
 #ifdef __linux__
     if (const char* pf = std::getenv("BASALT_PUNCH_FILE"); pf && *pf) {
         struct stat target_st{};
@@ -242,6 +291,25 @@ def main():
             }
         }
     }
+    if (punch_fd >= 0) {
+        const char* wf = std::getenv("BASALT_WAVE_FETCH_CMD");
+        const char* er = std::getenv("BASALT_EXPERTS_RANGE");
+        if (wf && *wf && er && *er) {
+            unsigned long long elo = 0, ehi = 0;
+            if (std::sscanf(er, "%llu:%llu", &elo, &ehi) == 2 && ehi > elo) {
+                wave_fetch_cmd = wf;
+                experts_lo = (uint64_t) elo;
+                experts_hi = (uint64_t) ehi;
+            }
+        }
+        if (const char* cg = std::getenv("BASALT_WAVE_CHUNK_GIB"); cg && *cg) {
+            char* endp = nullptr;
+            const long long v = std::strtoll(cg, &endp, 10);
+            if (endp != cg && v >= 4) {
+                wave_chunk_bytes = (uint64_t) std::min<long long>(v, 64ll) << 30;
+            }
+        }
+    }
 #endif
     const size_t device_tasks = rounds[0].size();
     std::vector<Task> punch_host_wave;
@@ -249,7 +317,9 @@ def main():
         punch_host_wave = std::move(host_reads);
     } else {
         rounds[0].insert(rounds[0].end(), host_reads.begin(), host_reads.end());
-    }''',
+    }
+    const size_t max_wave_tasks = std::max(std::max(rounds[0].size(), rounds[1].size()), punch_host_wave.size());
+    const int n_workers = (int) std::min<size_t>((size_t) m.threads, max_wave_tasks);''',
             ),
             (
                 '        if (device_tasks < rounds[0].size()) stages.push_back("ram");',
@@ -292,15 +362,85 @@ def main():
         }
         sp.resize(w + 1);
     };
-    auto collect_spans = [&](const std::vector<Task>& wave) {
+    auto collect_spans = [&](const std::vector<Task>& wave, size_t from = 0, size_t to = SIZE_MAX) {
         std::vector<Span> sp;
-        for (const Task& t : wave) {
+        const size_t end = std::min(to, wave.size());
+        for (size_t i = from; i < end; ++i) {
+            const Task& t = wave[i];
             const LoadItem& it = items[t.item];
             if (it.from == nullptr && it.file >= 0 && file_is_punch[(size_t) it.file] && t.len > 0)
                 sp.emplace_back(it.off + t.off, it.off + t.off + t.len);
         }
         merge_spans(sp);
         return sp;
+    };
+    auto clip_spans = [&](const std::vector<Span>& sp, uint64_t lo, uint64_t hi) {
+        std::vector<Span> out;
+        for (auto [a, b] : sp) {
+            const uint64_t ca = std::max(a, lo);
+            const uint64_t cb = std::min(b, hi);
+            if (cb > ca) out.emplace_back(ca, cb);
+        }
+        merge_spans(out);
+        return out;
+    };
+    auto invoke_wave_fetch = [&](const std::vector<Span>& sp, const std::string& tag) {
+        if (wave_fetch_cmd.empty() || sp.empty() || failed.load()) return;
+        const std::string jpath = "/tmp/basalt_wave_" + std::to_string((long long) ::getpid()) + "_" + tag + ".json";
+        {
+            std::ofstream out(jpath);
+            if (!out.is_open()) {
+                fail("BASALT_WAVE_FETCH_CMD: cannot write spans JSON " + jpath);
+                return;
+            }
+            out << "[";
+            for (size_t i = 0; i < sp.size(); ++i) {
+                if (i > 0) out << ",";
+                out << "[" << sp[i].first << "," << sp[i].second << "]";
+            }
+            out << "]\\n";
+        }
+        uint64_t total_b = 0;
+        for (auto [a, b] : sp) total_b += (b - a);
+        basalt::log::info("basalt loader", "wave fetch (%s): %.2f GiB across %zu span(s)",
+                          tag.c_str(), (double) total_b / 1073741824.0, sp.size());
+        const pid_t pid = ::fork();
+        if (pid < 0) {
+            (void) ::unlink(jpath.c_str());
+            fail("BASALT_WAVE_FETCH_CMD: fork failed");
+            return;
+        }
+        if (pid == 0) {
+            if (::access(wave_fetch_cmd.c_str(), X_OK) == 0) {
+                char* argv[] = {
+                    const_cast<char*>(wave_fetch_cmd.c_str()),
+                    const_cast<char*>(jpath.c_str()),
+                    const_cast<char*>(tag.c_str()),
+                    nullptr,
+                };
+                ::execv(wave_fetch_cmd.c_str(), argv);
+            } else {
+                char bash_bin[] = "/bin/bash";
+                char* argv[] = {
+                    bash_bin,
+                    const_cast<char*>(wave_fetch_cmd.c_str()),
+                    const_cast<char*>(jpath.c_str()),
+                    const_cast<char*>(tag.c_str()),
+                    nullptr,
+                };
+                ::execv(bash_bin, argv);
+            }
+            ::_exit(127);
+        }
+        int status = 0;
+        while (::waitpid(pid, &status, 0) < 0) {
+            if (errno != EINTR) { status = 1; break; }
+        }
+        (void) ::unlink(jpath.c_str());
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fail("BASALT_WAVE_FETCH_CMD failed (" + tag + ", rc=" +
+                 std::to_string(WIFEXITED(status) ? WEXITSTATUS(status) : -1) + ")");
+        }
     };
     auto punch_spans = [&](const std::vector<Span>& sp, const std::vector<Span>& keep, const char* tag) {
         if (punch_fd < 0 || sp.empty()) return;
@@ -331,6 +471,12 @@ def main():
     };
 #endif
 
+#ifdef __linux__
+    if (punch_fd >= 0 && !wave_fetch_cmd.empty() && !failed.load()) {
+        const auto dev_fetch = clip_spans(collect_spans(rounds[0]), experts_lo, experts_hi);
+        invoke_wave_fetch(dev_fetch, "wave1");
+    }
+#endif
     run_wave(rounds[0]);
 #ifdef __linux__
     if (punch_fd >= 0 && !failed.load()) {
@@ -342,8 +488,42 @@ def main():
             basalt::log::info("basalt loader", "the cards' share is read (%.2f GiB in %.1f s); RAM next",
                               (double) device_bytes / 1073741824.0,
                               std::chrono::duration<double>(std::chrono::steady_clock::now() - run_t0).count());
-            run_wave(punch_host_wave);
-            if (!failed.load()) punch_spans(host_sp, {}, "after-ram");
+            if (!wave_fetch_cmd.empty()) {
+                // Sort RAM expert reads by ascending file byte offset so micro-waves coalesce HTTP ranges
+                // and keep punched byte intervals strictly monotonic (peak RAM <= ~141 GiB).
+                std::stable_sort(punch_host_wave.begin(), punch_host_wave.end(), [&](const Task& a, const Task& b) {
+                    const uint64_t oa = items[a.item].off + a.off;
+                    const uint64_t ob = items[b.item].off + b.off;
+                    return oa < ob;
+                });
+                size_t pos = 0;
+                size_t wave_idx = 0;
+                while (pos < punch_host_wave.size() && !failed.load()) {
+                    size_t end = pos;
+                    uint64_t acc = 0;
+                    while (end < punch_host_wave.size()) {
+                        const uint64_t len = punch_host_wave[end].len;
+                        if (end > pos && acc + len > wave_chunk_bytes) break;
+                        acc += len;
+                        ++end;
+                    }
+                    std::vector<Task> sub_wave(punch_host_wave.begin() + (ptrdiff_t) pos,
+                                               punch_host_wave.begin() + (ptrdiff_t) end);
+                    const auto sub_sp = collect_spans(sub_wave);
+                    const auto sub_fetch = clip_spans(sub_sp, experts_lo, experts_hi);
+                    invoke_wave_fetch(sub_fetch, "wave2_" + std::to_string(wave_idx));
+                    run_wave(sub_wave);
+                    if (!failed.load()) {
+                        const auto future_sp = collect_spans(punch_host_wave, end);
+                        punch_spans(sub_sp, future_sp, "after-ram-wave");
+                    }
+                    pos = end;
+                    ++wave_idx;
+                }
+            } else {
+                run_wave(punch_host_wave);
+                if (!failed.load()) punch_spans(host_sp, {}, "after-ram");
+            }
         } else {
             const auto all_sp = collect_spans(rounds[0]);
             punch_spans(all_sp, {}, "after-reads");
@@ -386,9 +566,15 @@ def main():
                 self.on_loaded()''',
             ),
             (
-                '''        if self.loaded() and not self._vision_down():
+                '''        if self.loaded():
+            if self._vision_down():
+                print("[server] restarting the vision encoder", flush=True)
+                self.vision.restart()
             return''',
-                '''        if self.loaded() and not self._vision_down():
+                '''        if self.loaded():
+            if self._vision_down():
+                print("[server] restarting the vision encoder", flush=True)
+                self.vision.restart()
             return
         # BASALT_COLAB_PUNCH_GUARD: punched tmpfs weights cannot be re-read after an engine exit
         if os.environ.get("BASALT_PUNCH_FILE") and getattr(self, "_punched_once", False):
@@ -403,15 +589,7 @@ def main():
         ],
     )
 
-    # 6. PleReader RAM zero-copy mmap(), multi-window RAM+sparse-SSD layout, lazy open, and RowCache skip filter
-    #    (BASALT_COLAB_ENGRAM_MMAP):
-    #    - Legacy eager mode: when Engram head lives on /mnt/ram/ (or BASALT_ENGRAM_MMAP=1), mmap [0, head_bytes)
-    #      read-only with MAP_SHARED + MADV_RANDOM so lookups resolve via ~80ns memcpy (0 syscalls).
-    #    - Lazy layout mode (BASALT_ENGRAM_LAZY_OPEN=1 + BASALT_ENGRAM_LAYOUT=/mnt/ram/engram_layout.txt):
-    #      open() allocates RowCache immediately (before expert_tier.cpp sizes RAM experts) and defers DirectFile
-    #      + mmap() until first issue() after POST /load, when boot.sh knows exact /proc/meminfo MemAvailable.
-    #      Supports arbitrary 64 MiB-aligned RAM windows (`ram <path> <lo> <hi>`) backed by a logical full-size
-    #      sparse SSD file (`ssd <path>`) and unified RowCache::insert() admission skip ranges (`cache_skip <lo> <hi>`).
+    # 5. PleReader RAM zero-copy mmap(), multi-window RAM+sparse-SSD layout, lazy open, and RowCache skip filter
     patch_file(
         src,
         'src/ngram/ple_reader.cpp',
@@ -597,16 +775,16 @@ def main():
             ),
             (
                 '''    m.file.close();
-    DirectFile::free_aligned(m.slab);''',
+    m.mapped.reset();''',
                 '''    m.unmap_windows();
     m.lazy_pending = false;
     m.cache.skip_ranges.clear();
     m.file.close();
-    DirectFile::free_aligned(m.slab);''',
+    m.mapped.reset();''',
             ),
             (
-                '''bool PleReader::is_open() const { return impl_->file.is_open(); }''',
-                '''bool PleReader::is_open() const { return impl_->file.is_open() || impl_->lazy_pending || !impl_->ram_windows.empty(); }''',
+                '''bool PleReader::is_open() const { return impl_->ram_mode || impl_->file.is_open(); }''',
+                '''bool PleReader::is_open() const { return impl_->ram_mode || impl_->file.is_open() || impl_->lazy_pending || !impl_->ram_windows.empty(); }''',
             ),
             (
                 '''    const uint32_t rb = m.row_bytes;
@@ -677,74 +855,13 @@ def main():
         ],
     )
 
-    # 7. Configurable Engram RowCache size & max_inflight via BASALT_ENGRAM_CACHE_MIB / BASALT_ENGRAM_INFLIGHT
-    #    (BASALT_COLAB_ENGRAM_TAIL_CACHE):
-    #    Combined with Patch #6, 100% of RowCache shields the SSD ranges (up to 4096 MiB = ~29.8M IQ4_NL / 24.4M Q5_K rows),
-    #    and BASALT_ENGRAM_INFLIGHT (default 64, hybrid/SSD 256) raises Prefill concurrent I/O queue depth.
-    patch_file(
-        src,
-        'src/models/deepseek41/model.cpp',
-        'BASALT_COLAB_ENGRAM_TAIL_CACHE',
-        [
-            (
-                '#include <cstdio>',
-                '#include <cstdio>\n#include <cstdlib>',
-            ),
-            (
-                '''        const uint64_t engram_off = (engram_env && *engram_env) ? 0ull : e.file_offset;
-        if (!engram_->open(engram_path, engram_off, e.rows, 64, 1 << 16, err, e.row_bytes)) return false;''',
-                '''        const uint64_t engram_off = (engram_env && *engram_env) ? 0ull : e.file_offset;
-        // BASALT_COLAB_ENGRAM_TAIL_CACHE: size RowCache in MiB (0 disables; hybrid default 4096 MiB) + inflight depth
-        uint64_t cache_rows = 1ull << 16;
-        if (const char* cm = std::getenv("BASALT_ENGRAM_CACHE_MIB"); cm && *cm) {
-            char* endp = nullptr;
-            const long long mib = std::strtoll(cm, &endp, 10);
-            if (endp != cm && mib >= 0) {
-                if (mib == 0) {
-                    cache_rows = 0;
-                } else {
-                    const uint64_t clamped_mib = std::min<uint64_t>((uint64_t) mib, 4096ull);
-                    const uint64_t rb = std::max<uint32_t>(e.row_bytes, 1u);
-                    cache_rows = std::min<uint64_t>(e.rows, (clamped_mib << 20) / rb) & ~7ull;
-                }
-            }
-        }
-        uint32_t inflight = 64u;
-        if (const char* inf = std::getenv("BASALT_ENGRAM_INFLIGHT"); inf && *inf) {
-            char* endp = nullptr;
-            const long long v = std::strtoll(inf, &endp, 10);
-            if (endp != inf && v >= 1) inflight = (uint32_t) std::min<long long>(v, 1024ll);
-        }
-        if (!engram_->open(engram_path, engram_off, e.rows, inflight, cache_rows, err, e.row_bytes)) return false;''',
-            ),
-        ],
-    )
-
-    # 8. RAM expert tier MADV_HUGEPAGE + parallel cudaHostRegister (BASALT_COLAB_RAM_HUGEPAGE_PIN):
-    #    Reduces 78 GiB PTE/IOMMU TLB entries by 512x and parallelizes layer pinning during /load.
+    # 6. Parallel cudaHostRegister across layer spans (BASALT_COLAB_RAM_PARALLEL_PIN)
+    #    (MADV_HUGEPAGE on alloc_ram is native in Basalt v0.6.0 via #834)
     patch_file(
         src,
         'src/core/ram_load.cpp',
-        'BASALT_COLAB_RAM_HUGEPAGE_PIN',
+        'BASALT_COLAB_RAM_PARALLEL_PIN',
         [
-            (
-                '#include <cstring>',
-                '#include <cstring>\n#ifdef __linux__\n#include <sys/mman.h>\n#endif',
-            ),
-            (
-                '''uint8_t* alloc_ram(uint64_t bytes) {
-    return (uint8_t*) platform::alloc_aligned((size_t) ram_padded(bytes), 2ull << 20);
-}''',
-                '''uint8_t* alloc_ram(uint64_t bytes) {
-    const uint64_t padded = ram_padded(bytes);
-    uint8_t* p = (uint8_t*) platform::alloc_aligned((size_t) padded, 2ull << 20);
-#ifdef __linux__
-    // BASALT_COLAB_RAM_HUGEPAGE_PIN: advise 2 MiB transparent hugepages to cut CPU/IOMMU TLB misses 512x
-    if (p && padded >= (2ull << 20)) (void) ::madvise(p, (size_t) padded, MADV_HUGEPAGE);
-#endif
-    return p;
-}''',
-            ),
             (
                 '''    std::vector<RamPin> pins(spans.size());
     uint64_t pinned = 0;
@@ -762,7 +879,8 @@ def main():
         pinned += pins[i].registered_bytes;
     }
     return pins;''',
-                '''    std::vector<RamPin> pins(spans.size());
+                '''    // BASALT_COLAB_RAM_PARALLEL_PIN: parallelize cudaHostRegister across 4 threads when unlimited
+    std::vector<RamPin> pins(spans.size());
     if constexpr (!platform::kBoundHostRegistration) {
         if (!limited && spans.size() >= 4) {
             int cur_dev = 0;

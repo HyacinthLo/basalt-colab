@@ -1,14 +1,14 @@
 #!/bin/bash
-# Cold start on Colab G4 using Basalt v0.5.7 (DeepSeek-V4.1-Flash):
+# Cold start on Colab G4 using Basalt v0.6.0 (DeepSeek-V4.1-Flash):
 #   0. Stage 0: probe for fast local NVMe scratch (>600 MiB/s synced write, >=120 GiB free); fallback /content
 #   1. Inspect 64 KiB .basalt header (+ meta for hybrid) -> auto-plan storage tier:
-#        - ram+ram    (UD-IQ1_M):   100% RAM backbone + 100% RAM Engram
-#        - ram+hybrid (UD-IQ2_XXS): RAM backbone + lazy multi-window RAM (~83-86 GiB) + sparse SSD tail (~17-20 GiB, parallel at t=2s)
-#        - ssd+hybrid (UD-Q2_K_XL): SSD backbone (punch-on-read) + lazy RAM window (~42 GiB Layer 1 3/4-gram) + sparse SSD (~84 GiB)
-#   2. Parallel: fetch/build patched Basalt + fetch sparse backbone + fetch 43 KB abliteration edit
+#        - ram+ram     (UD-IQ1_M):   100% RAM backbone + 100% RAM Engram
+#        - ram+hybrid  (UD-IQ2_XXS): RAM backbone + lazy multi-window RAM (~83-86 GiB) + sparse SSD tail (~17-20 GiB, parallel at t=2s)
+#        - wave+hybrid (UD-Q2_K_XL): Stage 1 micro-wave zero-SSD backbone (Wave 1 VRAM + Wave 2 ~20 GiB chunks) + lazy RAM window + sparse SSD (~84 GiB, parallel at t=2s)
+#   2. Parallel: fetch/build patched Basalt + fetch sparse backbone (or base sections in wave+*) + fetch 43 KB abliteration edit
 #                (+ parallel sparse SSD Engram tail download when PARALLEL_TAIL=1)
 #   3. In-place abliteration via standalone abliterate (~1.5-3s, 62/62 tensors, tunable UNCENSOR_SCALE)
-#   4. Start basalt serve + POST /load (punch-on-read reclaims backbone; hybrid allocates 4 GiB RowCache & defers Engram open)
+#   4. Start basalt serve + POST /load (punch-on-read + wave_fetch.sh in wave+*; hybrid allocates 4 GiB RowCache & defers Engram open)
 #   5. Finalize RAM Engram windows from real post-/load MemAvailable (--finalize-engram) & join SSD tail
 #   6. Warmup (triggers lazy multi-window mmap) + open gate.py on :18080 + arm VM-side hard-cap backstop
 set -uo pipefail
@@ -29,6 +29,7 @@ mkdir -p $R /mnt/ram /content/patch $D
 rm -rf $R/READY $R/load_done $R/engram_claim
 
 T0=$(date +%s)
+export BOOT_T0="$T0"
 st() { echo "$(( $(date +%s) - T0 ))s $(date +%T) $*" >> $R/timeline.txt; }
 seen() { grep -qE "$1" $R/timeline.txt; }
 hdr() { echo "Authorization: Bearer $(cat /content/secrets/key)"; }
@@ -143,6 +144,16 @@ if [[ "$STAGE_MODE" == ssd+* ]]; then
   st "punch probe $SSD_DIR ok"
 fi
 
+# Stage 1 Micro-Wave: stream experts on demand in /mnt/ram/model.basalt (0 bytes backbone on SSD)
+WAVE_JOB_ARGS=()
+if [[ "$STAGE_MODE" == wave+* ]] && [ -n "${EXPERTS_RANGE:-}" ]; then
+  export BASALT_WAVE_FETCH_CMD="$V/wave_fetch.sh"
+  export BASALT_EXPERTS_RANGE="$EXPERTS_RANGE"
+  export BASALT_WAVE_CHUNK_GIB="${WAVE_CHUNK_GIB:-20}"
+  export MODEL_FILE_BYTES
+  WAVE_JOB_ARGS=(--exclude-experts)
+fi
+
 if [ -n "${ENGRAM_TAIL_PATH:-}" ]; then
   # Hybrid modes: allocate RowCache during /load, defer Engram mmap/open until post-/load real MemAvailable finalize
   export BASALT_ENGRAM_LAZY_OPEN=1
@@ -156,7 +167,7 @@ if [ -n "${ENGRAM_TAIL_PATH:-}" ]; then
     --engram-dest "$ENGRAM_PATH" --engram-jobs "$R/j_basalt_eng.json" \
     --engram-tail-dest "$ENGRAM_TAIL_PATH" --engram-head-bytes "${ENGRAM_HEAD_BYTES:-0}" \
     --engram-tail-jobs "$R/j_basalt_eng_tail.json" \
-    --engram-size-out "$R/engram_size.txt" "${PLAN_EXTRA_ARGS[@]}" > $R/fetch.log 2>&1 || { st "basalt_jobs FAILED"; exit 1; }
+    --engram-size-out "$R/engram_size.txt" "${WAVE_JOB_ARGS[@]}" "${PLAN_EXTRA_ARGS[@]}" > $R/fetch.log 2>&1 || { st "basalt_jobs FAILED"; exit 1; }
   ENGRAM_TOTAL_SIZE=$(cat $R/engram_size.txt)
   # Pre-create logical full-size 0-block sparse SSD file for parallel/delta range writes
   python3 -I -c "
@@ -169,7 +180,7 @@ else
   python3 $V/basalt_jobs.py --quant "$MODEL_QUANT" --url "$MODEL_URL" \
     --backbone-dest "$MODEL_PATH" --backbone-jobs "$R/j_basalt_bb.json" \
     --engram-dest "$ENGRAM_PATH" --engram-jobs "$R/j_basalt_eng.json" \
-    --engram-size-out "$R/engram_size.txt" > $R/fetch.log 2>&1 || { st "basalt_jobs FAILED"; exit 1; }
+    --engram-size-out "$R/engram_size.txt" "${WAVE_JOB_ARGS[@]}" > $R/fetch.log 2>&1 || { st "basalt_jobs FAILED"; exit 1; }
   ENGRAM_HEAD_SIZE=$(cat $R/engram_size.txt)
   # Pre-create 0-block sparse Engram file so PleReader::open sees exact logical size during /load
   python3 -I -c "

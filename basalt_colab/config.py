@@ -630,7 +630,7 @@ def dump_toml(cfg: Config) -> str:
     """Serializes Config to a clean, human-readable TOML document."""
     c, p, b, s = cfg.colab, cfg.proxy, cfg.basalt, cfg.basalt.sampling
     lines = [
-        "# basalt-colab configuration (Basalt v0.5.7 + DeepSeek-V4.1-Flash on Colab G4)",
+        "# basalt-colab configuration (Basalt v0.6.0 + DeepSeek-V4.1-Flash on Colab G4)",
         "",
         "[colab]",
         f"session = {_toml_val(c.session)}",

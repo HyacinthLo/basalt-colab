@@ -1,9 +1,9 @@
 {
   "basalt_repo": "https://github.com/jesdga95/basalt.git",
-  "basalt_tag": "v0.5.7",
-  "basalt_commit": "400b411c58031d064812ea21a259b2381acdaa3e",
-  "prebuilt_url": "https://github.com/HyacinthLo/basalt-colab/releases/download/prebuilt-v0.5.7/basalt-v0.5.7-deepseek41-sm120-linux-x64.tar.gz",
-  "prebuilt_sha256": "19fc693041fada3d174e09242f70858f28dd608019715048259826cfb8c74bb4",
+  "basalt_tag": "v0.6.0",
+  "basalt_commit": "111b050dac1f1ab2c561b57815cfb6791e0ab31f",
+  "prebuilt_url": "",
+  "prebuilt_sha256": "",
   "pack_url": "https://huggingface.co/jesdga/DeepSeek-V4.1-Flash-1017-Basalt/resolve/main/DeepSeek-V4.1-Flash-1017-UD-IQ1_M.basalt",
   "pack_model_id": "DeepSeek-V4.1-Flash-1017-UD-IQ1_M",
   "packs": {
@@ -28,11 +28,11 @@
     "ud-q2_k_xl": {
       "url": "",
       "model_alias": "DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL",
-      "size_gb": 343,
+      "size_gb": 344,
       "kld": 0.1501,
       "top1": 88.42,
       "estimated_speed_tok_s": 116.5,
-      "description": "2-bit XL (pending Basalt >=v0.5.8 + HF pack; -46% KLD vs IQ1_M; see docs/q2k-xl-acceleration.md)"
+      "description": "2-bit XL (Basalt v0.6.0 + Stage 1 wave+hybrid ready; supply --pack-url until official HF pack lands)"
     }
   },
   "abliteration_url": "https://huggingface.co/mrfakename/DeepSeek-V4.1-Flash-1017-abliterated/resolve/4433164758a8045b1b915b7644cce97b9a0e274c/abliteration-edit.npz",
