@@ -1,6 +1,6 @@
 #!/bin/bash
-# Starts basalt serve detached on $PORT (18081) with native Basalt v2 schema:
-#   - slot-full-context: true (CTX is per-slot context, up to 1,048,576)
+# Starts basalt serve detached on $PORT (18081) with native Basalt v0.6.0 v2 schema:
+#   - native shared KV pool (v0.6.0 #808: CTX is per-slot context, up to 1,048,576; slot-full-context removed)
 #   - elastic FP8/FP16 KV, Dynamic Vision, 32 GiB Disk Conversation Cache, optional sampling defaults
 set -uo pipefail
 S=/content/src/basalt
@@ -38,7 +38,6 @@ model = {
     "alias": os.environ["MODEL_ALIAS"],
     "gpu": "0",
     "max-context": int(os.environ["CTX"]),
-    "slot-full-context": True,
     "kv": os.environ["KV_TYPE"],
     "parallel": int(os.environ["PARALLEL"]),
     "vision": os.environ["VISION_MODE"],
@@ -107,6 +106,11 @@ else
 fi
 if [ -n "${BASALT_PUNCH_FILE:-}" ]; then
   export BASALT_PUNCH_FILE
+fi
+if [ -n "${BASALT_WAVE_FETCH_CMD:-}" ]; then
+  export BASALT_WAVE_FETCH_CMD BASALT_EXPERTS_RANGE BASALT_WAVE_CHUNK_GIB
+  export MODEL_URL MODEL_PATH MODEL_FILE_BYTES WORKERS
+  [ -n "${HF_HDR:-}" ] && export HF_HDR
 fi
 echo "$BIN serve --config $R/basalt_config.json --api-key-file /content/secrets/key" > $R/serve_cmd.txt
 cd "$S"

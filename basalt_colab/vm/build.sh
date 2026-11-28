@@ -68,11 +68,12 @@ if [ -n "$PREBUILT_URL" ] && [ -z "${BASALT_REF:-}" ]; then
       && grep -a -q "BASALT_ENGRAM_MMAP" "$S/bin/basalt" \
       && grep -a -q "BASALT_ENGRAM_CACHE_MIB" "$S/bin/basalt" \
       && grep -a -q "BASALT_ENGRAM_LAZY_OPEN" "$S/bin/basalt" \
-      && grep -a -q "BASALT_ENGRAM_INFLIGHT" "$S/bin/basalt"; then
+      && grep -a -q "BASALT_ENGRAM_INFLIGHT" "$S/bin/basalt" \
+      && grep -a -q "BASALT_WAVE_FETCH_CMD" "$S/bin/basalt"; then
       st "basalt prebuilt binary ready"
     else
       rm -f "$S/bin/basalt"
-      st "basalt prebuilt binary unusable or missing Engram window patches, falling back to source build"
+      st "basalt prebuilt binary unusable or missing v0.6.0/wave patches, falling back to source build"
     fi
   else
     rm -f "$ARCHIVE"

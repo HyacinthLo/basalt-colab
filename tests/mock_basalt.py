@@ -1,4 +1,4 @@
-"""Mock Basalt v0.5.7 HTTP server for offline tests: /, /health, /status, /metrics, /v1/*."""
+"""Mock Basalt v0.6.0 HTTP server for offline tests: /, /health, /status, /metrics, /v1/*."""
 import json, os, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 

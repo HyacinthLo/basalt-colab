@@ -527,7 +527,7 @@ def vm_files(vm_dir: Path) -> list[str]:
 def missing_vm_files(vm_dir: Path) -> list[str]:
     have = set(vm_files(vm_dir))
     refs: set[str] = set()
-    scripts = ("boot.sh", "serve.sh", "build.sh")
+    scripts = ("boot.sh", "serve.sh", "build.sh", "wave_fetch.sh")
     for f in scripts:
         p = vm_dir / f
         try:

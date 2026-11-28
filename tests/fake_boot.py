@@ -27,7 +27,7 @@ def main():
     env["FAKE_MODE"] = MODE
     files = [os.path.relpath(os.path.join(d, f), C) for d, _, fs in os.walk(V) for f in fs]
     want = [
-        "secrets/key", "vm/manifest.json", "vm/boot.sh", "vm/serve.sh", "vm/build.sh",
+        "secrets/key", "vm/manifest.json", "vm/boot.sh", "vm/serve.sh", "vm/build.sh", "vm/wave_fetch.sh",
         "vm/patch_basalt.py", "vm/basalt_jobs.py", "vm/abliterate_basalt.py",
         "vm/abliterate.c", "vm/pfetch.py", "vm/gate.py",
     ]

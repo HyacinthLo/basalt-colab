@@ -2,7 +2,7 @@
 
 <h1>basalt-colab</h1>
 
-<p><b>Uncensored DeepSeek-V4.1-Flash on Google Colab G4 (RTX PRO 6000 96 GB), built from first principles around Basalt v0.5.7.</b><br>
+<p><b>Uncensored DeepSeek-V4.1-Flash on Google Colab G4 (RTX PRO 6000 96 GB), built from first principles around Basalt v0.6.0.</b><br>
 150–190+ tok/s solo · 159 tok/s 2-stream concurrent · up to 1M elastic FP8 KV · 32 GiB Disk Conversation Cache · Dynamic Vision.<br>
 Zero-dependency Python 3.11+ CLI · Visual Web Control Console · OpenAI / Anthropic Gateway · DeepSeek Harness, Claude Code, Codex, OpenCode &amp; Cursor config generator.</p>
 
@@ -31,7 +31,7 @@ basalt-colab connect dsh   # prints ready-to-paste DeepSeek Harness cordis.patch
 ```
 
 ```text
-basalt-colab 0.3.0 · DeepSeek-V4.1-Flash-1017-UD-IQ1_M (Basalt v0.5.7)
+basalt-colab 0.3.0 · DeepSeek-V4.1-Flash-1017-UD-IQ1_M (Basalt v0.6.0)
 
 Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
 
@@ -63,14 +63,14 @@ Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
 
 ## Measured Performance (Colab G4 — RTX PRO 6000 Blackwell 96 GB)
 
-| Metric | Measured (Basalt v0.5.7 + `UD-IQ1_M` / `UD-IQ2_XXS`) |
+| Metric | Measured (Basalt v0.6.0 + `UD-IQ1_M` / `UD-IQ2_XXS`) |
 | --- | --- |
 | VM cold start (prebuilt `sm_120` binary) | **~95–108s** (`build.sh` in **6s**, zero-GIL 128 MiB parallel download at **3.47 GB/s**) |
 | Solo decode (`/v1/chat/completions`) | **148–160+ tok/s** (`UD-IQ1_M`) · **94–125 tok/s** (`UD-IQ2_XXS`, 98.3% VRAM hit, 0.3% PCIe) |
 | OpenAI Responses (`/v1/responses`) | **193.8 tok/s** (DSpark speculative draft + 32 draft experts) |
 | Anthropic Messages (`/v1/messages`) | **152.5 tok/s** (native Claude Code compatible) |
 | 2-stream concurrent decode | **159.0 tok/s aggregate** (`78.7 + 80.3 tok/s`, 94.1% hit, 0.8% PCIe) |
-| Context & KV cache | **Up to 1,048,576 (1M) per slot** via `slot-full-context` (FP8 KV: 0.97 GiB @ 1M; FP16 optional) |
+| Context & KV cache | **Up to 1,048,576 (1M) per slot** via native shared KV pool (FP8 KV: 0.97 GiB @ 1M; FP16 optional) |
 | Disk Conversation Cache | **32 GiB** `/content/conv_cache` (99.8% KV restored in **0.5 ms** across rotated sessions) |
 | Vision (`dynamic` mode) | **0 MiB idle VRAM / 0 MiB idle RAM**, ~1.0–1.6s on-demand image encode |
 | Client-disconnect cancel (`MSG_PEEK`) | **0.48s** measured GPU decode abort after client hangup |
@@ -109,7 +109,7 @@ Starting a Colab G4 GPU · ~1.5-2 minutes (prebuilt binary)
 | --- | --- | --- | --- | --- |
 | **`ud-iq1_m`** *(default)* | 260 GB | **`ram+ram`** (100% RAM+VRAM) | KLD `0.2779` · Top-1 `83.88%` | Fastest (`150–190+ tok/s`), zero SSD I/O |
 | **`ud-iq2_xxs`** | 285 GB | **`ram+hybrid`** (Experts 100% RAM+VRAM; **~83–86 GiB Engram in 2 RAM windows** covering Layer 1 all + Layer 14 3/4-gram + **~17–20 GiB Layer 14 2-gram sparse SSD** + **4 GiB `RowCache`**) | KLD `0.2408` (**-13.4%**) · Top-1 `85.15%` | Official pack on `jesdga`; post-`/load` lazy sizing from real `MemAvailable` |
-| **`ud-q2_k_xl`** *(planned)* | 344 GB (`320.14 GiB`) | **`ssd+hybrid`** (Engram window + `4 GiB` filtered `RowCache` ready; Stage 1 **`wave+hybrid`** loader planned in [`docs/q2k-xl-acceleration.md`](docs/q2k-xl-acceleration.md)) | KLD `0.1501` (**-46%**) · Top-1 `88.42%` | Pending Basalt `>=v0.5.8` (PR `#481`) + HF pack (`scripts/build_q2k_xl_pack.py`) |
+| **`ud-q2_k_xl`** *(ready via `--pack-url`)* | 344 GB (`320.14 GiB`) | **`wave+hybrid`** (**Stage 1 Micro-Wave zero-SSD backbone**: Wave 1 VRAM + Wave 2 ~20 GiB chunks → punch, **0 bytes backbone on SSD**; Layer 1 3/4-gram RAM window + `4 GiB` filtered `RowCache` + parallel sparse SSD Engram tail) | KLD `0.1501` (**-46%**) · Top-1 `88.42%` | Natively supported in Basalt `v0.6.0` (PR `#481`); supply `--pack-url` built via `scripts/build_q2k_xl_pack.py` until official HF pack is posted |
 | `NVFP4` *(unsupported)* | 428 GB | **Rejected fail-fast** | — | Backbone (`~294 GiB`) > G4 VRAM+RAM (`~272 GiB`); Basalt requires ≥320 GB RAM |
 
 ## Declarative Configuration (`config.toml`)
@@ -134,9 +134,9 @@ strict_model = false     # hot-reloadable live (false = route claude-haiku-* / g
 [basalt]
 quant = "ud-iq1_m"       # "ud-iq1_m", "ud-iq2_xxs", "ud-q2_k_xl", or "custom"
 pack_url = ""            # optional URL override (required for ud-q2_k_xl / custom)
-ref = ""                 # empty = pinned manifest (v0.5.7 + SHA-256 verified prebuilt fast path)
+ref = ""                 # empty = pinned manifest (v0.6.0 + SHA-256 verified prebuilt fast path)
 model_alias = ""         # empty = auto from quant (e.g. DeepSeek-V4.1-Flash-1017-UD-IQ1_M)
-max_context = 262144     # per-slot up to 1048576 (1M) via native slot-full-context
+max_context = 262144     # per-slot up to 1048576 (1M) via native shared KV pool
 parallel = 2             # 1..4 concurrent slots
 kv = "fp8"               # "fp8" or "fp16"
 vision = "dynamic"       # 0 MiB idle VRAM/RAM

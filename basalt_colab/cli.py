@@ -91,7 +91,7 @@ from basalt_colab.term import (
 )
 from basalt_colab.usage import UsageLedger
 
-USAGE = f"""basalt-colab {__version__} — DeepSeek-V4.1-Flash on Google Colab G4 via Basalt v0.5.7
+USAGE = f"""basalt-colab {__version__} — DeepSeek-V4.1-Flash on Google Colab G4 via Basalt v0.6.0
 
 usage: basalt-colab COMMAND [options]
   up [opts]                            start G4 (~1.5-2 min), print endpoints & live status
@@ -482,7 +482,7 @@ def interactive_config_wizard(paths: Paths, cfg: Config) -> Config | None:
         )
     else:
         new.basalt.pack_url = ""
-    new.basalt.max_context = pick("Context/slot", "32K..1M (slot-full-context)", short_context(cfg.basalt.max_context), context_value)
+    new.basalt.max_context = pick("Context/slot", "32K..1M (shared KV pool)", short_context(cfg.basalt.max_context), context_value)
     new.basalt.parallel = int(pick("Parallel", "1-4 concurrent slots", cfg.basalt.parallel, lambda t: int(t) if t.isdigit() and 1 <= int(t) <= 4 else None))
     new.basalt.routing_mode = pick("Routing", "exact (lossless) | balanced (lossy)", cfg.basalt.routing_mode, routing_mode_value)
     new.basalt.kv = pick("KV precision", "fp8 (0.97G@1M) or fp16", cfg.basalt.kv, lambda t: t.lower() if t.lower() in ("fp8", "fp16") else None)

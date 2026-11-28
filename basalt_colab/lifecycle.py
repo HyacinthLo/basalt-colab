@@ -56,6 +56,7 @@ STEPS = (
     ("model", r"backbone fetched \([^)]+\)", "model backbone downloaded"),
     ("build", r"basalt built", "Basalt built / ready"),
     ("abliterate", r"abliteration applied", "abliteration baked into weights (62/62)"),
+    ("wave1", r"wave fetch wave1 done", "Wave 1 VRAM experts streamed"),
     ("loaded", r"weights loaded", "model loaded onto GPU + RAM"),
     ("pinned", r"pin: ", "backbone storage punched & reclaimed"),
     ("engram_finalize", r"engram finalize ", "Engram RAM windows sized"),
