@@ -46,7 +46,7 @@ def load_edit_npz(path):
         q1 = [q_vals[2 * i + 1] for i in range(dim)]
     n0 = sum(x * x for x in q0)
     n1 = sum(x * x for x in q1)
-    dot = sum(a * b for a, b in zip(q0, q1))
+    dot = sum(a * b for a, b in zip(q0, q1, strict=True))
     assert abs(n0 - 1.0) < 1e-4 and abs(n1 - 1.0) < 1e-4 and abs(dot) < 1e-4, (n0, n1, dot)
     nlayers = s_shape[0]
     if s_f:
@@ -128,7 +128,7 @@ def main():
     args = ap.parse_args()
 
     if args.scale == 0.0:
-        print(f'abliteration skipped (--scale 0.0)')
+        print('abliteration skipped (--scale 0.0)')
         return
 
     with open(args.pack, 'rb') as f:

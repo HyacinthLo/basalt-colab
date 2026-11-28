@@ -23,7 +23,7 @@
       "kld": 0.2408,
       "top1": 85.15,
       "estimated_speed_tok_s": 130.0,
-      "description": "2-bit Dynamic V3.1 · -13.4% KLD vs IQ1_M; Engram on SSD, 0 cold experts on SSD"
+      "description": "2-bit Dynamic V3.1 · -13.4% KLD vs IQ1_M; 0 experts on SSD, ~83-86 GiB Engram in RAM + 4 GiB RowCache"
     },
     "ud-q2_k_xl": {
       "url": "",

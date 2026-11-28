@@ -13,7 +13,8 @@ git clone https://github.com/HyacinthLo/basalt-colab.git && cd basalt-colab
 pip install --no-deps --no-build-isolation -e .
 ```
 
-Run `basalt-colab doctor` at any time to verify Python, OpenSSH, Colab CLI, OAuth balance, `config.toml`, VM payload integrity, and port availability.
+- On first `basalt-colab setup` / `up`, `google-colab-cli==0.8.0` is installed automatically (preferring `uv` on Python 3.11 since `google-colab-cli` requires Python ≥ 3.12). On headless Linux / WSL2 / Docker / SSH, `basalt-colab` automatically provides a zero-dependency `0600` file keyring fallback when no D-Bus SecretService is available.
+- Run `basalt-colab doctor` at any time to verify Python, OpenSSH, Colab CLI version, OAuth balance, `config.toml`, VM payload integrity, and port availability.
 
 ## Paths & Legacy Migration
 
@@ -31,6 +32,7 @@ Run `basalt-colab doctor` at any time to verify Python, OpenSSH, Colab CLI, OAut
   - **Claude Code**: `basalt-colab connect claude` prints `~/.claude/settings.json` and `ANTHROPIC_*` shell exports.
   - **Codex CLI**: `basalt-colab connect codex` prints `~/.codex/config.toml` (`wire_api = "responses"`) and `OPENAI_*` exports.
   - **OpenCode**: `basalt-colab connect opencode` prints `opencode.json` using `{env:OPENAI_API_KEY}` (pass `--write` to update the managed file for `OPENCODE_CONFIG=...`).
+  - **OpenAI / Anthropic API**: `basalt-colab connect openai` prints OpenAI `/v1`, Anthropic `/v1/messages`, and `curl` snippets for SDKs and Cursor.
   - **Shell env**: `eval "$(basalt-colab env)"` exports `OPENAI_*`, `ANTHROPIC_*`, and `BASALT_API_KEY` synced to the running proxy.
 - **Multimodal & Piped CLI**:
   ```bash
@@ -40,7 +42,7 @@ Run `basalt-colab doctor` at any time to verify Python, OpenSSH, Colab CLI, OAut
 
 ## Prebuilt Basalt Binary & `--basalt-ref`
 
-- By default (`basalt.ref = ""`), `vm/build.sh` checks the pinned prebuilt release archive from `basalt_colab/vm/manifest.json` (`prebuilt_url` + `prebuilt_sha256`), skipping the ~85s C++ compile and bringing VM boot down to **~95s**. If unavailable or hash-mismatched, it transparently falls back to building from source on G4.
+- By default (`basalt.ref = ""`), `vm/build.sh` verifies the pinned prebuilt release archive from `basalt_colab/vm/manifest.json` (`prebuilt_url` + `prebuilt_sha256` + patch symbols), skipping the ~85s C++ compile and bringing VM boot down to **~95–108s**. If unavailable or mismatched, it transparently falls back to building from source on G4.
 - To test an upstream Basalt branch, tag, or commit:
   ```bash
   basalt-colab up --basalt-ref main
@@ -50,5 +52,8 @@ Run `basalt-colab doctor` at any time to verify Python, OpenSSH, Colab CLI, OAut
 ## Development & Offline Tests
 
 ```bash
+ruff check basalt_colab
+mypy basalt_colab
+bash -n basalt_colab/vm/*.sh
 python3 -B -m unittest discover -s tests -v
 ```
